@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 
-project_root = Path(__file__).resolve().parents[1]
+spec_dir = Path(globals().get("SPECPATH", Path.cwd())).resolve()
+if spec_dir.is_file():
+    spec_dir = spec_dir.parent
+project_root = spec_dir.parent if spec_dir.name.lower() == "packaging" else spec_dir
 
 app_name = "ESCgram"
 
@@ -57,4 +60,3 @@ coll = COLLECT(
     upx_exclude=[],
     name=app_name,
 )
-
