@@ -1,0 +1,60 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build app (PyInstaller)
+        run: |
+          pyinstaller --noconfirm packaging/escgram.spec
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: |
+          iscc packaging\installer\ESCgram.iss
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          if (Test-Path dist_installer\ESCgram-portable.zip) { Remove-Item dist_installer\ESCgram-portable.zip -Force }
+          Compress-Archive -Path dist\ESCgram\* -DestinationPath dist_installer\ESCgram-portable.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: escgram-windows
+          path: |
+            dist_installer/ESCgram-Setup.exe
+            dist_installer/ESCgram-portable.zip
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist_installer/ESCgram-Setup.exe
+            dist_installer/ESCgram-portable.zip
+

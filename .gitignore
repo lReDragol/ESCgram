@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Virtualenv
+.venv/
+venv/
+
+# OS / temp
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.pstat
+
+# Build artifacts
+build/
+dist/
+dist_installer/
+*.egg-info/
+
+# App runtime data (never commit)
+userdata/
+data/
+chats/
+media/
+temp/
+logs/
+avatars/
+history.json
+accounts.json
+config.json
+*.session
+*.session-journal
+
+# Local screenshots / dumps
+img*.png
+tmp_*.png
+_patch.tmp
+save/
+
+# Local organization (dev artifacts, backups)
+misc/

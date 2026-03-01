@@ -1,0 +1,404 @@
+{
+  "active": "night",
+  "themes": {
+    "night": {
+      "label": "Ночная тема",
+      "palette": {
+        "Window": "#0e1621",
+        "WindowText": "#dee6f1",
+        "Base": "#0e1621",
+        "AlternateBase": "#17212b",
+        "Button": "#1d2734",
+        "ButtonText": "#dee6f1",
+        "Text": "#dee6f1",
+        "Highlight": "#59b7e9",
+        "HighlightedText": "#0b141d",
+        "PlaceholderText": "#6f7b8a",
+        "BrightText": "#ffb36b",
+        "Disabled": {
+          "Text": "#516071",
+          "ButtonText": "#516071",
+          "WindowText": "#516071"
+        }
+      },
+      "app_stylesheet": [
+        "QWidget { background-color:#0e1621; color:#dee6f1; }",
+        "QLabel { color:#dee6f1; }",
+        "QTextEdit, QPlainTextEdit { background-color:#1d2734; border:1px solid #222f3d; border-radius:6px; color:#dee6f1; selection-background-color:#59b7e9; selection-color:#0b141d; }",
+        "QLineEdit { background-color:#1d2734; border:1px solid #222f3d; border-radius:6px; padding:4px 8px; color:#dee6f1; selection-background-color:#59b7e9; selection-color:#0b141d; }",
+        "QListWidget { background-color:#17212b; border:none; }",
+        "QListWidget::item { border-bottom:1px solid rgba(255,255,255,0.03); padding:6px 4px; }",
+        "QListWidget::item:selected { background-color:rgba(89,183,233,0.18); color:#dee6f1; }",
+        "QScrollArea, QScrollArea > QWidget > QWidget { background-color:transparent; }",
+        "QSplitter::handle { background-color:rgba(255,255,255,0.04); }",
+        "QPushButton, QToolButton, QComboBox { background-color:#1d2734; border:1px solid rgba(255,255,255,0.08); border-radius:6px; padding:6px 10px; color:#dee6f1; }",
+        "QPushButton:hover, QToolButton:hover, QComboBox:hover { background-color:rgba(89,183,233,0.12); border-color:rgba(89,183,233,0.35); }",
+        "QPushButton:pressed, QToolButton:pressed { background-color:rgba(89,183,233,0.2); }",
+        "QProgressBar { background-color:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:4px; text-align:center; }",
+        "QProgressBar::chunk { background-color:#59b7e9; border-radius:4px; }",
+        "QScrollBar:vertical { background-color:rgba(255,255,255,0.02); width:4px; margin:0; border-radius:2px; }",
+        "QScrollBar::handle:vertical { background-color:rgba(200,213,227,0.7); border-radius:2px; min-height:30px; }",
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }",
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }",
+        "QScrollBar:horizontal { background-color:rgba(255,255,255,0.02); height:4px; margin:0; border-radius:2px; }",
+        "QScrollBar::handle:horizontal { background-color:rgba(200,213,227,0.7); border-radius:2px; min-width:30px; }",
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }",
+        "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:transparent; }",
+        "QToolTip { color:#f7f9ff; background-color:#1b2433; border:1px solid rgba(255,255,255,0.15); }"
+      ],
+      "styles": {
+        "auth.qr_label": "background:#181818; border:1px solid #303030;",
+        "chat_sidebar.folder_button": "QPushButton {\n background-color:transparent;\n border:none;\n border-radius:0;\n padding:0;\n color:#dfe6f0;\n outline:none;\n}\nQPushButton:hover { background-color:rgba(118,140,158,0.15); }\nQPushButton:checked {\n background-color:rgba(89,183,233,0.18);\n border-color:rgba(89,183,233,0.55);\n}\nQPushButton QLabel { background:transparent; }",
+        "chat_sidebar.folder_title": "font-size:11px; font-weight:600; color:#d0d9e6; padding:0; margin:0; text-align:center; background:transparent;",
+        "chat_sidebar.folder_counter": "font-size:8px; color:#768c9e; padding:0; margin:0; background:transparent;",
+        "chat_sidebar.folder_icon_holder": "background-color:rgba(255,255,255,0.06); border-radius:14px;",
+        "chat_sidebar.menu_button": "QToolButton{border:none; background:transparent; padding:4px;}QToolButton:checked{background-color:rgba(78,164,245,0.18); border-radius:6px;}",
+        "chat_sidebar.loading": "color:#b6b6b6; font-size:12px;",
+        "chat_sidebar.folder_panel": "#folderPanel { background-color:transparent; border:none; }",
+        "chat_sidebar.list": "QListWidget{font-size:13px; background-color:#17212b; border:1px solid #2a2a2a; padding:0; margin:0; outline:none;}\nQListWidget::item{height:${row_height}px; padding:0; margin:0; color:#e0e0e0;}\nQListWidget::item:selected{background-color:#2f4f6f; color:#ffffff; border:none;}\nQListWidget::item:hover{background-color:#202a36;}\nQListWidget::item:focus{outline:none;}",
+        "main.settings_overlay": "background-color: rgba(9, 18, 28, 0.35);",
+        "main.reply_bar": "QFrame#replyBar{background-color:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;}",
+        "main.reply_bar_close": "QToolButton{border:none;background:transparent;padding:2px;color:#9fa6b1;}QToolButton:hover{background-color:rgba(255,255,255,0.08);border-radius:6px;}",
+        "main.media_preview_bar": "QFrame#mediaPreviewBar{background-color:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;}",
+        "main.media_preview_header": "font-size:13px; color:#dfe8f4;",
+        "main.media_preview_status": "color:#9fb0c5; font-size:11px;",
+        "main.media_preview_time": "color:#9fb0c5; font-size:11px;",
+        "main.streamer_overlay": "background-color: rgba(14, 22, 33, 0.92); color:#f7f9ff; font-size:16px; font-weight:600; border-radius:16px; padding:20px;",
+        "main.toast": "color:#9bb6d6; font-size:12px; padding:4px 10px;",
+        "settings.action_button": "QPushButton {\n text-align:left;\n padding:10px;\n border-radius:8px;\n background-color:rgba(255,255,255,0.02);\n color:#dfe6f0;\n}\nQPushButton:hover { background-color:rgba(89,183,233,0.18); }\nQPushButton:pressed { background-color:rgba(89,183,233,0.28); }",
+        "settings.toggle_row.label": "color:#dfe6f0; font-size:13px;",
+        "settings.drawer.background": "background-color: rgba(13, 20, 31, 0.96);",
+        "settings.drawer.title": "font-size:16px; font-weight:600; color:#f7f9fc;",
+        "settings.drawer.scroll": "QScrollArea { border:none; } QScrollArea > QWidget > QWidget { background-color:transparent; } QScrollBar:vertical { background-color:rgba(255,255,255,0.02); width:4px; margin:0; border-radius:2px; } QScrollBar::handle:vertical { background-color:rgba(200,213,227,0.7); border-radius:2px; min-height:30px; } QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; } QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }",
+        "settings.drawer.card": "QFrame { background-color: rgba(255,255,255,0.03); border-radius:12px; }",
+        "settings.account.avatar": "border-radius:21px; background-color:rgba(255,255,255,0.08); color:#dfe6f0; font-size:18px;",
+        "settings.account.avatar_plain": "border-radius:21px;",
+        "settings.account.name": "font-size:13px; color:#f1f4fb; font-weight:600;",
+        "settings.account.hint": "font-size:11px; color:#8ea0bf;",
+        "settings.section.caption": "color:#8ea0bf; font-size:12px;",
+        "settings.section.caption_muted": "color:#9db2d5; font-size:12px; margin-top:12px;",
+        "settings.pill_button": "padding:4px 10px; border-radius:3px;",
+        "settings.color_chip": "background-color:$color; color:#0b111a; border:1px solid rgba(255,255,255,0.2); padding:4px 10px; border-radius:4px;",
+        "context_menu.chat_menu": "QMenu{background-color:#17212b;color:#dee6f1;border:1px solid rgba(255,255,255,0.08);padding:4px;}QMenu::item{padding:6px 18px;}QMenu::item:selected{background-color:rgba(89,183,233,0.18);}QMenu::separator{height:1px;background-color:rgba(255,255,255,0.08);margin:4px 0;}",
+        "context_menu.message_menu": "QMenu{background-color:#17212b;color:#dee6f1;border:1px solid rgba(255,255,255,0.08);padding:4px;}QMenu::item{padding:6px 18px;}QMenu::item:selected{background-color:rgba(89,183,233,0.24);}QMenu::separator{height:1px;background-color:rgba(255,255,255,0.08);margin:4px 0;}",
+        "message_feed.scroll_area": "QScrollArea{border:none;}QScrollArea > QWidget > QWidget{background-color:transparent;}",
+        "media.preview_circular": "border-radius:$radiuspx; background-color:#1f1f1f; color:#fff;",
+        "media.time_label": "color:#9fa6b1; font-size:11px;",
+        "animation_demo.bubble": "QFrame#bubble { background:$bubble_bg; color:$bubble_fg; border-radius:14px; }QFrame#bubble QLabel { color:$bubble_fg; }",
+        "animation_demo.zone": "QWidget#zone { background:$zone_bg; border:1px solid $zone_border; border-radius:8px; }",
+        "animation_demo.window": "background:$app_bg;",
+        "message.bubble.label": "#bubble QLabel{color:$text; background-color:transparent;}#bubble QLabel a{color:$link; text-decoration:none;}",
+        "message.reply.accent": "background-color: rgba(89, 183, 233, 0.9); border-radius: 2px;",
+        "message.reply.sender": "font-weight:600; font-size:11px; color:#aacbf5;",
+        "message.reply.context": "font-size:10px; color:#59b7e9;",
+        "message.reply.text": "font-size:11px; color:#d5dbe6;",
+        "message.reply.text_deleted": "font-size:11px; color:#ff9aa0; font-style:italic;",
+        "message.forward.icon": "color:#59b7e9;font-size:12px;",
+        "message.forward.text": "color:#59b7e9;font-size:11px;",
+        "message.deleted.label": "color:#ff9aa0;font-size:11px;",
+        "message.hidden.label": "color:#9fa6b1;font-size:11px;",
+        "message.body.rich_text": "background-color: transparent;",
+        "message.body.container": "background-color: transparent;",
+        "message.status.label": "color:#9fa6b1;font-size:11px;",
+        "message.media.container": "background-color: transparent;",
+        "message.audio.voice_button": "QToolButton { background-color:rgba(89,183,233,0.18); border:none; border-radius:20px; padding:6px 10px; color:#59b7e9; font-size:18px; }QToolButton:hover { background-color:rgba(89,183,233,0.28); }",
+        "message.audio.time_label": "color:#9fa6b1;font-size:11px;",
+        "message.audio.file_icon": "font-size:24px;",
+        "message.audio.title": "color:#f4f7ff;font-weight:bold;",
+        "message.audio.meta": "color:#9fa6b1;font-size:11px;",
+        "message.document.title": "color:#f4f7ff;font-weight:600;font-size:13px;",
+        "message.document.meta": "color:#9fa6b1;font-size:11px;",
+        "message.document.status": "color:#768c9e;font-size:10px;",
+        "message.deleted.placeholder": "color:#8894a8;font-style:italic;",
+        "message.caption": "font-size:13px;",
+        "message.header.deleted": "color:#7e879b;font-size:12px;font-weight:600;",
+        "message.header.me": "color:#d5e4ff;font-size:12px;font-weight:600;",
+        "message.header.other": "color:#bfc8d6;font-size:12px;font-weight:600;",
+        "settings.tabs": "QTabWidget::pane { background-color:#0c141e; border:1px solid rgba(255,255,255,0.08); border-radius:10px; }\nQTabBar::tab { background-color:rgba(255,255,255,0.04); color:#dfe6f0; padding:8px 16px; border-top-left-radius:8px; border-top-right-radius:8px; margin-right:2px; }\nQTabBar::tab:selected { background-color:rgba(89,183,233,0.26); }\nQTabBar::tab:hover { background-color:rgba(89,183,233,0.14); }",
+        "style_editor.group": "QGroupBox { background-color:#101923; border:1px solid rgba(255,255,255,0.08); border-radius:10px; margin-top:12px; }\nQGroupBox::title { color:#dfe6f0; subcontrol-origin: margin; left:14px; padding:0 6px; font-weight:600; }\n#StyleQuickLabel { font-size:12px; color:#9fb0c4; }\n#StyleMetricLabel { min-width:48px; text-align:right; font-weight:600; color:#dfe6f0; }",
+        "style_editor.advanced_box": "QGroupBox { background-color:#0f1a25; border:1px solid rgba(255,255,255,0.12); border-radius:10px; margin-top:12px; }\nQGroupBox::title { color:#dfe6f0; subcontrol-origin: margin; left:14px; padding:0 6px; font-weight:600; }",
+        "style_editor.tree": "QTreeWidget { background-color:#0b121c; border:1px solid rgba(255,255,255,0.08); padding:2px; }\nQTreeWidget::item { height:22px; }\nQHeaderView::section { background-color:#111b27; color:#9fb0c4; border:none; padding:4px 6px; }",
+        "style_editor.color_button": "border:1px solid rgba(255,255,255,0.18); border-radius:8px; padding:6px 12px; font-weight:600; text-align:left;"
+      },
+      "metrics": {},
+      "bubbles": {
+        "me": {
+          "bg": "#2b5278",
+          "border": "#3a71a1",
+          "text": "#f4f7ff",
+          "link": "#59b7e9"
+        },
+        "assistant": {
+          "bg": "#1f4a3a",
+          "border": "#2e6a53",
+          "text": "#f2fff7",
+          "link": "#59b7e9"
+        },
+        "other": {
+          "bg": "#182533",
+          "border": "#243247",
+          "text": "#dfe6f0",
+          "link": "#59b7e9"
+        }
+      },
+      "colors": {
+        "chat_sidebar.folder_icon": "#768c9e"
+      },
+      "message_feed": {
+        "username_colors": [
+          "#ff8b8b",
+          "#ffb86c",
+          "#ffd479",
+          "#7be094",
+          "#5ec7ff",
+          "#80a0ff",
+          "#ff7ad8",
+          "#7dd7ff",
+          "#9de27f",
+          "#f7a8ff"
+        ]
+      },
+      "animation_demo": {
+        "colors": {
+          "bubble_bg": "#62b3ff",
+          "bubble_fg": "#ffffff",
+          "app_bg": "#141519",
+          "zone_bg": "#1f2125",
+          "zone_border": "#3a3d42"
+        }
+      },
+      "message_widgets": {
+        "link_color": "#59b7ff",
+        "bubbles": {
+          "me": {
+            "bg": "#2b5278",
+            "border": "#3a71a1",
+            "text": "#f4f7ff",
+            "link": "#6ec9ff"
+          },
+          "assistant": {
+            "bg": "#1f4a3a",
+            "border": "#2e6a53",
+            "text": "#f2fff7",
+            "link": "#6ec9ff"
+          },
+          "other": {
+            "bg": "#182533",
+            "border": "#243247",
+            "text": "#dfe6f0",
+            "link": "#6ec9ff"
+          }
+        },
+        "deleted_bubble": {
+          "bg": "#101a1f",
+          "border": "#1c2735",
+          "text": "#7e879b",
+          "link": "#6ec9ff"
+        },
+        "quote_block_style": "margin:4px 0; padding-left:8px; border-left:3px solid rgba(89,183,233,0.45); color:#c4d4eb;",
+        "metrics": {
+          "body_radius": 15,
+          "bubble_max_ratio": 0.54
+        }
+      }
+    },
+    "day": {
+      "label": "Дневная тема",
+      "palette": {
+        "Window": "#f5f7fb",
+        "WindowText": "#1b1f2a",
+        "Base": "#ffffff",
+        "AlternateBase": "#eef1f6",
+        "Button": "#ffffff",
+        "ButtonText": "#1b1f2a",
+        "Text": "#1b1f2a",
+        "Highlight": "#3390ec",
+        "HighlightedText": "#ffffff",
+        "PlaceholderText": "#8c98a6",
+        "BrightText": "#d35400",
+        "Disabled": {
+          "Text": "#98a2b3",
+          "ButtonText": "#98a2b3",
+          "WindowText": "#98a2b3"
+        }
+      },
+      "app_stylesheet": [
+        "QWidget { background-color:#f5f7fb; color:#1b1f2a; }",
+        "QLabel { color:#1b1f2a; }",
+        "QLineEdit, QTextEdit, QPlainTextEdit { background-color:#ffffff; border:1px solid rgba(27,31,42,0.14); border-radius:6px; selection-background-color:#3390ec; selection-color:#ffffff; }",
+        "QListWidget { background-color:#ffffff; border:1px solid rgba(27,31,42,0.12); }",
+        "QListWidget::item { border-bottom:1px solid rgba(27,31,42,0.06); padding:6px 4px; }",
+        "QListWidget::item:selected { background-color:rgba(51,144,236,0.18); color:#1b1f2a; }",
+        "QScrollArea, QScrollArea > QWidget > QWidget { background-color:transparent; }",
+        "QToolButton, QPushButton, QComboBox { background-color:#ffffff; border:1px solid rgba(27,31,42,0.14); border-radius:6px; padding:6px 10px; }",
+        "QToolButton:hover, QPushButton:hover, QComboBox:hover { background-color:rgba(51,144,236,0.08); border-color:rgba(51,144,236,0.35); }",
+        "QToolButton:pressed, QPushButton:pressed { background-color:rgba(51,144,236,0.14); }",
+        "QScrollBar:vertical { background-color:rgba(27,31,42,0.06); width:4px; margin:0; border-radius:2px; }",
+        "QScrollBar::handle:vertical { background-color:rgba(27,31,42,0.28); border-radius:2px; min-height:30px; }",
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }",
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }",
+        "QScrollBar:horizontal { background-color:rgba(27,31,42,0.06); height:4px; margin:0; border-radius:2px; }",
+        "QScrollBar::handle:horizontal { background-color:rgba(27,31,42,0.28); border-radius:2px; min-width:30px; }",
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }",
+        "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:transparent; }",
+        "QToolTip { color:#1b1f2a; background-color:#ffffff; border:1px solid rgba(27,31,42,0.15); }"
+      ],
+      "styles": {
+        "auth.qr_label": "background:#f4f4f4; border:1px solid #2a2a2a;",
+        "chat_sidebar.folder_button": "QPushButton {\n background-color:transparent;\n border:none;\n border-radius:0;\n padding:0;\n color:#2b2f3a;\n outline:none;\n}\nQPushButton:hover { background-color:rgba(51,144,236,0.10); }\nQPushButton:checked {\n background-color:rgba(51,144,236,0.18);\n border-color:rgba(51,144,236,0.45);\n}\nQPushButton QLabel { background:transparent; }",
+        "chat_sidebar.folder_title": "font-size:11px; font-weight:600; color:#2b2f3a; padding:0; margin:0; text-align:center; background:transparent;",
+        "chat_sidebar.folder_counter": "font-size:8px; color:#6b7280; padding:0; margin:0; background:transparent;",
+        "chat_sidebar.folder_icon_holder": "background-color:rgba(0,0,0,0.06); border-radius:14px;",
+        "chat_sidebar.menu_button": "QToolButton{border:none; background:transparent; padding:4px;}QToolButton:checked{background-color:rgba(51,103,214,0.2); border-radius:6px;}",
+        "chat_sidebar.loading": "color:#d0d0d0; font-size:12px;",
+        "chat_sidebar.folder_panel": "#folderPanel { background-color:transparent; border:none; }",
+        "chat_sidebar.list": "QListWidget{font-size:13px; background-color:#ffffff; border:1px solid rgba(27,31,42,0.12); padding:0; margin:0; outline:none;}\nQListWidget::item{height:${row_height}px; padding:0; margin:0; color:#1b1f2a;}\nQListWidget::item:selected{background-color:rgba(51,144,236,0.18); color:#1b1f2a; border:none;}\nQListWidget::item:hover{background-color:rgba(27,31,42,0.04);}\nQListWidget::item:focus{outline:none;}",
+        "main.settings_overlay": "background-color: rgba(0, 0, 0, 0.18);",
+        "main.reply_bar": "QFrame#replyBar{background-color:rgba(27,31,42,0.03);border:1px solid rgba(27,31,42,0.10);border-radius:10px;}",
+        "main.reply_bar_close": "QToolButton{border:none;background:transparent;padding:2px;color:#6b7280;}QToolButton:hover{background-color:rgba(27,31,42,0.06);border-radius:6px;}",
+        "main.media_preview_bar": "QFrame#mediaPreviewBar{background-color:rgba(27,31,42,0.03);border:1px solid rgba(27,31,42,0.10);border-radius:10px;}",
+        "main.media_preview_header": "font-size:13px; color:#1b1f2a;",
+        "main.media_preview_status": "color:#4a505d; font-size:11px;",
+        "main.media_preview_time": "color:#6b7280; font-size:11px;",
+        "main.streamer_overlay": "background-color: rgba(240, 240, 240, 0.95); color:#151515; font-size:16px; font-weight:600; border-radius:16px; padding:20px;",
+        "main.toast": "color:#3a4354; font-size:12px; padding:4px 10px;",
+        "settings.action_button": "QPushButton {\n text-align:left;\n padding:10px;\n border-radius:8px;\n background-color:rgba(0,0,0,0.05);\n color:#20242a;\n}\nQPushButton:hover { background-color:rgba(51,103,214,0.15); }\nQPushButton:pressed { background-color:rgba(51,103,214,0.25); }",
+        "settings.toggle_row.label": "color:#1e2128; font-size:13px;",
+        "settings.drawer.background": "background-color: rgba(238, 240, 245, 0.96);",
+        "settings.drawer.title": "font-size:16px; font-weight:600; color:#20242a;",
+        "settings.drawer.scroll": "QScrollArea { border:none; } QScrollArea > QWidget > QWidget { background-color:transparent; } QScrollBar:vertical { background-color:rgba(0,0,0,0.04); width:4px; margin:0; border-radius:2px; } QScrollBar::handle:vertical { background-color:rgba(0,0,0,0.35); border-radius:2px; min-height:30px; } QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; } QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }",
+        "settings.drawer.card": "QFrame { background-color: rgba(0,0,0,0.04); border-radius:12px; }",
+        "settings.account.avatar": "border-radius:21px; background-color:rgba(0,0,0,0.08); color:#20242a; font-size:18px;",
+        "settings.account.avatar_plain": "border-radius:21px;",
+        "settings.account.name": "font-size:13px; color:#20242a; font-weight:600;",
+        "settings.account.hint": "font-size:11px; color:#4a505d;",
+        "settings.section.caption": "color:#4a505d; font-size:12px;",
+        "settings.section.caption_muted": "color:#5a6070; font-size:12px; margin-top:12px;",
+        "settings.pill_button": "padding:4px 10px; border-radius:6px;",
+        "settings.color_chip": "background-color:$color; color:#0b111a; border:1px solid rgba(0,0,0,0.15); padding:4px 10px; border-radius:4px;",
+        "context_menu.chat_menu": "QMenu{background-color:#f3f4f7;color:#1f1f1f;border:1px solid rgba(0,0,0,0.08);padding:4px;}QMenu::item{padding:6px 18px;}QMenu::item:selected{background-color:rgba(51,103,214,0.18);}QMenu::separator{height:1px;background-color:rgba(0,0,0,0.08);margin:4px 0;}",
+        "context_menu.message_menu": "QMenu{background-color:#f3f4f7;color:#1f1f1f;border:1px solid rgba(0,0,0,0.08);padding:4px;}QMenu::item{padding:6px 18px;}QMenu::item:selected{background-color:rgba(51,103,214,0.22);}QMenu::separator{height:1px;background-color:rgba(0,0,0,0.08);margin:4px 0;}",
+        "message_feed.scroll_area": "QScrollArea{border:none;}QScrollArea > QWidget > QWidget{background-color:transparent;}",
+        "media.preview_circular": "border-radius:$radiuspx; background-color:#1f1f1f; color:#fff;",
+        "media.time_label": "color:#9fa6b1; font-size:11px;",
+        "animation_demo.bubble": "QFrame#bubble { background:$bubble_bg; color:$bubble_fg; border-radius:14px; }QFrame#bubble QLabel { color:$bubble_fg; }",
+        "animation_demo.zone": "QWidget#zone { background:$zone_bg; border:1px solid $zone_border; border-radius:8px; }",
+        "animation_demo.window": "background:$app_bg;",
+        "message.bubble.label": "#bubble QLabel{color:$text; background-color:transparent;}#bubble QLabel a{color:$link; text-decoration:none;}",
+        "message.reply.accent": "background-color: rgba(51, 144, 236, 0.9); border-radius: 2px;",
+        "message.reply.sender": "font-weight:600; font-size:11px; color:#2f6ea1;",
+        "message.reply.context": "font-size:10px; color:#3390ec;",
+        "message.reply.text": "font-size:11px; color:#1b1f2a;",
+        "message.reply.text_deleted": "font-size:11px; color:#c0392b; font-style:italic;",
+        "message.forward.icon": "color:#3390ec;font-size:12px;",
+        "message.forward.text": "color:#3390ec;font-size:11px;",
+        "message.deleted.label": "color:#c0392b;font-size:11px;",
+        "message.hidden.label": "color:#6b7280;font-size:11px;",
+        "message.body.rich_text": "background-color: transparent;",
+        "message.body.container": "background-color: transparent;",
+        "message.status.label": "color:#6b7280;font-size:11px;",
+        "message.media.container": "background-color: transparent;",
+        "message.audio.voice_button": "QToolButton { background-color:rgba(51,144,236,0.12); border:none; border-radius:20px; padding:6px 10px; color:#3390ec; font-size:18px; }QToolButton:hover { background-color:rgba(51,144,236,0.18); }",
+        "message.audio.time_label": "font-size:11px;",
+        "message.audio.file_icon": "font-size:24px;",
+        "message.audio.title": "font-weight:bold;",
+        "message.audio.meta": "font-size:11px;",
+        "message.document.title": "font-weight:600;font-size:13px;",
+        "message.document.meta": "font-size:11px;",
+        "message.document.status": "font-size:10px;",
+        "message.deleted.placeholder": "color:#8894a8;font-style:italic;",
+        "message.caption": "font-size:13px;",
+        "message.header.deleted": "color:#7e879b;font-size:12px;font-weight:600;",
+        "message.header.me": "color:#1b1f2a;font-size:12px;font-weight:600;",
+        "message.header.other": "color:#3a4354;font-size:12px;font-weight:600;",
+        "settings.tabs": "QTabWidget::pane { background-color:#ffffff; border:1px solid rgba(27,31,42,0.12); border-radius:10px; }\nQTabBar::tab { background-color:rgba(27,31,42,0.04); color:#1b1f2a; padding:8px 16px; border-top-left-radius:8px; border-top-right-radius:8px; margin-right:2px; }\nQTabBar::tab:selected { background-color:rgba(51,144,236,0.20); }\nQTabBar::tab:hover { background-color:rgba(51,144,236,0.12); }",
+        "style_editor.group": "QGroupBox { background-color:#1e1e1e; border:1px solid rgba(255,255,255,0.08); border-radius:10px; margin-top:12px; }\nQGroupBox::title { color:#f3f3f3; subcontrol-origin: margin; left:14px; padding:0 6px; font-weight:600; }\n#StyleQuickLabel { font-size:12px; color:#b7bcc6; }\n#StyleMetricLabel { min-width:48px; text-align:right; font-weight:600; color:#f3f3f3; }",
+        "style_editor.advanced_box": "QGroupBox { background-color:#202020; border:1px solid rgba(0,0,0,0.45); border-radius:10px; margin-top:12px; }\nQGroupBox::title { color:#f3f3f3; subcontrol-origin: margin; left:14px; padding:0 6px; font-weight:600; }",
+        "style_editor.tree": "QTreeWidget { background-color:#1b1b1b; border:1px solid rgba(255,255,255,0.08); padding:2px; }\nQTreeWidget::item { height:22px; }\nQHeaderView::section { background-color:#232323; color:#b7bcc6; border:none; padding:4px 6px; }",
+        "style_editor.color_button": "border:1px solid rgba(255,255,255,0.12); border-radius:8px; padding:6px 12px; font-weight:600; text-align:left;"
+      },
+      "metrics": {},
+      "bubbles": {
+        "me": {
+          "bg": "#2b5278",
+          "border": "#3a71a1",
+          "text": "#f4f7ff",
+          "link": "#7ab8ff"
+        },
+        "assistant": {
+          "bg": "#1f4a3a",
+          "border": "#2e6a53",
+          "text": "#f2fff7",
+          "link": "#7ae0b8"
+        },
+        "other": {
+          "bg": "#1c1c1c",
+          "border": "#2a2a2a",
+          "text": "#e2e2e2",
+          "link": "#7ab8ff"
+        }
+      },
+      "colors": {
+        "chat_sidebar.folder_icon": "#768c9e"
+      },
+      "message_feed": {
+        "username_colors": [
+          "#ff8b8b",
+          "#ffb86c",
+          "#ffd479",
+          "#7be094",
+          "#5ec7ff",
+          "#80a0ff",
+          "#ff7ad8",
+          "#7dd7ff",
+          "#9de27f",
+          "#f7a8ff"
+        ]
+      },
+      "animation_demo": {
+        "colors": {
+          "bubble_bg": "#62b3ff",
+          "bubble_fg": "#ffffff",
+          "app_bg": "#141519",
+          "zone_bg": "#1f2125",
+          "zone_border": "#3a3d42"
+        }
+      },
+      "message_widgets": {
+        "link_color": "#59b7ff",
+        "bubbles": {
+          "me": {
+            "bg": "#d7f5d2",
+            "border": "#b6e7ad",
+            "text": "#0b141d",
+            "link": "#3390ec"
+          },
+          "assistant": {
+            "bg": "#ffffff",
+            "border": "#dfe3ea",
+            "text": "#0b141d",
+            "link": "#3390ec"
+          },
+          "other": {
+            "bg": "#ffffff",
+            "border": "#dfe3ea",
+            "text": "#0b141d",
+            "link": "#3390ec"
+          }
+        },
+        "deleted_bubble": {
+          "bg": "#f1f3f6",
+          "border": "#d7dce5",
+          "text": "#6b7280",
+          "link": "#3390ec"
+        },
+        "quote_block_style": "margin:4px 0; padding-left:8px; border-left:3px solid rgba(89,183,233,0.45); color:#c4d4eb;",
+        "metrics": {
+          "body_radius": 14,
+          "bubble_max_ratio": 0.54
+        }
+      }
+    }
+  },
+  "presets": {}
+}

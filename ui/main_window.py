@@ -1,0 +1,4908 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import shutil
+import tempfile
+import time
+from typing import Any, Dict, List, Optional, Iterable
+
+from utils import app_paths
+
+from PySide6.QtCore import (
+    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent,
+    QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property
+)
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QCheckBox,
+    QHBoxLayout,
+    QGraphicsOpacityEffect,
+    QInputDialog,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QFrame,
+    QWidget,
+)
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # pragma: no cover
+    def _qt_is_valid(obj: object) -> bool:
+        return obj is not None
+
+from utils.zwc import (
+    decode_zwc,
+    encode_caret_hidden_fragments,
+    encode_zwc,
+    is_zwc_only,
+    contains_zwc,
+    reveal_zwc_fragments_with_entities,
+)
+from utils.text_markup import parse_tg_style_markup
+from ui.account_manager import AccountManagerDialog
+from ui.auth_dialog import AuthDialog
+from ui.avatar_cache import AvatarCache
+from ui.chat_sidebar import ChatSidebarMixin
+from ui.common import HAVE_QTMULTIMEDIA, HAVE_SD, load_history, log, save_history
+from ui.settings_window import SettingsWindow
+from ui.auto_download import AutoDownloadPolicy
+from ui.config_store import DEFAULT_CONFIG, load_config, save_config
+from ui.dialog_workers import DialogsStreamWorker, HistoryWorker, LastDateWorker
+from ui.account_workers import AccountProfileWorker
+from ui.event_pump import EventPump
+from utils.logging_setup import configure_logging
+from ui.message_feed import MessageFeedMixin
+from ui.message_widgets import DEFAULT_BUBBLE_THEME, ChatItemWidget, ReplyPreviewWidget, TextMessageWidget, set_bubble_theme
+from ui.media_picker import MediaPickerPopup
+from ui.send_media_inline_preview import InlineMediaPreviewBar
+from ui.send_media_workers import FfmpegConvertWorker, MediaBatchSendWorker, MediaSendWorker
+from ui.styles import StyleManager, apply_theme
+from ui.components.avatar import AvatarWidget
+
+try:
+    from ui.common import sd, sf  # type: ignore
+except ImportError:
+    sd = None
+    sf = None
+
+
+class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
+    def __init__(self, server, tg_adapter, config: Optional[Dict[str, Any]] = None):
+        # базовая инициализация
+        QWidget.__init__(self)
+        self.setWindowTitle("ESCgram")
+        self.server = server
+        self.tg = tg_adapter
+
+        # конфиг и фичи
+        self._config: Dict[str, Any] = config or load_config()
+        self._ensure_config_defaults()
+        self._apply_ai_config_from_settings(self._config.get("ai") if isinstance(self._config.get("ai"), dict) else {})
+        features_cfg = self._config.get("features", {})
+        theme_cfg = self._config.get("theme", {})
+        self._auto_download_enabled = bool(features_cfg.get("auto_download_media", False))
+        self._ghost_mode_enabled    = bool(features_cfg.get("ghost_mode", False))
+        self._voice_waveform_enabled = bool(features_cfg.get("voice_waveform", True))
+        self._streamer_mode_enabled  = bool(features_cfg.get("streamer_mode", False))
+        self._hide_hidden_chats = bool(features_cfg.get("hide_hidden_chats", True))
+        self._show_my_avatar_enabled = bool(features_cfg.get("show_my_avatar", True))
+        self._keep_deleted_messages = bool(features_cfg.get("keep_deleted_messages", True))
+        self._auto_download_policy = AutoDownloadPolicy.from_config(self._config.get("auto_download"))
+        self._theme_mode = str(theme_cfg.get("mode") or "night")
+        self._night_mode_enabled = (self._theme_mode == "night")
+
+        # геометрия окна
+        window_cfg = self._config.get("window", {})
+        width  = int(window_cfg.get("width",  1000) or 1000)
+        height = int(window_cfg.get("height",  700) or  700)
+        self.resize(width, height)
+
+        # --- анти-мерцание и тёмный фон (убираем белые полосы при анимации) ---
+        # используем Qt6-путь с перечислениями WidgetAttribute
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)   # рисуем весь фон сами
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)   # стиль на top-level виджете
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), QColor("#0E1621"))            # базовый тёмный
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+
+        # ====== стартовое состояние анимации раскрытия ======
+        # tiny-rect от центра, чтобы showEvent мог запустить _animate_open()
+        START_W, START_H = 6, 6
+        cx, cy = max(0, self.width() // 2), max(0, self.height() // 2)
+        self._reveal: QRect = QRect(
+            max(0, cx - START_W // 2),
+            max(0, cy - START_H // 2),
+            START_W,
+            START_H,
+        )
+        # задаём маску сразу, чтобы не было «просветов» до первого тика анимации
+        self.setMask(QRegion(self._reveal))
+        # ссылки на анимации (чтобы их не «съел» GC)
+        self._a1 = None
+        self._a2 = None
+        self._open_group = None
+        self._anim_open_done: bool = False
+
+        # модели/состояния
+        self.history: Dict[str, Any] = load_history()
+        self._history_limit = 200
+        self._history_initial_limit = 40
+        self._history_prefetch_limit = 300
+        self._history_chunk_size = 120
+        self._history_scroll_threshold = 40
+        self._history_current_limit = 0
+        self._history_auto_scroll_on_finish = True
+        self._history_load_requested_by_scroll = False
+        self._history_scroll_enabled = False
+        self.all_chats: Dict[str, Dict[str, Any]] = {}
+        self._chat_items_by_id: Dict[str, Any] = {}
+        self.current_chat_id: Optional[str] = None
+        self._my_id: Optional[str] = None
+        self._loading_history: bool = False
+        self._message_widgets: Dict[int, Any] = {}
+        self._message_cache: Dict[int, Dict[str, Any]] = {}
+        self._reply_index: Dict[int, List[int]] = {}
+        self._chat_last_message_id: Dict[str, int] = {}
+        self._selected_message_ids: set[int] = set()
+        self._runtime_toasts_enabled = bool(int(os.getenv("DRAGO_RUNTIME_TOASTS", "0") or 0))
+        self._pending_reply_to: Optional[int] = None
+        self._reply_bar: Optional[QFrame] = None
+        self._reply_preview_widget: Optional[ReplyPreviewWidget] = None
+        self._media_preview_bar: Optional[InlineMediaPreviewBar] = None
+        self._pending_media_preview: Optional[Dict[str, Any]] = None
+        self._avatar_size = 40
+        self._pending_account_revert: Optional[str] = None
+        self._media_popup: Optional[MediaPickerPopup] = None
+        self._active_account_user_id: str = ""
+        self._account_profile_thread: Optional[QThread] = None
+        self._media_job_active: bool = False
+        self._media_convert_thread: Optional[QThread] = None
+        self._media_convert_worker: Optional[FfmpegConvertWorker] = None
+        self._media_send_thread: Optional[QThread] = None
+        self._media_send_worker: Optional[MediaSendWorker] = None
+        self._media_batch_thread: Optional[QThread] = None
+        self._media_batch_worker: Optional[MediaBatchSendWorker] = None
+        self._media_send_reply_to: Optional[int] = None
+        self._media_send_reply_preview: Optional[Dict[str, Any]] = None
+        self._media_busy_state: Optional[Dict[str, str]] = None
+        self._media_busy_last_toast_at: float = 0.0
+        self._media_active_tmpdir: Optional[str] = None
+        self._local_media_seq: int = 0
+        self._input_min_height = 72
+        self._input_max_height = 260
+        self._pending_reply_updates: set[int] = set()
+        self._media_group_refresh_pending: bool = False
+        self._use_global_context_menu = True
+
+        # аватары
+        self.avatar_cache = AvatarCache(
+            self.server, size=self._avatar_size, on_ready=self._on_avatar_ready,
+        )
+
+        # долгий клик по «Отправить»
+        self._send_hold = QTimer(self)
+        self._send_hold.setSingleShot(True)
+        self._send_hold.timeout.connect(self._send_long)
+        self._send_long_mode = False
+
+        # фоновые потоки
+        self._dialogs_threads: set[QThread] = set()
+        self._dialogs_workers: set[DialogsStreamWorker] = set()
+        self._dialogs_stream_active: bool = False
+        self._hist_thread: Optional[QThread] = None
+        self._hist_worker: Optional[HistoryWorker] = None
+        self._ts_thread: Optional[QThread] = None
+        self._ts_worker: Optional[LastDateWorker] = None
+
+        # таймеры UI
+        self._resort_timer = QTimer(self)
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.timeout.connect(self._flush_chat_list_refresh)
+        self._chat_list_refresh_pending: bool = False
+        self._chat_list_last_refresh_at: float = 0.0
+        self._history_save_pending: bool = False
+        self._history_save_timer = QTimer(self)
+        self._history_save_timer.setSingleShot(True)
+        self._history_save_timer.timeout.connect(self._flush_history_save)
+        self._ts_warmup_done = False
+
+        # сборка UI
+        self._init_event_pump()
+        self._init_ui()
+
+        # синхронизация состояния панели настроек
+        if hasattr(self, "settings_panel"):
+            self.settings_panel.set_auto_download_checked(self._auto_download_enabled)
+            self.settings_panel.set_ghost_mode_checked(self._ghost_mode_enabled)
+            self.settings_panel.set_voice_waveform_checked(self._voice_waveform_enabled)
+            self.settings_panel.set_night_mode_checked(self._night_mode_enabled)
+            self.settings_panel.set_streamer_mode_checked(self._streamer_mode_enabled)
+            if hasattr(self.settings_panel, "set_show_my_avatar_checked"):
+                self.settings_panel.set_show_my_avatar_checked(self._show_my_avatar_enabled)
+
+        # применяем ghost-mode (если есть поддержка в адаптере)
+        try:
+            if hasattr(self.tg, "set_ghost_mode"):
+                self.tg.set_ghost_mode(self._ghost_mode_enabled)
+        except Exception:
+            log.exception("Failed to apply initial ghost mode state")
+
+        # полупрозрачный оверлей под панель настроек
+        self._settings_overlay = QWidget(self)
+        self._settings_overlay.hide()
+        self._settings_overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        StyleManager.instance().bind_stylesheet(self._settings_overlay, "main.settings_overlay")
+        self._settings_overlay.setGeometry(self.rect())
+        self._settings_overlay.mousePressEvent   = self._on_settings_overlay_clicked        # type: ignore[assignment]
+        self._settings_overlay.mouseReleaseEvent = self._on_settings_overlay_mouse_release  # type: ignore[assignment]
+        self._settings_overlay.mouseMoveEvent    = self._on_settings_overlay_mouse_move     # type: ignore[assignment]
+        self._settings_overlay.wheelEvent        = self._on_settings_overlay_wheel          # type: ignore[assignment]
+        self._settings_overlay_effect = QGraphicsOpacityEffect(self._settings_overlay)
+        self._settings_overlay.setGraphicsEffect(self._settings_overlay_effect)
+        self._settings_overlay_effect.setOpacity(0.0)
+
+        # оверлей «Режим стримера»
+        self._streamer_overlay = QLabel("Режим стримера активен", self)
+        self._streamer_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        StyleManager.instance().bind_stylesheet(self._streamer_overlay, "main.streamer_overlay")
+        self._streamer_overlay.hide()
+
+        # голосовые элементы / обновления
+        self._init_voice_controls()
+        self._init_refresh_timers()
+
+        # применяем тему и стартовые режимы
+        self._apply_theme_variant(self._theme_mode)
+        self._set_streamer_mode(self._streamer_mode_enabled, persist=False)
+
+        # первичная гидратация/аккаунт
+        self._hydrate_cached_dialogs()
+        self._sync_account_card()
+
+    def _ensure_config_defaults(self) -> None:
+        window_cfg = self._config.setdefault("window", {})
+        window_cfg.setdefault("width", 1000)
+        window_cfg.setdefault("height", 700)
+
+        theme_cfg = self._config.setdefault("theme", {})
+        theme_cfg.setdefault("mode", "night")
+        theme_cfg.setdefault("palette", {})
+        bubbles = theme_cfg.setdefault("bubbles", {})
+        for role in ("me", "assistant", "other"):
+            bubbles.setdefault(role, {})
+
+        if "auto_download" not in self._config:
+            self._config["auto_download"] = json.loads(json.dumps(DEFAULT_CONFIG.get("auto_download", {})))
+
+        features_cfg = self._config.setdefault("features", {})
+        features_cfg.setdefault("auto_download_media", False)
+        features_cfg.setdefault("ghost_mode", False)
+        features_cfg.setdefault("voice_waveform", True)
+        features_cfg.setdefault("streamer_mode", False)
+        features_cfg.setdefault("hide_hidden_chats", True)
+        features_cfg.setdefault("show_my_avatar", True)
+        features_cfg.setdefault("keep_deleted_messages", True)
+
+        ai_cfg = self._config.setdefault("ai", {})
+        defaults = DEFAULT_CONFIG.get("ai", {}) if isinstance(DEFAULT_CONFIG.get("ai"), dict) else {}
+        ai_cfg.setdefault("model", defaults.get("model", "gemma2"))
+        ai_cfg.setdefault("context", defaults.get("context", 2048))
+        ai_cfg.setdefault("use_cuda", defaults.get("use_cuda", True))
+        ai_cfg.setdefault("prompt", defaults.get("prompt", ""))
+
+    def _apply_ai_config_from_settings(self, state: Dict[str, Any], *, reset_model: bool = True) -> None:
+        model = str(state.get("model") or "").strip()
+        if model:
+            os.environ["DRAGO_AI_MODEL"] = model
+
+        ctx = state.get("context")
+        try:
+            ctx_int = int(ctx) if ctx is not None else None
+        except Exception:
+            ctx_int = None
+        if ctx_int and ctx_int > 0:
+            os.environ["DRAGO_NUM_CTX"] = str(ctx_int)
+        else:
+            os.environ.pop("DRAGO_NUM_CTX", None)
+
+        use_cuda = bool(state.get("use_cuda", True))
+        if use_cuda:
+            os.environ.pop("DRAGO_FORCE_CPU", None)
+            os.environ.pop("DRAGO_NUM_GPU", None)
+        else:
+            os.environ["DRAGO_FORCE_CPU"] = "1"
+            os.environ["DRAGO_NUM_GPU"] = "0"
+            os.environ.pop("DRAGO_FORCE_GPU", None)
+
+        prompt = str(state.get("prompt") or "")
+        try:
+            import ai as ai_module
+
+            ai_module.update_prompt_template(prompt)
+            if reset_model:
+                ai_module.reset_cached_model()
+        except Exception:
+            log.exception("Failed to apply AI config")
+
+    def _persist_feature_flag(self, key: str, value: bool) -> bool:
+        """Safely persist boolean feature toggles to config."""
+        features_cfg = self._config.setdefault("features", {})
+        previous = bool(features_cfg.get(key, False))
+        features_cfg[key] = bool(value)
+        try:
+            save_config(self._config)
+            return True
+        except Exception:
+            features_cfg[key] = previous
+            log.exception("Failed to persist feature flag %s", key)
+            return False
+
+    def _apply_config_theme(self) -> None:
+        self._apply_theme_variant(self._theme_mode)
+
+    def _apply_theme_variant(self, mode: str) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        theme_cfg = self._config.setdefault("theme", {})
+
+        mgr = StyleManager.instance()
+        try:
+            mgr.set_active_profile(mode)
+        except Exception:
+            # If profile is missing, fall back to whatever is active.
+            pass
+
+        extra_palette = theme_cfg.get("palette")
+        extra_stylesheet = theme_cfg.get("stylesheet")
+        overrides: Dict[str, Any] = {}
+        if isinstance(extra_palette, dict):
+            overrides["palette"] = dict(extra_palette)
+        if isinstance(extra_stylesheet, list):
+            overrides["stylesheet"] = list(extra_stylesheet)
+        elif isinstance(extra_stylesheet, str) and extra_stylesheet.strip():
+            overrides["stylesheet"] = str(extra_stylesheet)
+        if overrides:
+            apply_theme(app, overrides=overrides)
+
+        bubbles: Dict[str, Dict[str, str]] = {}
+        try:
+            raw_bubbles = mgr.bubbles()
+            if isinstance(raw_bubbles, dict):
+                for role, colors in raw_bubbles.items():
+                    if isinstance(colors, dict):
+                        bubbles[str(role)] = {str(k): str(v) for k, v in colors.items() if isinstance(k, str) and isinstance(v, str)}
+        except Exception:
+            bubbles = {}
+        if not bubbles:
+            bubbles = {role: dict(DEFAULT_BUBBLE_THEME.get(role, DEFAULT_BUBBLE_THEME["other"])) for role in ("me", "assistant", "other")}
+
+        extra_bubbles = theme_cfg.get("bubbles")
+        if isinstance(extra_bubbles, dict):
+            for role, entry in extra_bubbles.items():
+                if role in bubbles and isinstance(entry, dict):
+                    bubbles[role].update({str(k): str(v) for k, v in entry.items() if isinstance(k, str) and isinstance(v, str)})
+
+        set_bubble_theme(bubbles)
+        if hasattr(self, "settings_panel"):
+            self.settings_panel.set_theme(bubbles)
+
+        self._theme_mode = mode
+        self._night_mode_enabled = (mode == "night")
+        theme_cfg["mode"] = mode
+        try:
+            save_config(self._config)
+        except Exception:
+            log.debug("Не удалось сохранить настройки темы")
+        if hasattr(self, "settings_panel"):
+            self.settings_panel.set_night_mode_checked(self._night_mode_enabled)
+
+    def _hydrate_cached_dialogs(self) -> None:
+        try:
+            cached = self.server.list_cached_dialogs(limit=400)
+        except Exception:
+            cached = []
+        if cached:
+            self.on_dialogs_batch(cached)
+
+    def _init_voice_controls(self) -> None:
+        # Telegram-like behaviour:
+        # - hold → record voice
+        # - release → send
+        # - short click → show actions menu (send audio / video note)
+        self._voice_pressing: bool = False
+        self._voice_hold = QTimer(self)
+        self._voice_hold.setSingleShot(True)
+        self._voice_hold.timeout.connect(self._voice_long)
+        self._recording = False
+        self._rec_stream = None
+        self._rec_writer = None
+        self._rec_path: Optional[str] = None
+        self._recent_outgoing: Dict[str, List[Dict[str, Any]]] = {
+            "voice": [],
+            "audio": [],
+            "video": [],
+            "video_note": [],
+            "document": [],
+        }
+        self.btn_voice.pressed.connect(self._voice_pressed)
+        self.btn_voice.released.connect(self._voice_released)
+        self._update_voice_button()
+
+    def _update_settings_overlay_geometry(self) -> None:
+        if self._settings_overlay and self._settings_overlay.isVisible():
+            self._settings_overlay.setGeometry(self.rect())
+
+    def _set_settings_overlay_visible(self, visible: bool) -> None:
+        if not hasattr(self, "_settings_overlay"):
+            return
+        if visible:
+            self._settings_overlay.setGeometry(self.rect())
+            self._settings_overlay.show()
+            self._settings_overlay.raise_()
+            if hasattr(self, "settings_panel"):
+                self.settings_panel.raise_()
+        else:
+            self._settings_overlay.hide()
+
+    def _on_settings_panel_toggled(self, visible: bool) -> None:
+        self._set_settings_overlay_visible(visible)
+
+    def _on_settings_theme_changed(self, colors: Dict[str, str]) -> None:
+        theme_cfg = self._config.setdefault("theme", {})
+        bubbles_cfg = theme_cfg.setdefault("bubbles", {})
+        updated: Dict[str, Dict[str, str]] = {}
+        for role, color in colors.items():
+            if not isinstance(color, str):
+                continue
+            qcolor = QColor(color)
+            if not qcolor.isValid():
+                continue
+            defaults = dict(DEFAULT_BUBBLE_THEME.get(role, DEFAULT_BUBBLE_THEME["other"]))
+            role_cfg = dict(bubbles_cfg.get(role, defaults))
+            role_cfg["bg"] = qcolor.name()
+            role_cfg["border"] = QColor(qcolor).darker(120).name()
+            updated[role] = role_cfg
+            bubbles_cfg[role] = role_cfg
+
+        if updated:
+            set_bubble_theme(bubbles_cfg)
+            if hasattr(self, "settings_panel"):
+                self.settings_panel.set_theme(bubbles_cfg)
+            save_config(self._config)
+
+    def _on_settings_animation_progress(self, value: float) -> None:
+        if not hasattr(self, "_settings_overlay_effect"):
+            return
+        progress = max(0.0, min(1.0, float(value)))
+        self._settings_overlay_effect.setOpacity(progress * 0.75)
+        if progress > 0 and not self._settings_overlay.isVisible():
+            self._settings_overlay.show()
+        elif progress <= 0:
+            self._settings_overlay.hide()
+
+    def _set_night_mode(self, enabled: bool) -> None:
+        target = "night" if enabled else "day"
+        if target == self._theme_mode:
+            return
+        self._apply_theme_variant(target)
+
+    def _set_streamer_mode(self, enabled: bool, *, persist: bool = True) -> None:
+        enabled = bool(enabled)
+        previous = getattr(self, "_streamer_mode_enabled", False)
+        if persist:
+            if not self._persist_feature_flag("streamer_mode", enabled):
+                if hasattr(self, "settings_panel"):
+                    self.settings_panel.set_streamer_mode_checked(previous)
+                return
+        self._streamer_mode_enabled = enabled
+        if hasattr(self, "_streamer_overlay"):
+            self._streamer_overlay.setGeometry(self.rect())
+            self._streamer_overlay.setVisible(enabled)
+        if hasattr(self, "settings_panel"):
+            self.settings_panel.set_streamer_mode_checked(enabled)
+
+    def _persist_window_config(self) -> None:
+        window_cfg = self._config.setdefault("window", {})
+        window_cfg["width"] = int(max(100, self.width()))
+        window_cfg["height"] = int(max(100, self.height()))
+
+    # ===== АНИМАЦИЯ РАСКРЫТИЯ ОКНА =====
+
+    def getRevealRect(self) -> QRect:
+        return QRect(self._reveal)
+
+    def setRevealRect(self, r: QRect) -> None:
+        # +1/-1 по всем краям: убираем 1px щели на HiDPI и целочисленной интерполяции QRect
+        r = QRect(r.adjusted(-1, -1, 1, 1))
+        self._reveal = r
+        self.setMask(QRegion(self._reveal))
+        # немедленно перерисовываем только нужную область (быстрее и без «белых» кадров)
+        self.update(self._reveal)
+
+    revealRect = Property(QRect, getRevealRect, setRevealRect)
+
+    def _animate_open(self, vert_ms: int = 600, horz_ms: int = 600) -> None:
+        W, H = self.width(), self.height()
+        start_w = self._reveal.width()
+        start_h = self._reveal.height()
+
+        vert_start = QRect((W - start_w) // 2, (H - start_h) // 2, start_w, start_h)
+        vert_end = QRect((W - start_w) // 2, 0, start_w, H)
+        a1 = QPropertyAnimation(self, b"revealRect")
+        a1.setDuration(vert_ms)
+        a1.setStartValue(vert_start)
+        a1.setEndValue(vert_end)
+        a1.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        horz_start = vert_end
+        horz_end = QRect(0, 0, W, H)
+        a2 = QPropertyAnimation(self, b"revealRect")
+        a2.setDuration(horz_ms)
+        a2.setStartValue(horz_start)
+        a2.setEndValue(horz_end)
+        a2.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        group = QSequentialAnimationGroup(self)
+        group.addAnimation(a1)
+        group.addAnimation(a2)
+        group.finished.connect(self.clearMask)
+        group.finished.connect(lambda: self.update())
+
+        # <<< важное: не даём GC убить анимации во время проигрывания >>>
+        self._a1, self._a2, self._open_group = a1, a2, group
+        group.start()
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        if not getattr(self, "_anim_open_done", False):
+            self._anim_open_done = True
+            self._animate_open(vert_ms=600, horz_ms=600)
+
+    def _on_settings_overlay_clicked(self, event) -> None:
+        """Скрыть настройки только если клик вне панели."""
+        if self._forward_overlay_event(event):
+            return
+        panel = getattr(self, "settings_panel", None)
+        overlay = getattr(self, "_settings_overlay", None)
+        if panel and overlay and panel.isVisible():
+            try:
+                global_pos = overlay.mapToGlobal(event.position().toPoint())  # type: ignore[attr-defined]
+                panel_rect = QRect(panel.mapToGlobal(QPoint(0, 0)), panel.size())
+                if panel_rect.contains(global_pos):
+                    mapped = panel.mapFromGlobal(global_pos)
+                    proxy_event = QMouseEvent(
+                        event.type(),
+                        mapped,
+                        panel.mapFromGlobal(global_pos),
+                        event.button(),
+                        event.buttons(),
+                        event.modifiers(),
+                    )
+                    QApplication.sendEvent(panel, proxy_event)
+                    return
+            except Exception:
+                pass
+        try:
+            event.accept()
+        except Exception:
+            pass
+        menu_btn = getattr(self, "menu_button", None)
+        if menu_btn:
+            menu_btn.setChecked(False)
+        else:
+            self._toggle_settings_panel(False)
+
+    def _on_settings_overlay_mouse_release(self, event) -> None:
+        if self._forward_overlay_event(event):
+            return
+        QWidget.mouseReleaseEvent(self._settings_overlay, event)
+
+    def _on_settings_overlay_mouse_move(self, event) -> None:
+        if self._forward_overlay_event(event):
+            return
+        QWidget.mouseMoveEvent(self._settings_overlay, event)
+
+    def _on_settings_overlay_wheel(self, event: QWheelEvent) -> None:
+        if self._forward_overlay_event(event):
+            return
+        event.ignore()
+
+    def _forward_overlay_event(self, event) -> bool:
+        panel = getattr(self, "settings_panel", None)
+        overlay = getattr(self, "_settings_overlay", None)
+        if not (panel and overlay and panel.isVisible()):
+            return False
+        try:
+            local = event.position().toPoint()  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                local = event.pos()
+            except Exception:
+                return False
+        global_pos = overlay.mapToGlobal(local)
+        panel_rect = QRect(panel.mapToGlobal(QPoint(0, 0)), panel.size())
+        if not panel_rect.contains(global_pos):
+            return False
+        mapped = panel.mapFromGlobal(global_pos)
+        if isinstance(event, QMouseEvent):
+            proxy = QMouseEvent(
+                event.type(),
+                mapped,
+                event.globalPosition(),
+                event.button(),
+                event.buttons(),
+                event.modifiers(),
+            )
+            QApplication.sendEvent(panel, proxy)
+            return True
+        if isinstance(event, QWheelEvent):
+            proxy = QWheelEvent(
+                mapped,
+                event.globalPosition(),
+                event.pixelDelta(),
+                event.angleDelta(),
+                event.buttons(),
+                event.modifiers(),
+                event.phase(),
+                event.inverted(),
+                event.source(),
+            )
+            QApplication.sendEvent(panel, proxy)
+            return True
+        return False
+
+    def resizeEvent(self, e) -> None:
+        """Держим оверлей на весь размер окна при ресайзе."""
+        super().resizeEvent(e)
+        try:
+            if hasattr(self, "_settings_overlay") and self._settings_overlay:
+                self._settings_overlay.setGeometry(self.rect())
+            if hasattr(self, "_streamer_overlay") and self._streamer_overlay:
+                self._streamer_overlay.setGeometry(self.rect())
+            if hasattr(self, "_reposition_settings_panel"):
+                self._reposition_settings_panel()
+        except Exception:
+            pass
+
+    def _init_event_pump(self) -> None:
+        self.pump = EventPump(self.server)
+        self.pump_thread = QThread(self)
+        self.pump_thread.setObjectName("pump_thread")
+        self.pump.moveToThread(self.pump_thread)
+        self.pump_thread.started.connect(self.pump.run)
+        self.pump.gui_ai_message.connect(self._on_ai_msg)
+        self.pump.gui_user_echo.connect(self._on_user_echo)
+        self.pump.gui_peer_message.connect(self._on_peer_message)
+        self.pump.gui_media.connect(self._on_gui_media)
+        self.pump.gui_media_progress.connect(self._on_media_progress)
+        self.pump.gui_touch_dialog.connect(self._on_touch_dialog)
+        self.pump.gui_messages_deleted.connect(self._on_gui_messages_deleted)
+        self.pump_thread.start()
+
+    def _init_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_sidebar())
+
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        center_layout.addWidget(self._build_feed(), 1)
+        try:
+            self.chat_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._apply_bubble_widths)
+
+        bottom_wrap = QWidget()
+        bottom_layout = QVBoxLayout(bottom_wrap)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(6)
+        bottom_layout.addWidget(self._build_reply_bar(), 0)
+        bottom_layout.addWidget(self._build_media_preview_bar(), 0)
+        bottom_layout.addLayout(self._build_bottom_row())
+        center_layout.addWidget(bottom_wrap, 0)
+
+        splitter.addWidget(center)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        if self.tg.is_authorized_sync():
+            QTimer.singleShot(1000, self.refresh_telegram_chats_async)
+        else:
+            QTimer.singleShot(0, self._ensure_authorized)
+
+        self._shortcut_find = QShortcut(QKeySequence.Find, self)
+        self._shortcut_find.activated.connect(self.show_message_search)
+        self._shortcut_find_next = QShortcut(QKeySequence.FindNext, self)
+        self._shortcut_find_next.activated.connect(lambda: self.find_in_messages(forward=True))
+        self._shortcut_find_prev = QShortcut(QKeySequence.FindPrevious, self)
+        self._shortcut_find_prev.activated.connect(lambda: self.find_in_messages(forward=False))
+        self._shortcut_find_close = QShortcut(QKeySequence("Esc"), self)
+        self._shortcut_find_close.activated.connect(self.hide_message_search)
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        try:
+            handled = ChatSidebarMixin.eventFilter(self, obj, event)
+        except Exception:
+            handled = False
+        if handled:
+            return True
+
+        viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.ContextMenu:
+            try:
+                pos = event.pos()
+            except Exception:
+                pos = None
+            if pos is not None:
+                widget = self._find_message_widget_at(viewport, pos)
+                if widget is not None:
+                    try:
+                        global_pos = viewport.mapToGlobal(pos)
+                    except Exception:
+                        global_pos = None
+                    if global_pos is not None:
+                        self._show_message_context_menu(widget, global_pos)
+                        return True
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.Resize:
+            self._schedule_bubble_width_update()
+        return False
+
+    def _find_message_widget_at(self, viewport: QWidget, pos: QPoint) -> Optional[QWidget]:
+        wrap = getattr(self, "chat_history_wrap", None)
+        if wrap is None:
+            return None
+        try:
+            local = viewport.mapTo(wrap, pos)
+            target = wrap.childAt(local)
+        except Exception:
+            target = None
+        node = target
+        while node is not None:
+            if self._message_id_from_widget(node) is not None:
+                return node
+            try:
+                node = node.parent()
+            except Exception:
+                node = None
+        return None
+
+    def _schedule_bubble_width_update(self) -> None:
+        timer = getattr(self, "_bubble_width_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_bubble_widths)
+            self._bubble_width_timer = timer
+        try:
+            timer.start(0)
+        except Exception:
+            pass
+
+    def _bubble_max_width(self) -> int:
+        viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
+        vw = int(viewport.width()) if viewport is not None else int(self.width())
+        ratio = float(StyleManager.instance().metric("message_widgets.metrics.bubble_max_ratio", 0.54) or 0.54)
+        maxw = int(vw * ratio)
+        return max(280, min(920, maxw))
+
+    def _apply_bubble_widths(self) -> None:
+        maxw = self._bubble_max_width()
+        seen: set[int] = set()
+        widgets: list = []
+        try:
+            widgets.extend(list(getattr(self, "_message_order", []) or []))
+        except Exception:
+            pass
+        try:
+            widgets.extend(list(getattr(self, "_message_widgets", {}).values() or []))
+        except Exception:
+            pass
+
+        for widget in widgets:
+            if widget is None:
+                continue
+            if id(widget) in seen:
+                continue
+            seen.add(id(widget))
+            for attr in ("bubble", "_caption_bubble"):
+                bubble = getattr(widget, attr, None)
+                if isinstance(bubble, QWidget):
+                    try:
+                        bubble.setMaximumWidth(maxw)
+                    except Exception:
+                        pass
+
+    def _build_reply_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("replyBar")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        StyleManager.instance().bind_stylesheet(bar, "main.reply_bar")
+
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
+
+        preview = ReplyPreviewWidget(bar)
+        layout.addWidget(preview, 1)
+
+        btn_close = QToolButton(bar)
+        btn_close.setText("✕")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setToolTip("Отменить ответ")
+        btn_close.clicked.connect(self._clear_reply_target)
+        StyleManager.instance().bind_stylesheet(btn_close, "main.reply_bar_close")
+        layout.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignTop)
+
+        bar.hide()
+        self._reply_bar = bar
+        self._reply_preview_widget = preview
+        return bar
+
+    def _build_media_preview_bar(self) -> QWidget:
+        bar = InlineMediaPreviewBar(self)
+        bar.cancelRequested.connect(lambda: self._cancel_pending_media_preview(toast=True))
+        bar.sendRequested.connect(self._confirm_pending_media_send)
+        bar.hide()
+        self._media_preview_bar = bar
+        return bar
+
+    def _show_inline_media_preview(
+        self,
+        kind: str,
+        *,
+        chat_id: str,
+        src_path: str,
+        tmpdir: str,
+        out_path: str,
+    ) -> bool:
+        bar = getattr(self, "_media_preview_bar", None)
+        if bar is None:
+            return False
+        try:
+            preview_path = out_path
+            if str(kind or "").strip().lower() == "voice":
+                # QtMultimedia on Windows often cannot decode OGG/Opus (Telegram voice notes),
+                # so preview the original source file instead of the converted .ogg.
+                preview_path = src_path
+            bar.set_media(kind, preview_path, src_path)
+            bar.show()
+            self._pending_media_preview = {
+                "kind": str(kind or "").strip().lower(),
+                "chat_id": str(chat_id or ""),
+                "src_path": str(src_path or ""),
+                "tmpdir": str(tmpdir or ""),
+                "out_path": str(out_path or ""),
+            }
+            try:
+                self.user_input.setFocus()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            log.exception("Failed to show inline media preview")
+            try:
+                bar.hide()
+            except Exception:
+                pass
+            self._pending_media_preview = None
+            return False
+
+    def _cancel_pending_media_preview(self, *, toast: bool = False) -> None:
+        ctx = getattr(self, "_pending_media_preview", None)
+        if not ctx:
+            # Nothing pending; just ensure the widget is hidden/stopped.
+            bar = getattr(self, "_media_preview_bar", None)
+            if bar is not None:
+                try:
+                    bar.stop()
+                    bar.hide()
+                except Exception:
+                    pass
+            return
+
+        self._pending_media_preview = None
+        bar = getattr(self, "_media_preview_bar", None)
+        if bar is not None:
+            try:
+                bar.stop()
+                bar.hide()
+            except Exception:
+                pass
+
+        tmpdir = str(ctx.get("tmpdir") or "")
+        self._safe_cleanup_temp_dir(tmpdir)
+        self._media_active_tmpdir = None
+        self._media_job_active = False
+        if toast:
+            self._toast("Отправка отменена")
+
+    @Slot()
+    def _confirm_pending_media_send(self) -> None:
+        ctx = getattr(self, "_pending_media_preview", None)
+        if not ctx:
+            return
+        self._pending_media_preview = None
+        bar = getattr(self, "_media_preview_bar", None)
+        if bar is not None:
+            try:
+                bar.stop()
+                bar.hide()
+            except Exception:
+                pass
+        try:
+            self._send_prepared_media(
+                str(ctx.get("kind") or ""),
+                str(ctx.get("chat_id") or ""),
+                str(ctx.get("src_path") or ""),
+                str(ctx.get("tmpdir") or ""),
+                str(ctx.get("out_path") or ""),
+            )
+        except Exception:
+            log.exception("Failed to confirm media send from inline preview")
+
+    def _build_bottom_row(self) -> QHBoxLayout:
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(8, 12, 8, 12)
+        bottom_row.setSpacing(8)
+
+        self.btn_attach = QToolButton()
+        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach.setText("📎")
+        self.btn_attach.setToolTip("Отправить файлы")
+        self.btn_attach.clicked.connect(self._pick_files_and_send)
+        bottom_row.addWidget(self.btn_attach)
+
+        self.user_input = QTextEdit()
+        self.user_input.setMinimumHeight(self._input_min_height)
+        self.user_input.setMaximumHeight(self._input_max_height)
+        self.user_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.user_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
+        self.user_input.textChanged.connect(self._adjust_input_height)
+        bottom_row.addWidget(self.user_input, 1)
+
+        self.btn_media = QToolButton()
+        self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_media.setText("😊")
+        self.btn_media.setToolTip("Эмодзи / стикеры / GIF")
+        self.btn_media.clicked.connect(self._toggle_media_picker)
+        bottom_row.addWidget(self.btn_media)
+
+        self.btn_send = QPushButton("Отправить")
+        self._send_button_label = self.btn_send.text()
+        self.btn_send.setAutoDefault(False)
+        self.btn_send.pressed.connect(self._send_pressed)
+        self.btn_send.released.connect(self._send_released)
+        bottom_row.addWidget(self.btn_send)
+
+        self.auto_ai_checkbox = QCheckBox("🤖")
+        self.auto_ai_checkbox.setToolTip("Автоответ AI для текущего чата")
+        self.auto_ai_checkbox.stateChanged.connect(self.on_auto_ai_changed)
+        bottom_row.addWidget(self.auto_ai_checkbox)
+
+        self.btn_voice = QToolButton()
+        self.btn_voice.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_voice.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        voice_action = self.btn_voice.addAction("Отправить аудио…")
+        voice_action.triggered.connect(self._pick_mp3_and_send)
+        video_action = self.btn_voice.addAction("Отправить кружок…")
+        video_action.triggered.connect(self._pick_video_note_and_send)
+        bottom_row.addWidget(self.btn_voice)
+
+        QTimer.singleShot(0, self._adjust_input_height)
+
+        return bottom_row
+
+    @Slot()
+    def _adjust_input_height(self) -> None:
+        editor = getattr(self, "user_input", None)
+        if not isinstance(editor, QTextEdit):
+            return
+        try:
+            doc_h = int(editor.document().size().height())
+        except Exception:
+            doc_h = int(editor.fontMetrics().lineSpacing() * 2)
+        frame = int(editor.frameWidth() * 2)
+        margins = editor.contentsMargins()
+        target = doc_h + frame + int(margins.top()) + int(margins.bottom()) + 10
+        target = max(int(self._input_min_height), min(int(self._input_max_height), int(target)))
+        try:
+            editor.setFixedHeight(target)
+        except Exception:
+            pass
+        need_scroll = target >= int(self._input_max_height)
+        editor.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if need_scroll else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+    @staticmethod
+    def _classify_attachment_kind(path: str) -> str:
+        ext = os.path.splitext(str(path or ""))[1].lower()
+        mime = str(mimetypes.guess_type(path)[0] or "").lower()
+        if ext in {".gif"}:
+            return "animation"
+        if mime.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".bmp"}:
+            return "image"
+        if mime.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}:
+            return "video"
+        if mime.startswith("audio/") or ext in {".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".oga", ".opus"}:
+            if ext in {".ogg", ".oga", ".opus"}:
+                return "voice"
+            return "audio"
+        return "document"
+
+    @Slot()
+    def _pick_files_and_send(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            QMessageBox.information(self, "Файлы", "Сначала выберите чат.")
+            return
+        if self._media_job_in_progress():
+            self._toast("Дождитесь завершения текущей отправки")
+            return
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Выбрать файлы",
+            "",
+            "Media files (*.jpg *.jpeg *.png *.bmp *.gif *.mp4 *.mov *.m4v *.mkv *.webm *.avi *.mp3 *.wav *.m4a *.flac *.ogg *.oga *.opus);;All files (*.*)",
+        )
+        selected = [str(p) for p in (paths or []) if p and os.path.isfile(p)]
+        if not selected:
+            return
+
+        caption_text = str(self.user_input.toPlainText() or "").strip()
+        prepared: List[Dict[str, Any]] = []
+        for src in selected:
+            kind = self._classify_attachment_kind(src)
+            stable_path = src
+            try:
+                size = int(os.path.getsize(src))
+            except Exception:
+                size = 0
+            try:
+                cached_path, cached_size = self._cache_outgoing_media(kind, src)
+                if cached_path and os.path.isfile(cached_path):
+                    stable_path = cached_path
+                    size = int(cached_size or size)
+            except Exception:
+                pass
+            prepared.append(
+                {
+                    "kind": kind,
+                    "path": stable_path,
+                    "size": int(size or 0),
+                    "caption": "",
+                }
+            )
+
+        if not prepared:
+            return
+        if caption_text:
+            prepared[0]["caption"] = caption_text
+
+        reply_to = getattr(self, "_pending_reply_to", None)
+        reply_preview = self._build_reply_preview(reply_to)
+        self._media_send_reply_to = int(reply_to) if reply_to is not None else None
+        self._media_send_reply_preview = reply_preview
+
+        local_group_id = f"local-{int(time.time() * 1000)}" if len(prepared) > 1 else None
+        pending_ids: List[Optional[int]] = []
+        now_ts = int(time.time())
+        for idx, item in enumerate(prepared):
+            local_id = self._add_pending_local_media_widget(
+                kind=str(item["kind"]),
+                chat_id=chat_id,
+                media_path=str(item["path"]),
+                file_size=int(item["size"] or 0),
+                caption_text=str(item.get("caption") or "") if idx == 0 else "",
+                media_group_id=local_group_id,
+                timestamp=now_ts,
+            )
+            pending_ids.append(local_id)
+
+        if caption_text:
+            try:
+                self.user_input.clear()
+            except Exception:
+                pass
+        self._clear_reply_target()
+        self._start_media_batch_send(chat_id=chat_id, items=prepared, pending_ids=pending_ids)
+
+    def _start_media_batch_send(
+        self,
+        *,
+        chat_id: str,
+        items: List[Dict[str, Any]],
+        pending_ids: List[Optional[int]],
+    ) -> None:
+        if not items:
+            return
+        try:
+            timeout = max(180.0, 70.0 * float(len(items)))
+        except Exception:
+            timeout = 300.0
+        self._start_media_busy("Файлы", "Отправляю файлы…")
+        self._media_job_active = True
+        self._media_batch_ctx = {
+            "chat_id": str(chat_id or ""),
+            "pending_ids": list(pending_ids),
+            "items": [dict(x) for x in items],
+        }
+        try:
+            thread = QThread(self)
+            thread.setObjectName("media_batch_thread")
+            worker = MediaBatchSendWorker(
+                self.tg,
+                chat_id=str(chat_id or ""),
+                items=list(items),
+                reply_to=self._media_send_reply_to,
+                timeout_sec=timeout,
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.done.connect(self._on_media_batch_done_payload)
+            worker.done.connect(thread.quit)
+            worker.done.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._clear_media_batch_refs)
+            self._media_batch_thread = thread
+            self._media_batch_worker = worker
+            thread.start()
+        except Exception:
+            log.exception("Failed to start media batch send worker")
+            self._media_batch_ctx = None
+            self._stop_media_busy()
+            self._media_job_active = False
+            self._media_send_reply_to = None
+            self._media_send_reply_preview = None
+            for pid in pending_ids:
+                if pid is not None:
+                    self._remove_message_widget(pid)
+            self._toast("Не удалось запустить отправку файлов")
+
+    @Slot(dict)
+    def _on_media_batch_done_payload(self, payload: Dict[str, Any]) -> None:
+        ctx = getattr(self, "_media_batch_ctx", None)
+        self._media_batch_ctx = None
+        self._stop_media_busy()
+        self._media_job_active = False
+        self._media_send_reply_to = None
+        self._media_send_reply_preview = None
+        if not isinstance(ctx, dict):
+            return
+        chat_id = str(ctx.get("chat_id") or "")
+        pending_ids = list(ctx.get("pending_ids") or [])
+        self._on_media_batch_done(chat_id=chat_id, pending_ids=pending_ids, payload=dict(payload or {}))
+
+    def _on_media_batch_done(
+        self,
+        *,
+        chat_id: str,
+        pending_ids: List[Optional[int]],
+        payload: Dict[str, Any],
+    ) -> None:
+        results_raw = payload.get("results")
+        results: List[Dict[str, Any]] = [dict(r) for r in results_raw if isinstance(r, dict)] if isinstance(results_raw, list) else []
+        best_by_index: Dict[int, Dict[str, Any]] = {}
+        for row in results:
+            try:
+                idx = int(row.get("index"))
+            except Exception:
+                continue
+            prev = best_by_index.get(idx)
+            if prev is None or (not bool(prev.get("ok")) and bool(row.get("ok"))):
+                best_by_index[idx] = row
+
+        mids_raw = payload.get("message_ids")
+        message_ids: List[int] = []
+        if isinstance(mids_raw, list):
+            for mid in mids_raw:
+                try:
+                    as_int = int(mid)
+                except Exception:
+                    continue
+                if as_int > 0:
+                    message_ids.append(as_int)
+
+        promoted: set[int] = set()
+        for idx, mid in enumerate(message_ids):
+            if idx >= len(pending_ids):
+                break
+            pid = pending_ids[idx]
+            if pid is None:
+                continue
+            widget = self._message_widgets.get(int(pid))
+            if widget is None:
+                continue
+            self._promote_local_widget_message_id(widget, msg_id=int(mid), timestamp=int(time.time()))
+            promoted.add(idx)
+
+        failed_indices = {idx for idx, row in best_by_index.items() if not bool(row.get("ok"))}
+        if not best_by_index and not bool(payload.get("ok")):
+            failed_indices = {idx for idx in range(len(pending_ids))}
+        for idx, pid in enumerate(pending_ids):
+            if pid is None:
+                continue
+            if idx in failed_indices:
+                self._remove_message_widget(int(pid))
+                continue
+
+        self._refresh_media_group_layout()
+
+        if bool(payload.get("ok")):
+            self._toast("Файлы отправлены")
+            return
+        err = str(payload.get("error") or "").strip()
+        if err:
+            self._toast(err)
+        else:
+            self._toast("Часть файлов не отправилась")
+
+    def _on_message_widget_created(self, widget: QWidget, msg_id: Optional[int], chat_id: Optional[str]) -> None:
+        try:
+            maxw = self._bubble_max_width()
+        except Exception:
+            return
+        for attr in ("bubble", "_caption_bubble"):
+            bubble = getattr(widget, attr, None)
+            if isinstance(bubble, QWidget):
+                try:
+                    bubble.setMaximumWidth(maxw)
+                except Exception:
+                    pass
+
+    def _init_refresh_timers(self) -> None:
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.refresh_telegram_chats_async)
+        self._timer.start(5 * 60_000)
+
+        self._resort_timer.setInterval(5 * 60_000)
+        self._resort_timer.timeout.connect(self.populate_chat_list)
+        self._resort_timer.start()
+
+    def _schedule_chat_list_refresh(self, delay_ms: int = 120) -> None:
+        self._chat_list_refresh_pending = True
+        # Coalesce frequent updates to avoid expensive full chat-list rebuilds on bursts.
+        now = time.monotonic()
+        min_gap = 0.30
+        elapsed = now - float(getattr(self, "_chat_list_last_refresh_at", 0.0) or 0.0)
+        effective_delay = max(0, int(delay_ms))
+        if elapsed < min_gap:
+            effective_delay = max(effective_delay, int((min_gap - elapsed) * 1000))
+        try:
+            self._repaint_timer.start(effective_delay)
+        except Exception:
+            self._chat_list_refresh_pending = False
+            self.populate_chat_list()
+
+    @Slot()
+    def _flush_chat_list_refresh(self) -> None:
+        if not getattr(self, "_chat_list_refresh_pending", False):
+            return
+        self._chat_list_refresh_pending = False
+        self._chat_list_last_refresh_at = time.monotonic()
+        self.populate_chat_list()
+
+    def _ensure_chat_meta(self, chat_id: str) -> Dict[str, Any]:
+        info = dict(self.all_chats.get(chat_id, {}))
+        if not info:
+            info = {
+                "title": chat_id,
+                "type": "private",
+                "last_ts": 0,
+                "unread_count": 0,
+                "pinned": False,
+            }
+        info.setdefault("title", chat_id)
+        info.setdefault("type", "private")
+        info["last_ts"] = int(info.get("last_ts") or 0)
+        info["unread_count"] = max(0, int(info.get("unread_count") or 0))
+        info["pinned"] = bool(info.get("pinned", False))
+        return info
+
+    def _apply_chat_activity(
+        self,
+        chat_id: str,
+        *,
+        ts: Optional[int] = None,
+        unread_delta: int = 0,
+        clear_unread: bool = False,
+        refresh_delay_ms: Optional[int] = None,
+    ) -> None:
+        if not chat_id:
+            return
+        info = self._ensure_chat_meta(chat_id)
+        prev_last_ts = int(info.get("last_ts") or 0)
+        prev_unread = int(info.get("unread_count") or 0)
+        if ts is not None:
+            info["last_ts"] = max(int(info.get("last_ts") or 0), int(ts or 0))
+        if clear_unread:
+            info["unread_count"] = 0
+        elif unread_delta:
+            info["unread_count"] = max(0, int(info.get("unread_count") or 0) + int(unread_delta))
+        self.all_chats[chat_id] = info
+        changed = (int(info.get("last_ts") or 0) != prev_last_ts) or (int(info.get("unread_count") or 0) != prev_unread)
+        if refresh_delay_ms is not None:
+            if changed or clear_unread or unread_delta:
+                self._schedule_chat_list_refresh(refresh_delay_ms)
+
+    def _mark_message_seen(self, chat_id: str, msg_id: Optional[int]) -> bool:
+        if not chat_id or msg_id is None:
+            return False
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return False
+        if mid <= 0:
+            return False
+        last = int(self._chat_last_message_id.get(chat_id, 0) or 0)
+        if mid > last:
+            self._chat_last_message_id[chat_id] = mid
+            return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Chat list interactions
+
+    def on_chat_list_clicked(self, item) -> None:
+        chat_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self.switch_chat(chat_id)
+
+    def switch_chat(self, chat_id: str) -> None:
+        if chat_id == self.current_chat_id:
+            return
+        # If a send-preview is open for the previous chat, close it and cleanup temp files.
+        try:
+            self._cancel_pending_media_preview(toast=False)
+        except Exception:
+            pass
+        self._message_cache.clear()
+        self._reply_index.clear()
+        self._clear_message_selection()
+        self.current_chat_id = chat_id
+        self._apply_chat_activity(chat_id, clear_unread=True, refresh_delay_ms=0)
+        self.update_ai_controls_state()
+        self.load_chat_history_async()
+
+    def update_ai_controls_state(self) -> None:
+        if not self.current_chat_id:
+            self.auto_ai_checkbox.blockSignals(True)
+            self.auto_ai_checkbox.setChecked(False)
+            self.auto_ai_checkbox.setEnabled(False)
+            self.auto_ai_checkbox.blockSignals(False)
+            if hasattr(self, "settings_panel"):
+                self.settings_panel.set_controls_enabled(False)
+                self.settings_panel.sync_flags(enabled=False, auto=False)
+            return
+
+        flags = self.server.get_ai_flags(self.current_chat_id)
+        ai_enabled = bool(flags.get("ai", True))
+        auto_enabled = bool(flags.get("auto", False))
+
+        self.auto_ai_checkbox.blockSignals(True)
+        self.auto_ai_checkbox.setEnabled(ai_enabled)
+        self.auto_ai_checkbox.setChecked(auto_enabled and ai_enabled)
+        self.auto_ai_checkbox.blockSignals(False)
+
+        if hasattr(self, "settings_panel"):
+            self.settings_panel.set_controls_enabled(True)
+            self.settings_panel.sync_flags(enabled=ai_enabled, auto=auto_enabled)
+
+    def on_auto_download_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_auto_download_enabled", False)
+        desired = bool(enabled)
+        if previous == desired:
+            return
+        self._auto_download_enabled = desired
+        if not self._persist_feature_flag("auto_download_media", desired):
+            self._auto_download_enabled = previous
+            panel = getattr(self, "settings_panel", None)
+            if panel:
+                panel.set_auto_download_checked(previous)
+            self._toast("Не удалось сохранить настройку автозагрузки")
+            return
+        if self._auto_download_enabled:
+            self._apply_auto_download_to_feed()
+
+    def on_ghost_mode_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_ghost_mode_enabled", False)
+        desired = bool(enabled)
+        if previous == desired:
+            return
+        self._ghost_mode_enabled = desired
+        if not self._persist_feature_flag("ghost_mode", desired):
+            self._ghost_mode_enabled = previous
+            panel = getattr(self, "settings_panel", None)
+            if panel:
+                panel.set_ghost_mode_checked(previous)
+            self._toast("Не удалось сохранить режим призрака")
+            return
+        try:
+            if hasattr(self.tg, "set_ghost_mode"):
+                self.tg.set_ghost_mode(self._ghost_mode_enabled)
+        except Exception:
+            log.exception("Failed to toggle ghost mode")
+            self._ghost_mode_enabled = previous
+            self._persist_feature_flag("ghost_mode", previous)
+            panel = getattr(self, "settings_panel", None)
+            if panel:
+                panel.set_ghost_mode_checked(previous)
+            self._toast("Не удалось переключить режим призрака")
+            return
+        toast_msg = "Режим призрака включен" if self._ghost_mode_enabled else "Режим призрака выключен"
+        self._toast(toast_msg)
+
+    def on_voice_waveform_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_voice_waveform_enabled", True)
+        desired = bool(enabled)
+        if desired and not HAVE_QTMULTIMEDIA:
+            self._toast("QtMultimedia недоступен — дорожка голосовых отключена")
+            panel = getattr(self, "settings_panel", None)
+            if panel:
+                panel.set_voice_waveform_checked(previous)
+            return
+        if previous == desired:
+            return
+        self._voice_waveform_enabled = desired
+        if not self._persist_feature_flag("voice_waveform", desired):
+            self._voice_waveform_enabled = previous
+            panel = getattr(self, "settings_panel", None)
+            if panel:
+                panel.set_voice_waveform_checked(previous)
+            self._toast("Не удалось сохранить настройку дорожки голосовых")
+            return
+        self._refresh_voice_wave_widgets()
+        toast_msg = "Улучшенная дорожка голосовых включена" if self._voice_waveform_enabled else "Улучшенная дорожка голосовых отключена"
+        self._toast(toast_msg)
+
+    def on_hide_hidden_chats_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_hide_hidden_chats", True)
+        desired = bool(enabled)
+        if previous == desired:
+            return
+        self._hide_hidden_chats = desired
+        if not self._persist_feature_flag("hide_hidden_chats", desired):
+            self._hide_hidden_chats = previous
+            self._toast("Не удалось сохранить настройку скрытых чатов")
+            return
+        self.populate_chat_list()
+
+    def on_show_my_avatar_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_show_my_avatar_enabled", True)
+        desired = bool(enabled)
+        if previous == desired:
+            return
+        self._show_my_avatar_enabled = desired
+        if not self._persist_feature_flag("show_my_avatar", desired):
+            self._show_my_avatar_enabled = previous
+            panel = getattr(self, "settings_panel", None)
+            if panel and hasattr(panel, "set_show_my_avatar_checked"):
+                panel.set_show_my_avatar_checked(previous)
+            self._toast("Не удалось сохранить настройку аватара")
+            return
+        if self.current_chat_id:
+            try:
+                self.clear_feed()
+            except Exception:
+                pass
+            self._message_cache.clear()
+            self._reply_index.clear()
+            self.load_chat_history_async()
+
+    def on_keep_deleted_messages_setting_changed(self, enabled: bool) -> None:
+        previous = getattr(self, "_keep_deleted_messages", True)
+        desired = bool(enabled)
+        if previous == desired:
+            return
+        self._keep_deleted_messages = desired
+        if not self._persist_feature_flag("keep_deleted_messages", desired):
+            self._keep_deleted_messages = previous
+            self._toast("Не удалось сохранить настройку удалённых сообщений")
+            return
+        if self.current_chat_id:
+            self.load_chat_history_async()
+
+    def _on_ai_settings_changed(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        ai_cfg = self._config.setdefault("ai", {})
+        changed = False
+        reset_model = False
+
+        if "model" in payload:
+            model = str(payload.get("model") or "").strip()
+            if model and ai_cfg.get("model") != model:
+                ai_cfg["model"] = model
+                changed = True
+                reset_model = True
+
+        if "context" in payload:
+            ctx_value = payload.get("context")
+            ctx_int: Optional[int]
+            if ctx_value is None:
+                ctx_int = None
+            else:
+                try:
+                    ctx_int = int(ctx_value)
+                    if ctx_int <= 0:
+                        ctx_int = None
+                except Exception:
+                    ctx_int = None
+            if ai_cfg.get("context") != ctx_int:
+                ai_cfg["context"] = ctx_int
+                changed = True
+                reset_model = True
+
+        if "use_cuda" in payload:
+            use_cuda = bool(payload.get("use_cuda", True))
+            if bool(ai_cfg.get("use_cuda", True)) != use_cuda:
+                ai_cfg["use_cuda"] = use_cuda
+                changed = True
+                reset_model = True
+
+        if "prompt" in payload:
+            prompt = str(payload.get("prompt") or "")
+            if str(ai_cfg.get("prompt") or "") != prompt:
+                ai_cfg["prompt"] = prompt
+                changed = True
+
+        if changed:
+            try:
+                save_config(self._config)
+            except Exception:
+                log.exception("Failed to persist AI settings")
+            self._apply_ai_config_from_settings(ai_cfg, reset_model=reset_model)
+
+    def on_night_mode_setting_changed(self, enabled: bool) -> None:
+        self._set_night_mode(bool(enabled))
+
+    def on_streamer_mode_setting_changed(self, enabled: bool) -> None:
+        self._set_streamer_mode(bool(enabled))
+
+    def on_sidebar_action_requested(self, action_id: str) -> None:
+        actions = {
+            "read_local": lambda: self._mark_current_chat_read(local=True),
+            "read_remote": lambda: self._mark_current_chat_read(local=False),
+            "accounts": self._open_account_manager,
+            "settings": self._open_settings_window,
+            "saved": self._open_saved_messages,
+            "profile": self._show_profile_dialog,
+            "contacts": self._open_contacts_picker,
+            "create_group": self._create_group_dialog,
+            "create_channel": self._create_channel_dialog,
+            "archive": self._open_archive_picker,
+            "wallet": self._open_wallet_chat,
+            "calls": self._show_calls_stub,
+        }
+        handler = actions.get(action_id)
+        if handler:
+            handler()
+            return
+        self._toast("Действие пока недоступно")
+
+    def _open_saved_messages(self) -> None:
+        user_id = ""
+        try:
+            user_id = str(self.server.get_self_user_id() or "")
+        except Exception:
+            user_id = ""
+        if not user_id and hasattr(self.tg, "get_self_id_sync"):
+            try:
+                user_id = str(self.tg.get_self_id_sync() or "")
+            except Exception:
+                user_id = ""
+        if not user_id:
+            QMessageBox.warning(self, "Избранное", "Не удалось определить ID аккаунта.")
+            return
+        self.switch_chat(user_id)
+
+    def _show_profile_dialog(self) -> None:
+        meta = None
+        if hasattr(self.tg, "refresh_active_account_profile"):
+            try:
+                meta = self.tg.refresh_active_account_profile()
+            except Exception:
+                meta = None
+        if not isinstance(meta, dict):
+            meta = {}
+        title = str(meta.get("full_name") or meta.get("title") or "Профиль")
+        username = str(meta.get("username") or "")
+        phone = str(meta.get("phone") or "")
+        uid = str(meta.get("user_id") or "")
+        lines = [title]
+        if username:
+            lines.append(f"@{username}")
+        if phone:
+            lines.append(f"Телефон: {phone}")
+        if uid:
+            lines.append(f"ID: {uid}")
+        QMessageBox.information(self, "Профиль", "\n".join(lines))
+
+    def _pick_from_list(self, title: str, label: str, items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not items:
+            return None
+        labels: List[str] = []
+        for row in items:
+            text = str(row.get("label") or row.get("title") or row.get("id") or "")
+            labels.append(text)
+        selection, ok = QInputDialog.getItem(self, title, label, labels, 0, False)
+        if not ok or not selection:
+            return None
+        try:
+            idx = labels.index(selection)
+        except ValueError:
+            return None
+        return items[idx] if 0 <= idx < len(items) else None
+
+    def _open_contacts_picker(self) -> None:
+        if not hasattr(self.tg, "get_contacts_sync"):
+            QMessageBox.information(self, "Контакты", "Контакты недоступны.")
+            return
+        try:
+            contacts = list(self.tg.get_contacts_sync())
+        except Exception:
+            contacts = []
+        if not contacts:
+            QMessageBox.information(self, "Контакты", "Список контактов пуст.")
+            return
+        items = []
+        for row in contacts:
+            title = str(row.get("title") or row.get("username") or row.get("id") or "")
+            username = str(row.get("username") or "")
+            phone = str(row.get("phone") or "")
+            parts = [title]
+            if username:
+                parts.append(f"@{username}")
+            if phone:
+                parts.append(phone)
+            label = " • ".join([p for p in parts if p])
+            items.append({"id": str(row.get("id") or ""), "label": label})
+        choice = self._pick_from_list("Контакты", "Выберите контакт:", items)
+        if choice and choice.get("id"):
+            self.switch_chat(str(choice["id"]))
+
+    def _open_archive_picker(self) -> None:
+        if not hasattr(self.tg, "list_archived_chats_sync"):
+            QMessageBox.information(self, "Архив", "Архив недоступен.")
+            return
+        try:
+            rows = list(self.tg.list_archived_chats_sync(limit=200))
+        except Exception:
+            rows = []
+        if not rows:
+            QMessageBox.information(self, "Архив", "Архив пуст.")
+            return
+        items = []
+        for row in rows:
+            title = str(row.get("title") or row.get("id") or "")
+            username = str(row.get("username") or "")
+            label = f"{title} @{username}".strip() if username else title
+            items.append({"id": str(row.get("id") or ""), "label": label})
+        choice = self._pick_from_list("Архив", "Открыть чат:", items)
+        if choice and choice.get("id"):
+            self.switch_chat(str(choice["id"]))
+
+    def _create_group_dialog(self) -> None:
+        if not hasattr(self.tg, "create_group_sync"):
+            QMessageBox.information(self, "Создать группу", "Создание групп недоступно.")
+            return
+        title, ok = QInputDialog.getText(self, "Создать группу", "Название группы:")
+        if not ok or not str(title or "").strip():
+            return
+        users_raw, ok = QInputDialog.getText(
+            self,
+            "Создать группу",
+            "Участники (ID или @username, через запятую):",
+        )
+        if not ok:
+            return
+        users = [u.strip() for u in str(users_raw or "").split(",") if u.strip()]
+        if not users:
+            QMessageBox.warning(self, "Создать группу", "Нужно указать хотя бы одного участника.")
+            return
+        chat_id = None
+        try:
+            chat_id = self.tg.create_group_sync(str(title), users)
+        except Exception:
+            chat_id = None
+        if not chat_id:
+            QMessageBox.warning(self, "Создать группу", "Не удалось создать группу.")
+            return
+        self.switch_chat(str(chat_id))
+
+    def _create_channel_dialog(self) -> None:
+        if not hasattr(self.tg, "create_channel_sync"):
+            QMessageBox.information(self, "Создать канал", "Создание каналов недоступно.")
+            return
+        title, ok = QInputDialog.getText(self, "Создать канал", "Название канала:")
+        if not ok or not str(title or "").strip():
+            return
+        desc, _ = QInputDialog.getMultiLineText(self, "Создать канал", "Описание (необязательно):")
+        chat_id = None
+        try:
+            chat_id = self.tg.create_channel_sync(str(title), str(desc or ""))
+        except Exception:
+            chat_id = None
+        if not chat_id:
+            QMessageBox.warning(self, "Создать канал", "Не удалось создать канал.")
+            return
+        self.switch_chat(str(chat_id))
+
+    def _open_wallet_chat(self) -> None:
+        if not hasattr(self.tg, "resolve_username_sync"):
+            QMessageBox.information(self, "Кошелёк", "Кошелёк недоступен.")
+            return
+        chat_id = None
+        try:
+            chat_id = self.tg.resolve_username_sync("wallet")
+        except Exception:
+            chat_id = None
+        if not chat_id:
+            QMessageBox.warning(self, "Кошелёк", "Не удалось открыть чат кошелька.")
+            return
+        self.switch_chat(str(chat_id))
+
+    def _show_calls_stub(self) -> None:
+        QMessageBox.information(self, "Звонки", "История звонков пока не поддерживается.")
+
+    def _mark_current_chat_read(self, *, local: bool) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            self._toast("Нет активного чата")
+            return
+        if local:
+            self._apply_chat_activity(chat_id, clear_unread=True, refresh_delay_ms=0)
+            self._toast("Помечено как прочитанное локально")
+            return
+        ok = False
+        if hasattr(self.tg, "mark_chat_read_sync"):
+            try:
+                ok = bool(self.tg.mark_chat_read_sync(chat_id))
+            except Exception:
+                ok = False
+        self._toast("Помечено как прочитанное на сервере" if ok else "Не удалось отправить отметку о прочтении")
+
+    def _refresh_voice_wave_widgets(self) -> None:
+        """Sync waveform widgets visibility with the master toggle."""
+        for mid, widget in list(getattr(self, "_message_widgets", {}).items()):
+            cache = self._message_cache.get(mid)
+            if not cache or cache.get("kind") != "voice":
+                continue
+            setter = getattr(widget, "set_voice_waveform_enabled", None)
+            if callable(setter):
+                try:
+                    setter(self._voice_waveform_enabled)
+                except Exception:
+                    log.debug("Failed to refresh waveform widget for message %s", mid)
+
+    def _after_media_widget_added(self, widget: ChatItemWidget) -> bool:
+        # Avoid O(N^2) relayouts during history loads.
+        self._schedule_media_group_refresh()
+        if self._loading_history:
+            return False
+        should_stick = self._is_user_near_bottom()
+        self._maybe_auto_download_widget(widget)
+        return should_stick
+
+    def _is_widget_near_viewport(self, widget: QWidget, margin: int = 260) -> bool:
+        viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
+        if viewport is None or not _qt_is_valid(viewport):
+            return True
+        target = getattr(widget, "_row_wrap", None) or widget
+        if target is None or not _qt_is_valid(target):
+            return False
+        try:
+            point = target.mapTo(viewport, QPoint(0, 0))
+            top = int(point.y())
+            height = int(max(1, target.height()))
+            bottom = top + height
+            return (bottom >= -int(margin)) and (top <= int(viewport.height()) + int(margin))
+        except Exception:
+            return True
+
+    def _refresh_media_group_layout(self) -> None:
+        order = list(getattr(self, "_message_order", []) or [])
+        total = len(order)
+        if total <= 0:
+            return
+        for idx, widget in enumerate(order):
+            group_id = str(getattr(widget, "_media_group_id", "") or "").strip()
+            setter = getattr(widget, "set_media_group_position", None)
+            if not callable(setter):
+                continue
+            if not group_id:
+                try:
+                    setter("single")
+                except Exception:
+                    pass
+                continue
+            prev = order[idx - 1] if idx > 0 else None
+            next_w = order[idx + 1] if idx + 1 < total else None
+            same_prev = (
+                prev is not None
+                and str(getattr(prev, "_media_group_id", "") or "").strip() == group_id
+                and str(getattr(prev, "_message_role", "") or "").lower() == str(getattr(widget, "_message_role", "") or "").lower()
+            )
+            same_next = (
+                next_w is not None
+                and str(getattr(next_w, "_media_group_id", "") or "").strip() == group_id
+                and str(getattr(next_w, "_message_role", "") or "").lower() == str(getattr(widget, "_message_role", "") or "").lower()
+            )
+            if same_prev and same_next:
+                pos = "middle"
+            elif same_prev:
+                pos = "bottom"
+            elif same_next:
+                pos = "top"
+            else:
+                pos = "single"
+            try:
+                setter(pos)
+            except Exception:
+                pass
+
+    def _maybe_auto_download_widget(self, widget: ChatItemWidget) -> None:
+        if not self._auto_download_enabled or self._loading_history:
+            return
+        if not isinstance(widget, ChatItemWidget):
+            return
+        if widget.file_path and os.path.isfile(widget.file_path):
+            return
+        if widget.download_state not in {"idle", "error"}:
+            return
+        if not widget.server or not widget.chat_id or widget.msg_id is None:
+            return
+        auto_types = {"image", "voice", "video_note", "video", "animation"}
+        if widget.kind not in auto_types:
+            return
+        if not self._is_widget_near_viewport(widget):
+            return
+        chat_info = self.all_chats.get(str(widget.chat_id), {})
+        chat_type = chat_info.get("type", "private")
+        if not self._auto_download_policy.should_download(
+            chat_type=chat_type,
+            kind=widget.kind,
+            file_size=widget.file_size,
+        ):
+            return
+        if getattr(widget, "_auto_dl_pending", False):
+            return
+        setattr(widget, "_auto_dl_pending", True)
+        QTimer.singleShot(120, lambda w=widget: self._start_widget_auto_download(w))
+
+    def _start_widget_auto_download(self, widget: ChatItemWidget) -> None:
+        if not _qt_is_valid(widget):
+            return
+        setattr(widget, "_auto_dl_pending", False)
+        row_wrap = getattr(widget, "_row_wrap", None)
+        if row_wrap is not None and (not _qt_is_valid(row_wrap) or row_wrap.parent() is None):
+            return
+        if getattr(widget, "_disposed", False):
+            return
+        controls_alive = getattr(widget, "_download_controls_alive", None)
+        if callable(controls_alive):
+            try:
+                if not controls_alive():
+                    return
+            except Exception:
+                return
+        if widget.download_state not in {"idle", "error"}:
+            return
+        if not self._is_widget_near_viewport(widget):
+            return
+        try:
+            widget._start_download()
+        except Exception:
+            log.exception("Auto-download failed for message %s/%s", widget.chat_id, widget.msg_id)
+
+    def _apply_auto_download_to_feed(self) -> None:
+        """Trigger auto-download for currently rendered media widgets."""
+        for widget in list(self._message_widgets.values()):
+            self._maybe_auto_download_widget(widget)
+
+    def _on_feed_scroll_changed(self, _value: int) -> None:
+        if self._auto_download_enabled and not self._loading_history:
+            self._apply_auto_download_to_feed()
+        self._maybe_load_more_history_from_scroll()
+
+    def _maybe_load_more_history_from_scroll(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id or not chat_id.lstrip("-").isdigit():
+            return
+        if self._loading_history:
+            return
+        if not bool(getattr(self, "_history_scroll_enabled", False)):
+            return
+        try:
+            bar = self.chat_scroll.verticalScrollBar()
+        except Exception:
+            return
+        if bar is None or int(bar.value()) > int(getattr(self, "_history_scroll_threshold", 40) or 40):
+            return
+        current_limit = int(getattr(self, "_history_current_limit", 0) or 0)
+        if current_limit <= 0:
+            return
+        chunk = int(getattr(self, "_history_chunk_size", 140) or 140)
+        soft_cap = int(getattr(self, "_history_prefetch_limit", 500) or 500)
+        if current_limit < soft_cap:
+            next_limit = min(soft_cap, current_limit + chunk)
+        else:
+            next_limit = current_limit + chunk
+        if next_limit <= current_limit:
+            return
+        self._history_load_requested_by_scroll = True
+        self.load_chat_history_async(reset=False, limit=next_limit, auto_scroll=False)
+
+    def _is_user_near_bottom(self, threshold: int = 96) -> bool:
+        try:
+            bar = self.chat_scroll.verticalScrollBar()
+        except Exception:
+            return True
+        return (bar.maximum() - bar.value()) <= threshold
+
+    def _cache_message(
+        self,
+        msg_id: Optional[int],
+        *,
+        text: str,
+        kind: str,
+        sender: str,
+        reply_to: Optional[int],
+        is_deleted: bool,
+        forward_info: Optional[Dict[str, Any]] = None,
+        duration: Optional[int] = None,
+        waveform: Optional[List[int]] = None,
+        media_group_id: Optional[str] = None,
+    ) -> None:
+        if msg_id is None:
+            return
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        cached: Dict[str, Any] = {
+            "id": mid,
+            "text": text or "",
+            "kind": kind or "text",
+            "sender": sender or "",
+            "reply_to": int(reply_to) if reply_to else None,
+            "is_deleted": bool(is_deleted),
+            "forward_info": forward_info or None,
+            "duration": duration,
+            "waveform": list(waveform) if isinstance(waveform, list) else None,
+            "media_group_id": (str(media_group_id).strip() if media_group_id else None),
+        }
+        self._message_cache[mid] = cached
+        if reply_to:
+            try:
+                parent = int(reply_to)
+            except Exception:
+                parent = None
+            if parent is not None:
+                bucket = self._reply_index.setdefault(parent, [])
+                if mid not in bucket:
+                    bucket.append(mid)
+
+    def _build_reply_preview(self, reply_to: Optional[int]) -> Optional[Dict[str, Any]]:
+        if reply_to is None:
+            return None
+        try:
+            target_id = int(reply_to)
+        except Exception:
+            return None
+        cached = self._message_cache.get(target_id)
+        if cached is None and self.current_chat_id:
+            details = self.server.get_message_details_for_ui(self.current_chat_id, target_id)
+            if details:
+                cached = {
+                    "id": target_id,
+                    "text": details.get("text") or "",
+                    "kind": details.get("type") or "text",
+                    "sender": details.get("sender") or "",
+                    "reply_to": details.get("reply_to"),
+                    "is_deleted": bool(details.get("is_deleted")),
+                    "forward_info": details.get("forward_info"),
+                    "duration": details.get("duration"),
+                    "waveform": details.get("waveform"),
+                    "media_group_id": details.get("media_group_id"),
+                }
+                self._message_cache[target_id] = cached
+                reply_parent = details.get("reply_to")
+                if reply_parent:
+                    try:
+                        parent = int(reply_parent)
+                    except Exception:
+                        parent = None
+                    if parent is not None:
+                        bucket = self._reply_index.setdefault(parent, [])
+                        if target_id not in bucket:
+                            bucket.append(target_id)
+        if not cached:
+            return None
+        return {
+            "id": target_id,
+            "text": cached.get("text") or "",
+            "kind": cached.get("kind") or "text",
+            "sender": cached.get("sender") or "",
+            "is_deleted": bool(cached.get("is_deleted")),
+            "forward_info": cached.get("forward_info"),
+            "duration": cached.get("duration"),
+            "waveform": cached.get("waveform"),
+        }
+
+    def _update_reply_references(self, target_id: Optional[int]) -> None:
+        if target_id is None:
+            return
+        try:
+            key = int(target_id)
+        except Exception:
+            return
+        refs = self._reply_index.get(key, [])
+        if not refs:
+            return
+        preview = self._build_reply_preview(key)
+        for mid in refs:
+            widget = self._message_widgets.get(mid)
+            if not widget:
+                continue
+            try:
+                if hasattr(widget, "set_reply_preview"):
+                    widget.set_reply_preview(preview)
+            except Exception:
+                continue
+
+    def _flush_reply_updates(self, ids: Iterable[int]) -> None:
+        for mid in ids:
+            try:
+                self._update_reply_references(int(mid))
+            except Exception:
+                continue
+
+    def _schedule_media_group_refresh(self) -> None:
+        if self._media_group_refresh_pending:
+            return
+        self._media_group_refresh_pending = True
+        QTimer.singleShot(60, self._flush_media_group_refresh)
+
+    def _flush_media_group_refresh(self) -> None:
+        self._media_group_refresh_pending = False
+        try:
+            self._refresh_media_group_layout()
+        except Exception:
+            pass
+
+    def _message_insert_index(self, msg_id: Optional[int]) -> Optional[int]:
+        """Return insertion position that keeps _message_order sorted by message id."""
+        if msg_id is None:
+            return None
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return None
+        if mid <= 0:
+            return None
+        order = list(getattr(self, "_message_order", []) or [])
+        if not order:
+            return None
+        for idx, widget in enumerate(order):
+            existing_id = self._message_id_from_widget(widget)
+            if existing_id is None or existing_id <= 0:
+                continue
+            if existing_id > mid:
+                return idx
+        return None
+
+    @staticmethod
+    def _widget_text(widget: object) -> str:
+        for attr in ("_original_text", "text"):
+            try:
+                val = getattr(widget, attr, None)
+            except Exception:
+                val = None
+            if isinstance(val, str):
+                return val
+        return ""
+
+    def _promote_local_widget_message_id(self, widget: QWidget, *, msg_id: int, timestamp: Optional[int] = None) -> None:
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        old_mid: Optional[int] = None
+        for attr in ("_message_id", "msg_id"):
+            try:
+                raw = getattr(widget, attr, None)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            try:
+                old_mid = int(raw)
+                break
+            except Exception:
+                continue
+        if old_mid is not None and old_mid in self._message_widgets and old_mid != mid:
+            try:
+                self._message_widgets.pop(old_mid, None)
+            except Exception:
+                pass
+        try:
+            setattr(widget, "_message_id", mid)
+        except Exception:
+            pass
+        if hasattr(widget, "msg_id"):
+            try:
+                setattr(widget, "msg_id", mid)
+            except Exception:
+                pass
+        if timestamp is not None:
+            try:
+                setattr(widget, "_message_timestamp", int(timestamp))
+            except Exception:
+                pass
+        try:
+            self._message_widgets[mid] = widget
+        except Exception:
+            pass
+        row_wrap = getattr(widget, "_row_wrap", None)
+        if row_wrap is not None:
+            try:
+                setattr(row_wrap, "_message_id", mid)
+            except Exception:
+                pass
+        if old_mid is not None:
+            try:
+                self._selected_message_ids.discard(int(old_mid))
+            except Exception:
+                pass
+
+    def _find_pending_local_text_widget(self, text: str) -> Optional[QWidget]:
+        target = str(text or "").strip()
+        fallback: Optional[QWidget] = None
+        if not target:
+            return fallback
+        for widget in reversed(list(getattr(self, "_message_order", []) or [])):
+            role = str(getattr(widget, "role", "") or getattr(widget, "_message_role", "")).lower()
+            if role != "me":
+                continue
+            wid = self._message_id_from_widget(widget)
+            if wid is not None and wid > 0:
+                continue
+            wkind = str(getattr(widget, "kind", "") or "text").lower()
+            if wkind != "text":
+                continue
+            local_text = str(self._widget_text(widget) or "").strip()
+            if local_text == target:
+                return widget
+            if fallback is None:
+                fallback = widget
+        return fallback
+
+    def _find_pending_local_media_widget(self, kind: str, file_size: int) -> Optional[QWidget]:
+        want = str(kind or "").strip().lower()
+        fallback: Optional[QWidget] = None
+        for widget in reversed(list(getattr(self, "_message_order", []) or [])):
+            role = str(getattr(widget, "role", "")).lower()
+            if role != "me":
+                continue
+            wkind = str(getattr(widget, "kind", "")).lower()
+            if wkind != want:
+                continue
+            wid = self._message_id_from_widget(widget)
+            if wid is not None and wid > 0:
+                continue
+            try:
+                wsize = int(getattr(widget, "file_size", 0) or 0)
+            except Exception:
+                wsize = 0
+            if fallback is None:
+                fallback = widget
+            if file_size > 0 and wsize > 0 and wsize != file_size:
+                continue
+            return widget
+        return fallback
+
+    # ------------------------------------------------------------------ #
+    # Event pump handlers
+
+    @Slot(str, str)
+    def _on_ai_msg(self, chat_id: str, text: str) -> None:
+        self._remember_history_entry(
+            chat_id,
+            role="assistant",
+            text=text,
+            sender_id="assistant",
+            sender_name="AI",
+        )
+        if self.current_chat_id and chat_id == self.current_chat_id:
+            self.add_text_item("🤖 AI", text, role="assistant", chat_id=chat_id, user_id="assistant")
+
+    @Slot(str, str, str, object)
+    def _on_user_echo(self, chat_id: str, text: str, user_id: str, payload: object) -> None:
+        mine = (user_id == "me") or (self._my_id and str(user_id) == str(self._my_id))
+        role = "me" if mine else "other"
+        header = "Вы" if mine else (self.server.get_user_display_name(user_id) or "Пользователь")
+        sender_id_val = str(self._my_id or user_id or "me") if mine else str(user_id)
+        hidden_flag = is_zwc_only(text)
+        decoded = decode_zwc(text) if hidden_flag else None
+        entities = None
+        if isinstance(payload, dict):
+            maybe_entities = payload.get("entities")
+            if isinstance(maybe_entities, list):
+                entities = maybe_entities
+        reply_to = None
+        if isinstance(payload, dict):
+            try:
+                reply_to_raw = payload.get("reply_to")
+                reply_to = int(reply_to_raw) if reply_to_raw is not None else None
+            except Exception:
+                reply_to = None
+        local_msg_id: Optional[int] = None
+        if isinstance(payload, dict):
+            try:
+                local_raw = payload.get("id")
+                local_msg_id = int(local_raw) if local_raw is not None else None
+            except Exception:
+                local_msg_id = None
+        reply_preview = self._build_reply_preview(reply_to)
+
+        # For Telegram chats (numeric IDs), storage is the single source of truth.
+        # Persisting local echoes into history.json causes duplicates/reordering.
+        if not str(chat_id or "").lstrip("-").isdigit():
+            self._remember_history_entry(
+                chat_id,
+                role=role,
+                text=text,
+                sender_id=sender_id_val,
+                sender_name=header,
+                hidden=hidden_flag,
+                decoded_text=decoded,
+            )
+        if chat_id != (self.current_chat_id or ""):
+            return
+
+        if contains_zwc(text) or hidden_flag:
+            display, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(text)
+            self.add_text_item(
+                header,
+                display,
+                role=role,
+                chat_id=chat_id,
+                user_id=user_id,
+                entities=hidden_entities or None,
+                has_hidden=has_hidden,
+                msg_id=local_msg_id,
+                reply_to=reply_to,
+                reply_preview=reply_preview,
+            )
+            return
+
+        self.add_text_item(
+            header,
+            text,
+            role=role,
+            chat_id=chat_id,
+            user_id=user_id,
+            entities=entities,
+            msg_id=local_msg_id,
+            reply_to=reply_to,
+            reply_preview=reply_preview,
+        )
+
+    @Slot(str, dict)
+    def _on_peer_message(self, chat_id: str, payload: dict) -> None:
+        """Render live incoming/edited text messages (Telegram → server → GUI)."""
+        if not chat_id:
+            return
+
+        msg_id_raw = payload.get("id") or 0
+        try:
+            msg_id = int(msg_id_raw)
+        except Exception:
+            msg_id = 0
+
+        self._ensure_my_id_for_history()
+        sender_id = str(payload.get("sender_id") or "")
+        mine = bool(self._my_id and sender_id and str(sender_id) == str(self._my_id))
+        is_deleted = bool(payload.get("is_deleted", False))
+        ts_raw = payload.get("ts")
+        try:
+            timestamp = int(ts_raw) if ts_raw is not None else None
+        except Exception:
+            timestamp = None
+
+        is_new_message = self._mark_message_seen(chat_id, msg_id if msg_id else None)
+        is_active_chat = chat_id == (self.current_chat_id or "")
+        if is_active_chat:
+            self._apply_chat_activity(chat_id, ts=timestamp, clear_unread=True, refresh_delay_ms=80)
+        else:
+            unread_delta = 1 if (not mine and not is_deleted and (is_new_message or msg_id <= 0)) else 0
+            self._apply_chat_activity(chat_id, ts=timestamp, unread_delta=unread_delta, refresh_delay_ms=80)
+            return
+
+        role = "me" if mine else "other"
+        header = "Вы" if mine else str(payload.get("sender") or self.server.get_user_display_name(sender_id) or sender_id or "Неизвестно")
+
+        text = str(payload.get("text") or "")
+        hidden_flag = is_zwc_only(text)
+        has_hidden = False
+        display_text = text
+        entities = None
+        if contains_zwc(text) or hidden_flag:
+            display_text, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(text)
+            entities = hidden_entities or None
+        else:
+            maybe_entities = payload.get("entities")
+            if isinstance(maybe_entities, list):
+                entities = maybe_entities
+
+        reply_to_raw = payload.get("reply_to")
+        try:
+            reply_to = int(reply_to_raw) if reply_to_raw is not None else None
+        except Exception:
+            reply_to = None
+
+        forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
+
+        existing = self._message_widgets.get(msg_id) if msg_id else None
+        if existing is None and mine and msg_id > 0:
+            pending = self._find_pending_local_text_widget(display_text)
+            if pending is not None:
+                self._promote_local_widget_message_id(pending, msg_id=msg_id, timestamp=timestamp)
+                existing = pending
+        if existing is not None:
+            try:
+                setter = getattr(existing, "set_message_text", None)
+                if callable(setter):
+                    setter(display_text, entities=entities)
+                if hasattr(existing, "set_deleted"):
+                    existing.set_deleted(is_deleted)
+                if hasattr(existing, "set_has_hidden"):
+                    existing.set_has_hidden(bool(has_hidden))
+                if hasattr(existing, "set_reply_preview"):
+                    existing.set_reply_preview(self._build_reply_preview(reply_to))
+                if hasattr(existing, "set_forward_info"):
+                    existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+            except Exception:
+                pass
+        else:
+            reply_preview = self._build_reply_preview(reply_to)
+            insert_at = self._message_insert_index(msg_id if msg_id else None)
+            self.add_text_item(
+                header,
+                display_text,
+                role=role,
+                chat_id=chat_id,
+                user_id=sender_id,
+                entities=entities,
+                has_hidden=has_hidden,
+                msg_id=msg_id if msg_id else None,
+                reply_to=reply_to,
+                reply_preview=reply_preview,
+                is_deleted=is_deleted,
+                forward_info=forward_info,
+                timestamp=timestamp,
+                insert_at=insert_at,
+            )
+
+        if msg_id:
+            self._cache_message(
+                msg_id,
+                text=text,
+                kind="text",
+                sender=header,
+                reply_to=reply_to,
+                is_deleted=is_deleted,
+                forward_info=forward_info,
+            )
+            self._update_reply_references(msg_id)
+
+    @Slot(str, dict)
+    def _on_gui_media(self, chat_id: str, payload: dict) -> None:
+        if not chat_id:
+            return
+
+        kind_raw = (payload.get("mtype") or "").lower()
+        kind = {"photo": "image", "gif": "animation"}.get(kind_raw, kind_raw)
+        mime = str(payload.get("mime") or "").lower()
+        file_name_hint = str(payload.get("file_name") or "").lower()
+        if kind == "audio":
+            waveform_hint = payload.get("waveform")
+            looks_like_voice = (
+                isinstance(waveform_hint, list)
+                or "audio/ogg" in mime
+                or "audio/opus" in mime
+                or "application/ogg" in mime
+                or file_name_hint.endswith((".ogg", ".oga", ".opus"))
+            )
+            if looks_like_voice:
+                kind = "voice"
+        msg_id = int(payload.get("message_id") or payload.get("id") or 0)
+        if not msg_id:
+            return
+
+        self._ensure_my_id_for_history()
+        text = payload.get("text") or ""
+        file_path = payload.get("file_path")
+        file_size = int(payload.get("file_size") or 0)
+        user_id = str(payload.get("user_id") or "")
+        mine = bool(self._my_id and user_id and str(user_id) == str(self._my_id))
+        is_deleted = bool(payload.get("is_deleted", False))
+        ts_raw = payload.get("ts")
+        try:
+            timestamp = int(ts_raw) if ts_raw is not None else None
+        except Exception:
+            timestamp = None
+
+        is_new_message = self._mark_message_seen(chat_id, msg_id)
+        is_active_chat = chat_id == (self.current_chat_id or "")
+        if is_active_chat:
+            self._apply_chat_activity(chat_id, ts=timestamp, clear_unread=True, refresh_delay_ms=80)
+        else:
+            unread_delta = 1 if (not mine and not is_deleted and is_new_message) else 0
+            self._apply_chat_activity(chat_id, ts=timestamp, unread_delta=unread_delta, refresh_delay_ms=80)
+            return
+
+        role = "me" if mine else "other"
+        header = "Вы" if mine else str(payload.get("sender") or self.server.get_user_display_name(user_id) or user_id or "Неизвестно")
+        forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
+        text_entities = payload.get("entities") if isinstance(payload.get("entities"), list) else None
+        duration_raw = payload.get("duration")
+        try:
+            duration_ms = int(duration_raw) * 1000 if duration_raw else None
+        except Exception:
+            duration_ms = None
+        waveform_payload = payload.get("waveform")
+        if isinstance(waveform_payload, list):
+            try:
+                waveform = [int(v) for v in waveform_payload]
+            except Exception:
+                waveform = None
+        else:
+            waveform = None
+
+        if mine and not file_path and file_size > 0 and kind in {"video", "video_note", "audio", "voice", "document"}:
+            prefer_kind = "voice" if kind == "audio" else kind
+            local = self._match_outgoing_local(prefer_kind, file_size)
+            if local and os.path.isfile(local):
+                file_path = local
+
+        reply_to_raw = payload.get("reply_to")
+        try:
+            reply_to = int(reply_to_raw) if reply_to_raw is not None else None
+        except Exception:
+            reply_to = None
+        media_group_id_raw = payload.get("media_group_id")
+        media_group_id = str(media_group_id_raw).strip() if media_group_id_raw else None
+
+        reply_preview = self._build_reply_preview(reply_to)
+
+        existing = self._message_widgets.get(msg_id)
+        if existing is None and mine and msg_id > 0:
+            pending = self._find_pending_local_media_widget(kind, file_size)
+            if pending is not None:
+                self._promote_local_widget_message_id(pending, msg_id=msg_id, timestamp=timestamp)
+                existing = pending
+        if existing is not None:
+            try:
+                if hasattr(existing, "set_deleted"):
+                    existing.set_deleted(is_deleted)
+                if hasattr(existing, "set_reply_preview"):
+                    existing.set_reply_preview(reply_preview)
+                if hasattr(existing, "set_forward_info"):
+                    existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                if hasattr(existing, "set_caption"):
+                    existing.set_caption(text, entities=text_entities)
+                elif hasattr(existing, "set_message_text"):
+                    existing.set_message_text(text, entities=text_entities)
+                setattr(existing, "_media_group_id", str(media_group_id or ""))
+                if file_path and os.path.isfile(file_path) and hasattr(existing, "show_downloaded_media"):
+                    existing.show_downloaded_media(kind, file_path)
+            except Exception:
+                pass
+        else:
+            insert_at = self._message_insert_index(msg_id)
+            self.add_media_item(
+                kind=kind,
+                header=header,
+                text=text,
+                text_entities=text_entities,
+                role=role,
+                msg_id=msg_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                thumb_path=payload.get("thumb_path"),
+                file_path=file_path,
+                file_size=file_size,
+                reply_to=reply_to,
+                reply_preview=reply_preview,
+                is_deleted=is_deleted,
+                voice_waveform=self._voice_waveform_enabled,
+                forward_info=forward_info,
+                duration_ms=duration_ms,
+                waveform=waveform,
+                media_group_id=media_group_id,
+                insert_at=insert_at,
+            )
+
+        self._cache_message(
+            msg_id,
+            text=text,
+            kind=kind,
+            sender=header,
+            reply_to=reply_to,
+            is_deleted=is_deleted,
+            forward_info=forward_info,
+            duration=int(duration_raw) if duration_raw is not None else None,
+            waveform=waveform,
+            media_group_id=media_group_id,
+        )
+        self._refresh_media_group_layout()
+        self._update_reply_references(msg_id)
+
+    @Slot(str, dict)
+    def _on_media_progress(self, chat_id: str, payload: dict) -> None:
+        if chat_id != (self.current_chat_id or ""):
+            return
+        msg_id = int(payload.get("message_id") or payload.get("id") or 0)
+        if not msg_id:
+            return
+        widget = self._message_widgets.get(msg_id)
+        if widget:
+            try:
+                widget.update_download_state(payload)
+            except Exception:
+                pass
+
+    @Slot(str, list)
+    def _on_gui_messages_deleted(self, chat_id: str, message_ids: List[int]) -> None:
+        if not message_ids:
+            return
+        keep_deleted = bool(getattr(self, "_keep_deleted_messages", True))
+        current = self.current_chat_id or ""
+        for mid in message_ids:
+            try:
+                key = int(mid)
+            except Exception:
+                continue
+            cached = self._message_cache.get(key)
+            if isinstance(cached, dict):
+                cached["is_deleted"] = True
+            elif keep_deleted:
+                self._message_cache[key] = {
+                    "id": key,
+                    "text": "",
+                    "kind": "text",
+                    "sender": "",
+                    "reply_to": None,
+                    "is_deleted": True,
+                    "forward_info": None,
+                    "duration": None,
+                    "waveform": None,
+                    "media_group_id": None,
+                }
+            if key in self._selected_message_ids:
+                self._selected_message_ids.discard(key)
+            refs = self._reply_index.pop(key, [])
+            if refs:
+                for ref_id in refs:
+                    try:
+                        self._update_reply_references(int(ref_id))
+                    except Exception:
+                        continue
+            for parent_id, bucket in list(self._reply_index.items()):
+                if key in bucket:
+                    self._reply_index[parent_id] = [x for x in bucket if x != key]
+            if chat_id == current:
+                if keep_deleted:
+                    widget = self._message_widgets.get(key)
+                    if widget is not None and hasattr(widget, "set_deleted"):
+                        try:
+                            widget.set_deleted(True)
+                        except Exception:
+                            pass
+                else:
+                    self._message_cache.pop(key, None)
+                    self._remove_message_widget(key)
+            elif not keep_deleted:
+                self._message_cache.pop(key, None)
+
+    def _remove_message_widget(self, msg_id: int) -> None:
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        widget = self._message_widgets.pop(mid, None)
+        self._selected_message_ids.discard(mid)
+        self._message_cache.pop(mid, None)
+        if not widget:
+            return
+        try:
+            if widget in getattr(self, "_message_order", []):
+                self._message_order.remove(widget)
+        except Exception:
+            pass
+        row_wrap = getattr(widget, "_row_wrap", None)
+        target = row_wrap if row_wrap is not None else widget
+        try:
+            disposer = getattr(self, "_dispose_widget_tree", None)
+            if callable(disposer):
+                disposer(target)
+        except Exception:
+            pass
+        try:
+            self.chat_history_layout.removeWidget(target)
+        except Exception:
+            pass
+        try:
+            target.deleteLater()
+        except Exception:
+            pass
+        try:
+            self._refresh_media_group_layout()
+        except Exception:
+            pass
+
+    @Slot(str, int)
+    def _on_touch_dialog(self, chat_id: str, ts: int) -> None:
+        if not chat_id:
+            return
+        self._apply_chat_activity(chat_id, ts=int(ts or 0), refresh_delay_ms=120)
+
+    # ------------------------------------------------------------------ #
+    # History loading
+
+    def _stop_history_worker(self) -> None:
+        if self._hist_worker and self._hist_thread:
+            try:
+                self._hist_worker.stop()
+                self._hist_thread.quit()
+                self._hist_thread.wait(900)
+            except Exception:
+                pass
+        self._hist_worker = None
+        self._hist_thread = None
+
+    def load_chat_history_async(
+        self,
+        *,
+        reset: bool = True,
+        limit: Optional[int] = None,
+        auto_scroll: Optional[bool] = None,
+    ) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            self._loading_history = False
+            return
+
+        if auto_scroll is None:
+            auto_scroll = bool(reset)
+        self._history_auto_scroll_on_finish = bool(auto_scroll)
+
+        if reset:
+            self.clear_feed()
+            self._clear_message_selection()
+            self._clear_reply_target()
+            self.hide_message_search()
+            self._message_cache.clear()
+            self._reply_index.clear()
+            self._history_load_requested_by_scroll = False
+            self._history_scroll_enabled = False
+            target_limit = int(limit or getattr(self, "_history_initial_limit", 80) or 80)
+        else:
+            target_limit = int(limit or getattr(self, "_history_current_limit", 0) or 0)
+            if target_limit <= int(getattr(self, "_history_current_limit", 0) or 0):
+                return
+
+        self._history_current_limit = max(1, target_limit)
+        self._loading_history = True
+        self._stop_history_worker()
+
+        if chat_id.lstrip("-").isdigit():
+            self._hist_thread = QThread(self)
+            self._hist_thread.setObjectName("history_thread")
+            self._hist_worker = HistoryWorker(
+                self.server,
+                chat_id,
+                limit=self._history_current_limit,
+                batch_size=24,
+                include_deleted=bool(getattr(self, "_keep_deleted_messages", True)),
+            )
+            self._hist_worker.moveToThread(self._hist_thread)
+            self._hist_thread.started.connect(self._hist_worker.run)
+            self._hist_worker.batch.connect(self.on_history_batch)
+            self._hist_worker.finished.connect(self.on_history_finished)
+            self._hist_worker.finished.connect(self._hist_thread.quit)
+            self._hist_worker.finished.connect(self._hist_worker.deleteLater)
+            self._hist_thread.finished.connect(self._hist_thread.deleteLater)
+            self._hist_thread.start()
+            return
+
+        # Local (non-Telegram numeric) history fallback.
+        messages = self.history.get("chats", {}).get(chat_id, [])
+        if isinstance(messages, list):
+            if self._history_current_limit > 0:
+                messages = messages[-self._history_current_limit :]
+            self.on_history_batch(messages)
+        self.on_history_finished()
+
+    @Slot(list)
+    def on_history_batch(self, messages: List[Dict[str, Any]]) -> None:
+        self._ensure_my_id_for_history()
+        wrap = getattr(self, "chat_history_wrap", None)
+        if wrap:
+            try:
+                wrap.setUpdatesEnabled(False)
+            except Exception:
+                wrap = None
+
+        pending_reply_updates: set[int] = set()
+        try:
+            for entry in messages:
+                kind_raw = (entry.get("type") or "text").lower()
+                if kind_raw == "audio":
+                    mime = str(entry.get("mime") or "").lower()
+                    file_name_hint = str(entry.get("file_name") or "").lower()
+                    waveform_hint = entry.get("waveform")
+                    if (
+                        isinstance(waveform_hint, list)
+                        or "audio/ogg" in mime
+                        or "audio/opus" in mime
+                        or "application/ogg" in mime
+                        or file_name_hint.endswith((".ogg", ".oga", ".opus"))
+                    ):
+                        kind_raw = "voice"
+                text = entry.get("text") or ""
+                entities = entry.get("entities") if isinstance(entry.get("entities"), list) else None
+                msg_id_raw = entry.get("id")
+                try:
+                    msg_id = int(msg_id_raw)
+                except Exception:
+                    msg_id = None
+                if msg_id is not None and self.current_chat_id:
+                    self._mark_message_seen(self.current_chat_id, msg_id)
+                sender_id = str(entry.get("sender_id") or "")
+                reply_to_raw = entry.get("reply_to")
+                try:
+                    reply_to = int(reply_to_raw) if reply_to_raw is not None else None
+                except Exception:
+                    reply_to = None
+                is_deleted = bool(entry.get("is_deleted", False))
+                forward_info = entry.get("forward_info")
+                duration_raw = entry.get("duration")
+                try:
+                    duration_ms = int(duration_raw) * 1000 if duration_raw else None
+                except Exception:
+                    duration_ms = None
+                waveform_entry = entry.get("waveform")
+                waveform = list(waveform_entry) if isinstance(waveform_entry, list) else None
+                media_group_id_raw = entry.get("media_group_id")
+                media_group_id = str(media_group_id_raw).strip() if media_group_id_raw else None
+
+                mine = self._my_id and sender_id == self._my_id
+                role = "me" if mine else ("assistant" if kind_raw == "assistant" else "other")
+                header = "Вы" if mine else (entry.get("sender") or "Неизвестно")
+
+                reply_preview = self._build_reply_preview(reply_to)
+                media_kinds = {"image", "photo", "animation", "gif", "video", "video_note", "audio", "voice", "document", "sticker"}
+                kind_for_cache = kind_raw
+
+                existing = self._message_widgets.get(msg_id) if msg_id is not None else None
+
+                if kind_raw in media_kinds and msg_id is not None:
+                    normalized = {"photo": "image", "gif": "animation"}.get(kind_raw, kind_raw)
+                    kind_for_cache = normalized
+                    caption_text = str(text or "")
+                    caption_entities = entities
+                    caption_has_hidden = False
+                    if caption_text and (contains_zwc(caption_text) or is_zwc_only(caption_text)):
+                        caption_text, hidden_entities, caption_has_hidden = reveal_zwc_fragments_with_entities(caption_text)
+                        caption_entities = hidden_entities or None
+
+                    if existing is not None:
+                        try:
+                            if hasattr(existing, "set_deleted"):
+                                existing.set_deleted(is_deleted)
+                            if hasattr(existing, "set_reply_preview"):
+                                existing.set_reply_preview(reply_preview)
+                            if hasattr(existing, "set_forward_info"):
+                                existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                            if hasattr(existing, "set_caption"):
+                                existing.set_caption(caption_text, entities=caption_entities)
+                            if hasattr(existing, "set_has_hidden"):
+                                existing.set_has_hidden(bool(caption_has_hidden))
+                            setattr(existing, "_media_group_id", str(media_group_id or ""))
+                            file_path = entry.get("file_path")
+                            if file_path and os.path.isfile(file_path) and hasattr(existing, "show_downloaded_media"):
+                                existing.show_downloaded_media(normalized, file_path)
+                        except Exception:
+                            pass
+                    else:
+                        insert_at = self._message_insert_index(msg_id)
+                        self.add_media_item(
+                            kind=normalized,
+                            header=header,
+                            text=caption_text,
+                            text_entities=caption_entities,
+                            role=role,
+                            file_path=entry.get("file_path"),
+                            msg_id=msg_id,
+                            chat_id=self.current_chat_id,
+                            user_id=sender_id,
+                            thumb_path=entry.get("thumb_path"),
+                            file_size=entry.get("file_size"),
+                            has_hidden=caption_has_hidden,
+                            reply_to=reply_to,
+                            reply_preview=reply_preview,
+                            is_deleted=is_deleted,
+                            voice_waveform=self._voice_waveform_enabled,
+                            forward_info=forward_info if isinstance(forward_info, dict) else None,
+                            duration_ms=duration_ms,
+                            waveform=waveform,
+                            media_group_id=media_group_id,
+                            insert_at=insert_at,
+                        )
+                else:
+                    display_text = str(text or "")
+                    entities_for_display = entities
+                    has_hidden = False
+                    if display_text and (contains_zwc(display_text) or is_zwc_only(display_text)):
+                        display_text, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(display_text)
+                        entities_for_display = hidden_entities or None
+
+                    if existing is not None:
+                        try:
+                            setter = getattr(existing, "set_message_text", None)
+                            if callable(setter):
+                                setter(display_text, entities=entities_for_display)
+                            if hasattr(existing, "set_deleted"):
+                                existing.set_deleted(is_deleted)
+                            if hasattr(existing, "set_reply_preview"):
+                                existing.set_reply_preview(reply_preview)
+                            if hasattr(existing, "set_forward_info"):
+                                existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                            if hasattr(existing, "set_has_hidden"):
+                                existing.set_has_hidden(bool(has_hidden))
+                        except Exception:
+                            pass
+                    else:
+                        insert_at = self._message_insert_index(msg_id)
+                        self.add_text_item(
+                            header,
+                            display_text,
+                            role=role,
+                            chat_id=self.current_chat_id,
+                            user_id=sender_id,
+                            entities=entities_for_display,
+                            has_hidden=has_hidden,
+                            msg_id=msg_id,
+                            reply_to=reply_to,
+                            reply_preview=reply_preview,
+                            is_deleted=is_deleted,
+                            forward_info=forward_info if isinstance(forward_info, dict) else None,
+                            insert_at=insert_at,
+                        )
+                if not self._loading_history:
+                    self._apply_bubble_widths()
+
+                self._cache_message(
+                    msg_id,
+                    text=text,
+                    kind=kind_for_cache,
+                    sender=header,
+                    reply_to=reply_to,
+                    is_deleted=is_deleted,
+                    forward_info=forward_info if isinstance(forward_info, dict) else None,
+                    duration=int(duration_raw) if duration_raw is not None else None,
+                    waveform=waveform,
+                    media_group_id=media_group_id,
+                )
+                if msg_id is not None:
+                    pending_reply_updates.add(msg_id)
+            if pending_reply_updates:
+                self._flush_reply_updates(pending_reply_updates)
+            if self._loading_history:
+                self._schedule_media_group_refresh()
+            else:
+                self._refresh_media_group_layout()
+        finally:
+            if wrap:
+                try:
+                    wrap.setUpdatesEnabled(True)
+                except Exception:
+                    pass
+
+    @Slot()
+    def on_history_finished(self) -> None:
+        self._loading_history = False
+        if self.current_chat_id:
+            self._apply_chat_activity(self.current_chat_id, clear_unread=True, refresh_delay_ms=0)
+        if bool(getattr(self, "_history_auto_scroll_on_finish", True)):
+            QTimer.singleShot(0, self._scroll_to_bottom)
+            QTimer.singleShot(60, self._scroll_to_bottom)
+        if getattr(self, "_auto_download_enabled", False):
+            QTimer.singleShot(180, self._apply_auto_download_to_feed)
+        if bool(getattr(self, "_history_load_requested_by_scroll", False)):
+            self._history_load_requested_by_scroll = False
+            return
+        # Enable scroll-triggered paging after initial render settles.
+        QTimer.singleShot(220, lambda: setattr(self, "_history_scroll_enabled", True))
+
+    # ------------------------------------------------------------------ #
+    # Telegram dialogs refresh
+
+    def refresh_telegram_chats_async(self) -> None:
+        if not self.tg.is_authorized_sync():
+            return
+        if getattr(self, "_dialogs_stream_active", False):
+            return
+        self._dialogs_stream_active = True
+        self.sidebar_ui.loading_label.setText("Загружаю чаты…")
+        self.sidebar_ui.loading_label.show()
+
+        thread = QThread(self)
+        thread.setObjectName("dialogs_stream_thread")
+        worker = DialogsStreamWorker(self.server, batch_size=60)
+        self._dialogs_workers.add(worker)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.batch.connect(self.on_dialogs_batch)
+        worker.done.connect(self._on_dialogs_worker_done)
+        worker.done.connect(lambda w=worker: self._dialogs_workers.discard(w))
+        worker.done.connect(self._on_dialogs_stream_done)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda th=thread: self._on_dialogs_thread_finished(th))
+        self._dialogs_threads.add(thread)
+
+        def _fallback() -> None:
+            if not self.all_chats:
+                chats = self.server.list_all_telegram_chats(limit=400)
+                if chats:
+                    self.on_dialogs_batch(chats)
+                self.sidebar_ui.loading_label.setText("Готово (fallback)")
+
+        QTimer.singleShot(8000, _fallback)
+        thread.start()
+
+    @Slot()
+    def _on_dialogs_worker_done(self) -> None:
+        self._dialogs_stream_active = False
+
+    def _on_dialogs_thread_finished(self, thread: QThread) -> None:
+        try:
+            self._dialogs_threads.discard(thread)
+        except Exception:
+            pass
+        self._dialogs_stream_active = False
+
+    def _on_avatar_ready(self, kind: str, entity_id: str) -> None:
+        target_id = str(entity_id or "")
+        if not target_id:
+            return
+
+        if kind == "chat":
+            item_map = getattr(self, "_chat_items_by_id", {})
+            item = item_map.get(target_id) if isinstance(item_map, dict) else None
+            if item:
+                info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+                try:
+                    pixmap = self.avatar_cache.chat(target_id, info)
+                    # Chat list rows already render avatar via ChatListRowWidget.
+                    # Keeping QListWidgetItem icon causes duplicate avatars.
+                    item.setIcon(QIcon())
+                    row_widget = self.chat_list.itemWidget(item)
+                    if row_widget and hasattr(row_widget, "set_avatar"):
+                        row_widget.set_avatar(pixmap)
+                except Exception:
+                    pass
+            else:
+                for idx in range(self.chat_list.count()):
+                    item = self.chat_list.item(idx)
+                    if not item:
+                        continue
+                    cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                    if cid != target_id:
+                        continue
+                    info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+                    try:
+                        pixmap = self.avatar_cache.chat(cid, info)
+                        item.setIcon(QIcon())
+                        row_widget = self.chat_list.itemWidget(item)
+                        if row_widget and hasattr(row_widget, "set_avatar"):
+                            row_widget.set_avatar(pixmap)
+                    except Exception:
+                        pass
+
+        self._refresh_feed_avatars(kind, target_id)
+        if kind == "user" and target_id and target_id == str(getattr(self, "_active_account_user_id", "") or ""):
+            try:
+                self._sync_account_card()
+            except Exception:
+                pass
+
+    def _refresh_feed_avatars(self, kind: str, entity_id: str) -> None:
+        for idx in range(self.chat_history_layout.count()):
+            layout_item = self.chat_history_layout.itemAt(idx)
+            container = layout_item.widget() if layout_item else None
+            if not container:
+                continue
+            avatars = container.findChildren(AvatarWidget)
+            if not avatars:
+                continue
+            for avatar in avatars:
+                widget_kind = str(avatar.property("avatar_kind") or "")
+                widget_id = str(avatar.property("avatar_id") or "")
+                if widget_kind != kind or widget_id != entity_id:
+                    continue
+                try:
+                    if kind == "chat":
+                        info = self.all_chats.get(entity_id, {"title": entity_id})
+                        pixmap = self.avatar_cache.chat(entity_id, info)
+                    elif kind == "user":
+                        header = avatar.toolTip() or entity_id
+                        pixmap = self.avatar_cache.user(entity_id, header)
+                    else:
+                        continue
+                    avatar.set_pixmap(pixmap)
+                    avatar.update()
+                except Exception:
+                    continue
+
+    @Slot()
+    def _on_dialogs_stream_done(self) -> None:
+        self.sidebar_ui.loading_label.setText("Готово")
+        self._schedule_chat_list_refresh(0)
+        if not self._resort_timer.isActive():
+            self._resort_timer.start()
+
+    @Slot(list)
+    def on_dialogs_batch(self, chunk: List[Dict[str, Any]]) -> None:
+        new_ids = []
+        active_chat = self.current_chat_id or ""
+        for info in chunk:
+            cid = str(info["id"])
+            if cid not in self.all_chats:
+                new_ids.append(cid)
+            prev = self.all_chats.get(cid, {})
+            last_ts = info.get("last_ts")
+            if last_ts is None:
+                last_ts = info.get("last_message_date")
+            if last_ts is None:
+                last_ts = prev.get("last_ts", 0)
+            try:
+                merged_last_ts = max(int(prev.get("last_ts") or 0), int(last_ts or 0))
+            except Exception:
+                merged_last_ts = int(last_ts or 0)
+            incoming_unread = info.get("unread_count", prev.get("unread_count", 0))
+            try:
+                unread_val = max(0, int(incoming_unread or 0))
+            except Exception:
+                unread_val = max(0, int(prev.get("unread_count") or 0))
+            prev_unread = max(0, int(prev.get("unread_count") or 0))
+            merged_unread = 0 if cid == active_chat else max(unread_val, prev_unread)
+            self.all_chats[cid] = {
+                "title": info.get("title") or prev.get("title") or cid,
+                "type": info.get("type") or prev.get("type") or "",
+                "last_ts": merged_last_ts,
+                "username": info.get("username") or prev.get("username"),
+                "photo_small_id": info.get("photo_small_id") or prev.get("photo_small_id"),
+                "pinned": bool(info.get("pinned", prev.get("pinned", False))),
+                "unread_count": merged_unread,
+            }
+        self._schedule_chat_list_refresh(60)
+        if new_ids and not self._ts_warmup_done:
+            self._start_last_ts_worker(new_ids[:40])
+            self._ts_warmup_done = True
+
+    def _start_last_ts_worker(self, chat_ids: List[str]) -> None:
+        prev_worker = getattr(self, "_ts_worker", None)
+        if prev_worker is not None and hasattr(prev_worker, "stop"):
+            try:
+                prev_worker.stop()
+            except Exception:
+                pass
+        prev_thread = getattr(self, "_ts_thread", None)
+        if prev_thread is not None:
+            try:
+                if prev_thread.isRunning():
+                    prev_thread.quit()
+                    prev_thread.wait(1000)
+            except Exception:
+                pass
+
+        thread = QThread(self)
+        thread.setObjectName("last_ts_thread")
+        worker = LastDateWorker(self.server, chat_ids, limit_each=1)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.tick.connect(self._on_last_ts_tick)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self._ts_thread = thread
+        self._ts_worker = worker
+
+    @Slot(str, int)
+    def _on_last_ts_tick(self, chat_id: str, ts: int) -> None:
+        if chat_id in self.all_chats:
+            self._apply_chat_activity(chat_id, ts=int(ts or 0), refresh_delay_ms=120)
+
+    # ------------------------------------------------------------------ #
+    # Message sending
+
+    def _toggle_emoji_picker(self) -> None:
+        # Backward-compat: route to the unified media picker.
+        self._toggle_media_picker()
+
+    def _toggle_media_picker(self) -> None:
+        if not hasattr(self, "btn_media"):
+            return
+        if self._media_popup is None:
+            self._media_popup = MediaPickerPopup(self.tg, self)
+            self._media_popup.emojiSelected.connect(self._insert_emoji)
+            self._media_popup.stickerSelected.connect(self._send_sticker_file_id)
+            self._media_popup.gifPickRequested.connect(self._pick_gif_and_send)
+        if self._media_popup.isVisible():
+            self._media_popup.hide()
+        else:
+            self._media_popup.popup_above(self.btn_media)
+
+    def _clear_reply_target(self) -> None:
+        self._pending_reply_to = None
+        bar = getattr(self, "_reply_bar", None)
+        if bar is not None:
+            try:
+                bar.hide()
+            except Exception:
+                pass
+
+    def _set_reply_target(self, message_id: int) -> None:
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        preview = self._build_reply_preview(mid) or {
+            "id": mid,
+            "text": "",
+            "kind": "text",
+            "sender": "Сообщение",
+            "is_deleted": False,
+        }
+        self._pending_reply_to = mid
+        widget = getattr(self, "_reply_preview_widget", None)
+        if widget is not None:
+            try:
+                widget.set_data(preview)
+            except Exception:
+                pass
+        bar = getattr(self, "_reply_bar", None)
+        if bar is not None:
+            try:
+                bar.show()
+            except Exception:
+                pass
+        try:
+            self.user_input.setFocus()
+        except Exception:
+            pass
+
+    def _copy_message_link(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        info = self.all_chats.get(chat_id, {})
+        username = str(info.get("username") or "").strip()
+        if username:
+            link = f"https://t.me/{username}/{mid}"
+        else:
+            link = f"{chat_id}:{mid}"
+        try:
+            QApplication.clipboard().setText(link)
+            self._toast("Ссылка скопирована")
+        except Exception:
+            pass
+
+    def _forward_message(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        to_chat_id = self._choose_forward_target_chat()
+        if not to_chat_id:
+            return
+        try:
+            ok_send = bool(self.server.forward_message(from_chat_id=chat_id, message_id=mid, to_chat_id=to_chat_id))
+        except Exception:
+            ok_send = False
+        self._toast("Переслано" if ok_send else "Не удалось переслать")
+
+    def _choose_forward_target_chat(self) -> Optional[str]:
+        items: List[str] = []
+        mapping: Dict[str, str] = {}
+        for cid, info in sorted(self.all_chats.items(), key=lambda kv: str(kv[1].get("title") or kv[0]).lower()):
+            title = str(info.get("title") or cid)
+            label = f"{title} ({cid})"
+            items.append(label)
+            mapping[label] = str(cid)
+
+        if not items:
+            self._toast("Нет доступных чатов для пересылки")
+            return None
+        chosen, ok = QInputDialog.getItem(self, "Переслать", "Куда:", items, 0, False)
+        if not ok or not chosen:
+            return None
+        return mapping.get(str(chosen))
+
+    def _forward_selected_messages(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        mids = sorted({int(mid) for mid in self._selected_message_ids if int(mid) > 0})
+        if not mids:
+            self._toast("Нет выбранных сообщений")
+            return
+        to_chat_id = self._choose_forward_target_chat()
+        if not to_chat_id:
+            return
+        try:
+            ok_send = bool(self.server.forward_messages(from_chat_id=chat_id, message_ids=mids, to_chat_id=to_chat_id))
+        except Exception:
+            ok_send = False
+        self._toast("Выбранные сообщения пересланы" if ok_send else "Не удалось переслать выбранные сообщения")
+
+    def _delete_message(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            self._purge_messages_locally(chat_id, [mid], purge_storage=False)
+            self._toast("Локальное сообщение удалено")
+            return
+        cached = self._message_cache.get(mid) or {}
+        was_deleted = bool(cached.get("is_deleted"))
+        try:
+            ok_send = bool(self.server.delete_messages(chat_id=chat_id, message_ids=[mid]))
+        except Exception:
+            ok_send = False
+        if ok_send:
+            self._on_gui_messages_deleted(chat_id, [mid])
+            self._toast("Сообщение удалено")
+            return
+        if was_deleted:
+            self._purge_messages_locally(chat_id, [mid], purge_storage=True)
+            self._toast("Сообщение окончательно удалено")
+            return
+        self._toast("Не удалось удалить сообщение")
+
+    def _delete_selected_messages(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        mids_all = sorted({int(mid) for mid in self._selected_message_ids})
+        if not mids_all:
+            self._toast("Нет выбранных сообщений")
+            return
+        local_mids = [mid for mid in mids_all if mid <= 0]
+        mids = [mid for mid in mids_all if mid > 0]
+        if local_mids:
+            self._purge_messages_locally(chat_id, local_mids, purge_storage=False)
+        try:
+            ok_send = bool(self.server.delete_messages(chat_id=chat_id, message_ids=mids)) if mids else True
+        except Exception:
+            ok_send = False
+        if ok_send:
+            if mids:
+                self._on_gui_messages_deleted(chat_id, mids)
+            self._clear_message_selection()
+            self._toast("Выбранные сообщения удалены")
+            return
+        deleteds = [mid for mid in mids if bool((self._message_cache.get(mid) or {}).get("is_deleted"))]
+        if deleteds:
+            self._purge_messages_locally(chat_id, deleteds, purge_storage=True)
+            self._clear_message_selection()
+            self._toast("Удалённые сообщения окончательно удалены")
+            return
+        self._toast("Не удалось удалить выбранные сообщения")
+
+    def _set_message_reaction(self, message_id: int, reaction: str) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        ok = False
+        try:
+            ok = bool(self.server.set_message_reaction(chat_id=chat_id, message_id=mid, reaction=reaction))
+        except Exception:
+            ok = False
+        self._toast("Реакция отправлена" if ok else "Не удалось отправить реакцию")
+
+    def _set_message_selected(self, msg_id: int, selected: bool) -> None:
+        widget = self._message_widgets.get(int(msg_id))
+        if widget is None:
+            return
+        setter = getattr(widget, "set_selected", None)
+        if callable(setter):
+            try:
+                setter(bool(selected))
+            except Exception:
+                pass
+
+    def _toggle_message_selection(self, msg_id: int) -> None:
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        if mid in self._selected_message_ids:
+            self._selected_message_ids.discard(mid)
+            self._set_message_selected(mid, False)
+        else:
+            self._selected_message_ids.add(mid)
+            self._set_message_selected(mid, True)
+        count = len(self._selected_message_ids)
+        self._toast(f"Выбрано: {count}" if count else "Выделение снято")
+
+    def _clear_message_selection(self) -> None:
+        if not self._selected_message_ids:
+            return
+        ids = list(self._selected_message_ids)
+        self._selected_message_ids.clear()
+        for mid in ids:
+            self._set_message_selected(mid, False)
+
+    def _message_id_from_widget(self, widget: object) -> Optional[int]:
+        for attr in ("_message_id", "msg_id"):
+            try:
+                val = getattr(widget, attr, None)
+            except Exception:
+                val = None
+            if val is None:
+                continue
+            try:
+                mid = int(val)
+            except Exception:
+                continue
+            if mid != 0:
+                return mid
+        return None
+
+    def _purge_messages_locally(self, chat_id: str, message_ids: List[int], *, purge_storage: bool) -> None:
+        mids: List[int] = []
+        for mid in message_ids:
+            try:
+                mids.append(int(mid))
+            except Exception:
+                continue
+        if not mids:
+            return
+        current = str(self.current_chat_id or "")
+        for key in mids:
+            self._selected_message_ids.discard(key)
+            self._message_cache.pop(key, None)
+            refs = self._reply_index.pop(key, [])
+            for ref_id in refs:
+                try:
+                    self._update_reply_references(int(ref_id))
+                except Exception:
+                    continue
+            for parent_id, bucket in list(self._reply_index.items()):
+                if key in bucket:
+                    self._reply_index[parent_id] = [x for x in bucket if x != key]
+            if chat_id == current:
+                self._remove_message_widget(key)
+        if purge_storage and hasattr(self.server, "purge_local_messages"):
+            try:
+                server_mids = [int(mid) for mid in mids if int(mid) > 0]
+                if server_mids:
+                    self.server.purge_local_messages(chat_id, server_mids)
+            except Exception:
+                pass
+
+    def _show_message_context_menu(self, widget: QWidget, global_pos: QPoint) -> None:
+        msg_id = self._message_id_from_widget(widget)
+
+        def _extract_text() -> str:
+            for attr in ("_original_text", "text"):
+                try:
+                    val = getattr(widget, attr, None)
+                except Exception:
+                    val = None
+                if isinstance(val, str) and val.strip():
+                    return val
+            try:
+                if hasattr(widget, "toPlainText"):
+                    return str(widget.toPlainText() or "")
+            except Exception:
+                pass
+            return ""
+
+        def _copy_text() -> None:
+            text = _extract_text()
+            if not text:
+                return
+            try:
+                QApplication.clipboard().setText(text)
+                self._toast("Текст скопирован")
+            except Exception:
+                pass
+
+        def _quote_text() -> None:
+            text = _extract_text()
+            if not text:
+                return
+            # Telegram-like quote block.
+            lines = (text or "").strip().splitlines() or [text.strip()]
+            quoted = "\n".join([("> " + ln) if ln else ">" for ln in lines])
+            try:
+                cur = self.user_input.textCursor()
+                if cur is not None:
+                    if self.user_input.toPlainText().strip():
+                        cur.insertText("\n")
+                    cur.insertText(quoted + "\n")
+                    self.user_input.setTextCursor(cur)
+                else:
+                    self.user_input.insertPlainText(quoted + "\n")
+                self.user_input.setFocus()
+            except Exception:
+                pass
+
+        menu = QMenu(self)
+        StyleManager.instance().bind_stylesheet(menu, "context_menu.message_menu")
+        has_server_id = bool(msg_id is not None and int(msg_id) > 0)
+        reply_action = menu.addAction("Ответить")
+        if has_server_id:
+            reply_action.triggered.connect(lambda: self._set_reply_target(int(msg_id)))
+        else:
+            # Locally-rendered messages may not have Telegram message id yet.
+            reply_action.triggered.connect(_quote_text)
+
+        menu.addAction("Копировать текст").triggered.connect(_copy_text)
+
+        if has_server_id:
+            mid = int(msg_id)
+            reaction_menu = menu.addMenu("Реакция")
+            for emoji in ("👍", "❤️", "🔥", "😂", "😢", "😡"):
+                reaction_menu.addAction(emoji).triggered.connect(lambda _, e=emoji, mid=mid: self._set_message_reaction(mid, e))
+            menu.addSeparator()
+            menu.addAction("Удалить сообщение").triggered.connect(lambda: self._delete_message(mid))
+            menu.addAction("Копировать ссылку на сообщение").triggered.connect(lambda: self._copy_message_link(mid))
+            menu.addAction("Переслать").triggered.connect(lambda: self._forward_message(mid))
+            if mid in self._selected_message_ids:
+                menu.addAction("Снять выделение").triggered.connect(lambda: self._toggle_message_selection(mid))
+            else:
+                menu.addAction("Выделить").triggered.connect(lambda: self._toggle_message_selection(mid))
+        else:
+            local_mid = int(msg_id) if msg_id is not None else 0
+            menu.addSeparator()
+            menu.addAction("Удалить сообщение").triggered.connect(lambda mid=local_mid: self._delete_message(mid))
+            react = menu.addMenu("Реакция")
+            react.setEnabled(False)
+            copy_link = menu.addAction("Копировать ссылку на сообщение")
+            copy_link.setEnabled(False)
+            forward = menu.addAction("Переслать")
+            forward.setEnabled(False)
+            menu.addAction("Выделить (доступно после синхронизации)").setEnabled(False)
+
+        if self._selected_message_ids:
+            menu.addSeparator()
+            menu.addAction(f"Удалить выбранные ({len(self._selected_message_ids)})").triggered.connect(self._delete_selected_messages)
+            menu.addAction(f"Переслать выбранные ({len(self._selected_message_ids)})").triggered.connect(self._forward_selected_messages)
+            menu.addAction("Снять выделение со всех").triggered.connect(self._clear_message_selection)
+
+        menu.addSeparator()
+        menu.addAction("Пометить чат прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
+
+        try:
+            menu.exec(global_pos)
+        finally:
+            try:
+                menu.deleteLater()
+            except Exception:
+                pass
+
+    @Slot(object)
+    def _show_input_context_menu(self, pos) -> None:
+        try:
+            menu = self.user_input.createStandardContextMenu()
+        except Exception:
+            return
+        try:
+            menu.addSeparator()
+            menu.addAction("Жирный").triggered.connect(lambda: self._wrap_input_selection("*", "*"))
+            menu.addAction("Курсив").triggered.connect(lambda: self._wrap_input_selection("_", "_"))
+            menu.addAction("Подчёркнутый").triggered.connect(lambda: self._wrap_input_selection("__", "__"))
+            menu.addAction("Зачёркнутый").triggered.connect(lambda: self._wrap_input_selection("~", "~"))
+            menu.addAction("Спойлер").triggered.connect(lambda: self._wrap_input_selection("||", "||"))
+            menu.addAction("Скрыть фрагмент (невидимое)").triggered.connect(lambda: self._wrap_input_selection("^", "^"))
+            menu.addAction("Код").triggered.connect(lambda: self._wrap_input_selection("`", "`"))
+            menu.addAction("Блок кода").triggered.connect(lambda: self._wrap_input_selection("```\n", "\n```"))
+            menu.exec(self.user_input.mapToGlobal(pos))
+        finally:
+            try:
+                menu.deleteLater()
+            except Exception:
+                pass
+
+    def _wrap_input_selection(self, left: str, right: str) -> None:
+        cursor = self.user_input.textCursor()
+        if cursor is None:
+            return
+        if cursor.hasSelection():
+            selected = cursor.selectedText().replace("\u2029", "\n")
+            cursor.insertText(f"{left}{selected}{right}")
+        else:
+            cursor.insertText(f"{left}{right}")
+            try:
+                cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.MoveAnchor, len(right))
+            except Exception:
+                pass
+            self.user_input.setTextCursor(cursor)
+        self.user_input.setFocus()
+
+    def _hide_input_selection_invisible(self) -> None:
+        # Backward compatibility (older callers): use caret markers in the input field.
+        self._wrap_input_selection("^", "^")
+
+    def _show_voice_actions_menu(self) -> None:
+        btn = getattr(self, "btn_voice", None)
+        if btn is None:
+            return
+        try:
+            actions = btn.actions()
+        except Exception:
+            actions = []
+        if not actions:
+            return
+        menu = QMenu(self)
+        for act in actions:
+            try:
+                menu.addAction(act)
+            except Exception:
+                continue
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _pick_sticker_and_send(self) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            QMessageBox.information(self, "Стикер", "Сначала выберите чат.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать стикер",
+            "",
+            "Stickers (*.webp *.png *.tgs *.webm);;Images (*.webp *.png);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            cached_path, size = self._cache_outgoing_media("sticker", path)
+        except Exception:
+            cached_path = path
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                size = 0
+
+        sender_id = self._my_id or "me"
+        ok = False
+        if hasattr(self.tg, "send_sticker_sync"):
+            try:
+                ok = bool(self.tg.send_sticker_sync(chat_id=chat_id, sticker_path=cached_path))
+            except Exception:
+                ok = False
+        elif hasattr(self.tg, "send_document_sync"):
+            try:
+                ok = bool(self.tg.send_document_sync(chat_id=chat_id, document_path=cached_path))
+            except Exception:
+                ok = False
+
+        if ok:
+            self.add_media_item(
+                kind="sticker",
+                header="Вы",
+                text="",
+                role="me",
+                file_path=cached_path if os.path.isfile(cached_path) else None,
+                file_size=size,
+                chat_id=chat_id,
+                user_id=sender_id,
+            )
+            self._toast("Стикер отправлен")
+        else:
+            QMessageBox.warning(self, "Стикер", "Не удалось отправить стикер.")
+
+    @Slot(str)
+    def _insert_emoji(self, emoji: str) -> None:
+        try:
+            cursor = self.user_input.textCursor()
+            cursor.insertText(str(emoji))
+            self.user_input.setTextCursor(cursor)
+            self.user_input.setFocus()
+        except Exception:
+            pass
+        try:
+            if self._media_popup and self._media_popup.isVisible():
+                self._media_popup.hide()
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _send_sticker_file_id(self, file_id: str) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            self._toast("Сначала выберите чат")
+            return
+        fid = str(file_id or "").strip()
+        if not fid:
+            return
+
+        self._ensure_my_id_for_history()
+        sender_id = self._my_id or "me"
+        reply_to = getattr(self, "_pending_reply_to", None)
+
+        mid: Optional[int] = None
+        try:
+            if hasattr(self.tg, "send_sticker_id_with_id_sync"):
+                mid = self.tg.send_sticker_id_with_id_sync(chat_id=chat_id, sticker_file_id=fid, reply_to=reply_to)
+            elif hasattr(self.tg, "send_sticker_id_sync"):
+                ok = bool(self.tg.send_sticker_id_sync(chat_id=chat_id, sticker_file_id=fid, reply_to=reply_to))
+                mid = None if not ok else None
+        except Exception:
+            mid = None
+
+        if not mid:
+            QMessageBox.warning(self, "Стикер", "Не удалось отправить стикер.")
+            return
+
+        widget = self.add_media_item(
+            kind="sticker",
+            header="Вы",
+            text="",
+            role="me",
+            file_path=None,
+            file_size=0,
+            msg_id=int(mid),
+            chat_id=chat_id,
+            user_id=sender_id,
+        )
+        try:
+            widget._start_download()
+        except Exception:
+            pass
+        self._clear_reply_target()
+
+        try:
+            if self._media_popup and self._media_popup.isVisible():
+                self._media_popup.hide()
+        except Exception:
+            pass
+
+    @Slot()
+    def _pick_gif_and_send(self) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            self._toast("Сначала выберите чат")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать GIF",
+            "",
+            "GIF/Animation (*.gif *.mp4 *.webm);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            size = int(os.path.getsize(path))
+        except Exception:
+            size = 0
+
+        ok = False
+        if hasattr(self.tg, "send_animation_sync"):
+            try:
+                ok = bool(self.tg.send_animation_sync(chat_id=chat_id, animation_path=path))
+            except Exception:
+                ok = False
+        elif hasattr(self.tg, "send_document_sync"):
+            try:
+                ok = bool(self.tg.send_document_sync(chat_id=chat_id, document_path=path))
+            except Exception:
+                ok = False
+
+        if not ok:
+            QMessageBox.warning(self, "GIF", "Не удалось отправить GIF.")
+            return
+
+        self._ensure_my_id_for_history()
+        sender_id = self._my_id or "me"
+        self.add_media_item(
+            kind="animation",
+            header="Вы",
+            text="",
+            role="me",
+            file_path=path if os.path.isfile(path) else None,
+            file_size=size,
+            chat_id=chat_id,
+            user_id=sender_id,
+        )
+        try:
+            if self._media_popup and self._media_popup.isVisible():
+                self._media_popup.hide()
+        except Exception:
+            pass
+
+    def send_message(self) -> None:
+        raw = self.user_input.toPlainText() or ""
+        if not (raw.strip() and self.current_chat_id):
+            return
+        encoded, _ = encode_caret_hidden_fragments(raw)
+        plain, entities = parse_tg_style_markup(encoded)
+        if not plain.strip():
+            return
+        reply_to = getattr(self, "_pending_reply_to", None)
+        self.server.gui_send_message(
+            chat_id=self.current_chat_id,
+            user_id="me",
+            text=plain,
+            reply_to=reply_to,
+            entities=entities or None,
+        )
+        self.user_input.clear()
+        self._clear_reply_target()
+
+    def on_auto_ai_changed(self, state: int) -> None:
+        if not self.current_chat_id:
+            return
+        desired = bool(state)
+        if desired:
+            self.server.set_ai_flags(self.current_chat_id, ai=True, auto=True)
+        else:
+            self.server.set_ai_flags(self.current_chat_id, auto=False)
+        self.populate_chat_list()
+        self.update_ai_controls_state()
+
+    def _send_pressed(self) -> None:
+        txt = (self.user_input.toPlainText() or "").strip()
+        if not txt:
+            self._send_hold.stop()
+            self._send_long_mode = False
+            return
+        self._send_long_mode = False
+        self._send_hold.start(420)
+
+    def _send_long(self) -> None:
+        self._send_long_mode = True
+        try:
+            self.btn_send.setText("\u0421\u043a\u0440\u044b\u0442\u043e")
+        except Exception:
+            pass
+
+    def _send_released(self) -> None:
+        txt = (self.user_input.toPlainText() or "").strip()
+        if self._send_hold.isActive():
+            self._send_hold.stop()
+            if txt:
+                self.send_message()
+        else:
+            if txt:
+                self.send_message_invisible()
+        self._send_long_mode = False
+        QTimer.singleShot(200, lambda: self.btn_send.setText(self._send_button_label))
+
+    def send_message_invisible(self) -> None:
+        text = (self.user_input.toPlainText() or "").strip()
+        if not (text and self.current_chat_id):
+            return
+        try:
+            hidden = encode_zwc(text)
+        except Exception as exc:
+            QMessageBox.warning(self, "Невидимое", f"Не удалось закодировать: {exc}")
+            return
+        reply_to = getattr(self, "_pending_reply_to", None)
+        self.server.gui_send_message(chat_id=self.current_chat_id, user_id="me", text=hidden, reply_to=reply_to)
+        self.user_input.clear()
+        self._clear_reply_target()
+
+    def _schedule_history_save(self, delay_ms: int = 350) -> None:
+        self._history_save_pending = True
+        timer = getattr(self, "_history_save_timer", None)
+        if timer is None:
+            self._flush_history_save()
+            return
+        try:
+            timer.start(max(0, int(delay_ms)))
+        except Exception:
+            self._flush_history_save()
+
+    @Slot()
+    def _flush_history_save(self) -> None:
+        if not getattr(self, "_history_save_pending", False):
+            return
+        self._history_save_pending = False
+        try:
+            save_history(self.history)
+        except Exception:
+            log.exception("Failed to persist history")
+
+    def _remember_history_entry(
+        self,
+        chat_id: str,
+        *,
+        role: str,
+        text: str,
+        sender_id: str = "",
+        sender_name: str = "",
+        hidden: bool = False,
+        decoded_text: Optional[str] = None,
+    ) -> None:
+        chats = self.history.setdefault("chats", {})
+        bucket = chats.setdefault(chat_id, [])
+        entry = {
+            "id": int(time.time() * 1000),
+            "type": "assistant" if role == "assistant" else "text",
+            "text": text,
+            "sender_id": sender_id,
+            "sender": sender_name,
+            "role": role,
+            "ts": int(time.time()),
+        }
+        if hidden:
+            entry["hidden"] = True
+        if decoded_text is not None:
+            entry["decoded_text"] = decoded_text
+        bucket.append(entry)
+        if len(bucket) > self._history_limit:
+            del bucket[:-self._history_limit]
+        self._schedule_history_save()
+
+    def _voice_pressed(self) -> None:
+        self._voice_pressing = True
+        # Start recording quickly if user keeps holding.
+        self._voice_hold.start(160)
+
+    def _voice_released(self) -> None:
+        self._voice_pressing = False
+        if self._voice_hold.isActive():
+            self._voice_hold.stop()
+            # Short click: open actions menu instead of switching modes.
+            if not self._recording:
+                self._show_voice_actions_menu()
+        else:
+            if self._recording:
+                self._stop_recording_and_send()
+
+    def _voice_long(self) -> None:
+        if not self._voice_pressing:
+            return
+        if self._recording:
+            return
+        self._start_recording()
+
+    def _update_voice_button(self) -> None:
+        if self._recording:
+            self.btn_voice.setText("⏺️")
+            self.btn_voice.setToolTip("Идёт запись… отпустите, чтобы отправить")
+            return
+        self.btn_voice.setText("🎙")
+        self.btn_voice.setToolTip("Удерживать — запись голосового; клик — меню (аудио/кружок)")
+
+    def _start_recording(self) -> None:
+        if not self.current_chat_id:
+            QMessageBox.information(self, "Голосовое", "Сначала выберите чат.")
+            return
+        if not HAVE_SD:
+            QMessageBox.warning(
+                self,
+                "Запись голоса",
+                "Для записи установите библиотеки:\n  pip install sounddevice soundfile",
+            )
+            self._update_voice_button()
+            return
+
+        try:
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="rec_")
+            os.close(fd)
+            self._rec_path = path
+            self._rec_writer = sf.SoundFile(path, mode="w", samplerate=48_000, channels=1, subtype="PCM_16")
+            self._rec_stream = sd.InputStream(
+                samplerate=48_000,
+                channels=1,
+                callback=lambda indata, *_: self._rec_writer.write(indata.copy()),
+            )
+            self._rec_stream.start()
+            self._recording = True
+            self.btn_voice.setText("⏺️")
+            self._toast("Запись… отпустите кнопку, чтобы отправить как голосовое")
+        except Exception as exc:
+            self._recording = False
+            self._rec_path = None
+            if self._rec_stream:
+                try:
+                    self._rec_stream.stop()
+                    self._rec_stream.close()
+                except Exception:
+                    pass
+            if self._rec_writer:
+                try:
+                    self._rec_writer.close()
+                except Exception:
+                    pass
+            self._rec_stream = None
+            self._rec_writer = None
+            QMessageBox.critical(self, "Запись голоса", f"Не удалось начать запись:\n{exc}")
+            self._update_voice_button()
+
+    def _stop_recording_and_send(self) -> None:
+        try:
+            if self._rec_stream:
+                self._rec_stream.stop()
+                self._rec_stream.close()
+            if self._rec_writer:
+                self._rec_writer.close()
+        finally:
+            self._rec_stream = None
+            self._rec_writer = None
+            self._recording = False
+            self._update_voice_button()
+
+        if not self._rec_path:
+            return
+        path = self._rec_path
+        self._rec_path = None
+        self._convert_and_send_as_voice(path)
+
+    def _pick_mp3_and_send(self) -> None:
+        if not self.current_chat_id:
+            QMessageBox.information(self, "Голосовое", "Сначала выберите чат.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать аудио для голосового",
+            "",
+            "Audio files (*.mp3 *.wav *.m4a *.flac *.ogg *.oga);;All files (*.*)",
+        )
+        if path:
+            self._convert_and_send_as_voice(path)
+
+    def _pick_video_note_and_send(self) -> None:
+        if not self.current_chat_id:
+            QMessageBox.information(self, "Кружок", "Сначала выберите чат.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать видео для кружка",
+            "",
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)",
+        )
+        if path:
+            self._convert_and_send_as_video_note(path)
+
+    def _toast(self, text: str) -> None:
+        if not bool(getattr(self, "_runtime_toasts_enabled", False)):
+            return
+        layout = getattr(self, "chat_history_layout", None)
+        if layout is None:
+            log.warning("Toast requested before chat history init: %s", text)
+            QMessageBox.information(self, "ESCgram", text)
+            return
+        info = QLabel(text)
+        info.setStyleSheet("color:#9bb6d6; font-size:12px; padding:4px 10px;")
+        info.setWordWrap(True)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        row.addWidget(info, 0)
+        row.addStretch(1)
+
+        wrap = QWidget()
+        wrap.setLayout(row)
+        idx = max(0, layout.count() - 1)
+        layout.insertWidget(idx, wrap)
+        self._scroll_to_bottom()
+        QTimer.singleShot(2000, wrap.deleteLater)
+
+    def _media_cache_dir(self) -> str:
+        base = app_paths.ensure_dir(app_paths.get_data_dir() / "media_cache")
+        return str(base)
+
+    def _register_outgoing(self, kind: str, size: int, path: str) -> None:
+        bucket = self._recent_outgoing.setdefault(kind, [])
+        bucket.append({"size": int(size), "path": path, "ts": time.time()})
+        if len(bucket) > 20:
+            del bucket[:-20]
+
+    def _cache_outgoing_media(self, kind: str, src_path: str) -> tuple[str, int]:
+        size = os.path.getsize(src_path)
+        ext = os.path.splitext(src_path)[1] or ""
+        name = f"{kind}_{int(time.time())}_{size}{ext}"
+        dst = os.path.join(self._media_cache_dir(), name)
+        shutil.copy2(src_path, dst)
+        self._register_outgoing(kind, size, dst)
+        return dst, size
+
+    def _match_outgoing_local(self, kind: str, file_size: int) -> Optional[str]:
+        for item in reversed(self._recent_outgoing.get(kind, [])):
+            if int(item.get("size") or 0) == int(file_size or 0):
+                candidate = str(item.get("path") or "")
+                if candidate and os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    def _next_local_media_message_id(self) -> int:
+        seq = int(getattr(self, "_local_media_seq", 0) or 0) + 1
+        self._local_media_seq = seq
+        # Keep a separate negative range from text local-echo IDs.
+        return -1_000_000_000 - seq
+
+    def _add_pending_local_media_widget(
+        self,
+        *,
+        kind: str,
+        chat_id: str,
+        media_path: str,
+        file_size: int,
+        caption_text: str = "",
+        media_group_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
+    ) -> Optional[int]:
+        if not chat_id or str(chat_id) != str(self.current_chat_id or ""):
+            return None
+
+        local_mid = self._next_local_media_message_id()
+        reply_to = self._media_send_reply_to
+        reply_preview = self._media_send_reply_preview
+        resolved_size = int(file_size or 0)
+        if resolved_size <= 0 and media_path:
+            try:
+                resolved_size = int(os.path.getsize(media_path))
+            except Exception:
+                resolved_size = 0
+
+        try:
+            self.add_media_item(
+                kind=str(kind or "").strip().lower(),
+                header="Вы",
+                text=str(caption_text or ""),
+                role="me",
+                file_path=media_path,
+                msg_id=local_mid,
+                chat_id=chat_id,
+                user_id=str(self._my_id or "me"),
+                file_size=resolved_size,
+                reply_to=reply_to,
+                reply_preview=reply_preview,
+                is_deleted=False,
+                voice_waveform=self._voice_waveform_enabled,
+                forward_info=None,
+                media_group_id=media_group_id,
+                timestamp=timestamp,
+            )
+            self._cache_message(
+                local_mid,
+                text=str(caption_text or ""),
+                kind=str(kind or "").strip().lower(),
+                sender="Вы",
+                reply_to=reply_to,
+                is_deleted=False,
+                forward_info=None,
+                media_group_id=media_group_id,
+            )
+            if reply_to is not None:
+                self._update_reply_references(reply_to)
+            return local_mid
+        except Exception:
+            log.exception("Failed to add local pending media bubble")
+            return None
+
+    def _start_media_busy(self, title: str, text: str) -> None:
+        self._media_busy_state = {"title": str(title or ""), "text": str(text or "")}
+        now = time.monotonic()
+        # Do not open separate modal windows: only lightweight in-chat toast.
+        if now - float(getattr(self, "_media_busy_last_toast_at", 0.0) or 0.0) >= 0.6:
+            self._media_busy_last_toast_at = now
+            if text:
+                self._toast(text)
+
+    def _stop_media_busy(self) -> None:
+        self._media_busy_state = None
+
+    def _media_job_in_progress(self) -> bool:
+        if getattr(self, "_media_job_active", False):
+            return True
+        convert_thread = getattr(self, "_media_convert_thread", None)
+        send_thread = getattr(self, "_media_send_thread", None)
+        batch_thread = getattr(self, "_media_batch_thread", None)
+        return bool(
+            (convert_thread is not None and convert_thread.isRunning())
+            or (send_thread is not None and send_thread.isRunning())
+            or (batch_thread is not None and batch_thread.isRunning())
+        )
+
+    def _clear_media_convert_refs(self) -> None:
+        self._media_convert_worker = None
+        self._media_convert_thread = None
+
+    def _clear_media_send_refs(self) -> None:
+        self._media_send_worker = None
+        self._media_send_thread = None
+
+    def _clear_media_batch_refs(self) -> None:
+        self._media_batch_worker = None
+        self._media_batch_thread = None
+
+    @staticmethod
+    def _safe_cleanup_temp_dir(tmpdir: Optional[str]) -> None:
+        if not tmpdir:
+            return
+        try:
+            if os.path.isdir(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _build_voice_ffmpeg_cmd(self, ffmpeg: str, src_path: str, dst_path: str) -> List[str]:
+        return [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            src_path,
+            "-vn",
+            "-acodec",
+            "libopus",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-b:a",
+            "48k",
+            "-application",
+            "voip",
+            "-map_metadata",
+            "-1",
+            dst_path,
+        ]
+
+    def _build_video_note_ffmpeg_cmd(self, ffmpeg: str, src_path: str, dst_path: str) -> List[str]:
+        return [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            src_path,
+            "-vf",
+            r"crop=min(iw\,ih):min(iw\,ih),scale=480:480",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.0",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            "30",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+            dst_path,
+        ]
+
+    def _prepare_and_preview_media(self, kind: str, src_path: str) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            return
+        if not os.path.isfile(src_path):
+            title = "Голосовое" if kind == "voice" else "Кружок"
+            QMessageBox.warning(self, title, "Исходный файл не найден.")
+            return
+        if self._media_job_in_progress():
+            self._toast("Дождитесь завершения текущей отправки")
+            return
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            if kind == "voice":
+                QMessageBox.warning(
+                    self,
+                    "Голосовое",
+                    "Не найден ffmpeg в PATH — конвертация в OGG/Opus невозможна.\n"
+                    "Установите полноценный ffmpeg (с поддержкой libopus).",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Кружок",
+                    "Не найден ffmpeg в PATH — конвертация в кружок невозможна.\n"
+                    "Установите полноценный ffmpeg (libx264 + aac).",
+                )
+            return
+
+        tmpdir = tempfile.mkdtemp(prefix="voice_" if kind == "voice" else "videonote_")
+        out_name = "voice.ogg" if kind == "voice" else "note.mp4"
+        out_path = os.path.join(tmpdir, out_name)
+        self._media_active_tmpdir = tmpdir
+
+        if kind == "voice":
+            cmd = self._build_voice_ffmpeg_cmd(ffmpeg, src_path, out_path)
+            self._start_media_busy("Голосовое", "Подготавливаю голосовое для предпрослушивания…")
+            timeout = 240.0
+        else:
+            cmd = self._build_video_note_ffmpeg_cmd(ffmpeg, src_path, out_path)
+            self._start_media_busy("Кружок", "Подготавливаю кружок для предпросмотра…")
+            timeout = 300.0
+
+        self._media_job_active = True
+        # Store context on the window instance so the done handler is a real Qt slot,
+        # guaranteeing queued delivery to the GUI thread (avoid UI calls from worker thread).
+        self._media_convert_ctx = {
+            "kind": kind,
+            "chat_id": chat_id,
+            "src_path": src_path,
+            "tmpdir": tmpdir,
+            "out_path": out_path,
+        }
+        try:
+            thread = QThread(self)
+            thread.setObjectName("media_convert_thread")
+            worker = FfmpegConvertWorker(cmd, out_path, timeout_sec=timeout)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.done.connect(self._on_media_convert_done_payload)
+            worker.done.connect(thread.quit)
+            worker.done.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._clear_media_convert_refs)
+            self._media_convert_thread = thread
+            self._media_convert_worker = worker
+            thread.start()
+        except Exception as exc:
+            log.exception("Failed to start conversion worker (%s): %s", kind, exc)
+            self._media_convert_ctx = None
+            self._stop_media_busy()
+            self._safe_cleanup_temp_dir(tmpdir)
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            QMessageBox.warning(self, "Отправка медиа", "Не удалось запустить фоновую конвертацию.")
+
+    @Slot(dict)
+    def _on_media_convert_done_payload(self, payload: Dict[str, Any]) -> None:
+        ctx = getattr(self, "_media_convert_ctx", None)
+        self._media_convert_ctx = None
+        if not isinstance(ctx, dict) or not ctx:
+            # Best-effort cleanup if context is missing (e.g. window is closing).
+            try:
+                self._stop_media_busy()
+            except Exception:
+                pass
+            try:
+                self._safe_cleanup_temp_dir(getattr(self, "_media_active_tmpdir", None))
+            except Exception:
+                pass
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            return
+        self._on_media_conversion_done(
+            str(ctx.get("kind") or ""),
+            str(ctx.get("chat_id") or ""),
+            str(ctx.get("src_path") or ""),
+            str(ctx.get("tmpdir") or ""),
+            str(ctx.get("out_path") or ""),
+            payload if isinstance(payload, dict) else {},
+        )
+
+    def _on_media_conversion_done(
+        self,
+        kind: str,
+        chat_id: str,
+        src_path: str,
+        tmpdir: str,
+        out_path: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        self._stop_media_busy()
+
+        ok = bool((payload or {}).get("ok"))
+        err = str((payload or {}).get("error") or "").strip()
+        if not ok:
+            if err:
+                log.warning("Media conversion failed (%s): %s", kind, err)
+            msg = (
+                "Конвертация голосового не удалась."
+                if kind == "voice"
+                else "Конвертация кружка не удалась."
+            )
+            self._toast(msg)
+            self._safe_cleanup_temp_dir(tmpdir)
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            return
+
+        # If user switched chats while conversion was running, silently cancel.
+        if str(self.current_chat_id or "") != str(chat_id or ""):
+            self._safe_cleanup_temp_dir(tmpdir)
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            return
+
+        if self._show_inline_media_preview(
+            kind,
+            chat_id=chat_id,
+            src_path=src_path,
+            tmpdir=tmpdir,
+            out_path=out_path,
+        ):
+            return
+
+        self._toast("Предпросмотр недоступен, отправляю без него")
+        self._send_prepared_media(kind, chat_id, src_path, tmpdir, out_path)
+
+    def _send_prepared_media(
+        self,
+        kind: str,
+        chat_id: str,
+        src_path: str,
+        tmpdir: str,
+        media_path: str,
+    ) -> None:
+        reply_to = getattr(self, "_pending_reply_to", None)
+        reply_preview = self._build_reply_preview(reply_to)
+        self._media_send_reply_to = int(reply_to) if reply_to is not None else None
+        self._media_send_reply_preview = reply_preview
+        # Clear reply bar early, like text sending does.
+        self._clear_reply_target()
+
+        if kind == "voice":
+            self._start_media_busy("Голосовое", "Отправляю голосовое сообщение…")
+            timeout = 140.0
+        else:
+            self._start_media_busy("Кружок", "Отправляю кружок…")
+            timeout = 220.0
+
+        stable_media_path = media_path
+        try:
+            cached_path, _ = self._cache_outgoing_media(kind, media_path)
+            if cached_path and os.path.isfile(cached_path):
+                stable_media_path = cached_path
+        except Exception:
+            log.debug("Failed to cache outgoing %s before send; fallback to temp file", kind, exc_info=True)
+
+        local_msg_id = self._add_pending_local_media_widget(
+            kind=kind,
+            chat_id=chat_id,
+            media_path=stable_media_path,
+            file_size=int(os.path.getsize(stable_media_path)) if stable_media_path and os.path.isfile(stable_media_path) else 0,
+            timestamp=int(time.time()),
+        )
+
+        try:
+            thread = QThread(self)
+            thread.setObjectName("media_send_thread")
+            worker = MediaSendWorker(
+                self.tg,
+                kind=kind,
+                chat_id=chat_id,
+                media_path=stable_media_path,
+                reply_to=reply_to,
+                timeout_sec=timeout,
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            # Store context so we can use a Qt slot (queued to GUI thread).
+            self._media_send_ctx = {
+                "kind": kind,
+                "chat_id": chat_id,
+                "src_path": src_path,
+                "tmpdir": tmpdir,
+                "media_path": stable_media_path,
+                "local_msg_id": local_msg_id,
+            }
+            worker.done.connect(self._on_media_send_done_payload)
+            worker.done.connect(thread.quit)
+            worker.done.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._clear_media_send_refs)
+            self._media_send_thread = thread
+            self._media_send_worker = worker
+            thread.start()
+        except Exception as exc:
+            log.exception("Failed to start send worker (%s): %s", kind, exc)
+            self._media_send_ctx = None
+            self._stop_media_busy()
+            self._safe_cleanup_temp_dir(tmpdir)
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            self._media_send_reply_to = None
+            self._media_send_reply_preview = None
+            if local_msg_id is not None:
+                self._remove_message_widget(local_msg_id)
+            self._toast("Не удалось запустить отправку медиа")
+
+    @Slot(dict)
+    def _on_media_send_done_payload(self, payload: Dict[str, Any]) -> None:
+        ctx = getattr(self, "_media_send_ctx", None)
+        self._media_send_ctx = None
+        if not isinstance(ctx, dict) or not ctx:
+            try:
+                self._stop_media_busy()
+            except Exception:
+                pass
+            try:
+                self._safe_cleanup_temp_dir(getattr(self, "_media_active_tmpdir", None))
+            except Exception:
+                pass
+            self._media_active_tmpdir = None
+            self._media_job_active = False
+            self._media_send_reply_to = None
+            self._media_send_reply_preview = None
+            return
+        self._on_media_send_done(
+            str(ctx.get("kind") or ""),
+            str(ctx.get("chat_id") or ""),
+            str(ctx.get("src_path") or ""),
+            str(ctx.get("tmpdir") or ""),
+            str(ctx.get("media_path") or ""),
+            int(ctx.get("local_msg_id") or 0) or None,
+            payload if isinstance(payload, dict) else {},
+        )
+
+    def _on_media_send_done(
+        self,
+        kind: str,
+        chat_id: str,
+        src_path: str,
+        tmpdir: str,
+        media_path: str,
+        local_msg_id: Optional[int],
+        payload: Dict[str, Any],
+    ) -> None:
+        self._stop_media_busy()
+
+        ok = bool((payload or {}).get("ok"))
+        err = str((payload or {}).get("error") or "").strip()
+        self._media_send_reply_to = None
+        self._media_send_reply_preview = None
+
+        if ok:
+            # Do not add a second local bubble here. Wait for Telegram update event
+            # and reconcile with cached local path in _on_gui_media.
+            if kind == "voice":
+                self._toast("Голосовое отправлено")
+            else:
+                self._toast("Кружок отправлен")
+        else:
+            if local_msg_id is not None:
+                self._remove_message_widget(local_msg_id)
+            if err:
+                log.warning("Media send failed (%s): %s", kind, err)
+            self._toast("Не удалось отправить голосовое" if kind == "voice" else "Не удалось отправить кружок")
+
+        self._safe_cleanup_temp_dir(tmpdir)
+        self._media_active_tmpdir = None
+        self._media_job_active = False
+
+    def _reconcile_pending_media_after_send(self, chat_id: str, local_msg_id: int) -> None:
+        # Kept for backward compatibility with older call-sites.
+        # Full history reload here causes visible UI freeze and feed jumps.
+        return
+
+    def _convert_and_send_as_voice(self, src_path: str) -> None:
+        self._prepare_and_preview_media("voice", src_path)
+
+    def _convert_and_send_as_video_note(self, src_path: str) -> None:
+        self._prepare_and_preview_media("video_note", src_path)
+
+    # ------------------------------------------------------------------ #
+    # Utility helpers
+
+    def _ensure_authorized(self) -> None:
+        if self.tg.is_authorized_sync():
+            self.refresh_telegram_chats_async()
+            return
+        dlg = AuthDialog(self.tg, self)
+        dlg.login_success.connect(self._handle_login_success)
+        dlg.exec()
+        if not self.tg.is_authorized_sync() and self._pending_account_revert:
+            try:
+                self.tg.switch_account(self._pending_account_revert)
+            except Exception:
+                log.warning("Failed to revert to previous account", exc_info=True)
+            finally:
+                self._pending_account_revert = None
+                self._reset_state_after_account_change()
+                self._sync_account_card()
+
+    def _handle_login_success(self) -> None:
+        self._pending_account_revert = None
+        self._refresh_account_profile_async()
+        self.refresh_telegram_chats_async()
+
+    def _refresh_account_profile_async(self) -> None:
+        if not hasattr(self.tg, "refresh_active_account_profile"):
+            self._sync_account_card()
+            return
+        thread = getattr(self, "_account_profile_thread", None)
+        if thread is not None and thread.isRunning():
+            return
+        thread = QThread(self)
+        thread.setObjectName("account_profile_thread")
+        worker = AccountProfileWorker(self.tg)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_account_profile_loaded)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._account_profile_thread = thread
+        thread.start()
+
+    @Slot(dict)
+    def _on_account_profile_loaded(self, meta: Dict[str, Any]) -> None:
+        try:
+            if meta and hasattr(self.tg, "get_active_account_meta"):
+                # AccountStore is already updated inside refresh_active_account_profile().
+                pass
+        except Exception:
+            pass
+        self._sync_account_card()
+
+    def _record_account_profile(self) -> None:
+        if not hasattr(self.tg, "refresh_active_account_profile"):
+            return
+        meta = self.tg.refresh_active_account_profile()
+        if not meta:
+            return
+        subtitle = meta.get("phone") or (f"@{meta.get('username')}" if meta.get("username") else "")
+        if hasattr(self, "settings_panel"):
+            avatar = self._account_avatar_pixmap(meta)
+            self.settings_panel.set_account_info(meta.get("title") or "Аккаунт", subtitle, avatar)
+
+    def _sync_account_card(self) -> None:
+        panel = getattr(self, "settings_panel", None)
+        if not panel or not hasattr(self.tg, "get_active_account_meta"):
+            return
+        info = self.tg.get_active_account_meta() or {}
+        self._active_account_user_id = str(info.get("user_id") or info.get("id") or "")
+        subtitle = info.get("phone") or (f"@{info.get('username')}" if info.get("username") else "")
+        avatar = self._account_avatar_pixmap(info)
+        panel.set_account_info(info.get("title") or "Аккаунт", subtitle, avatar)
+
+        if (
+            not self._active_account_user_id
+            and hasattr(self.tg, "is_authorized_sync")
+            and self.tg.is_authorized_sync()
+        ):
+            self._refresh_account_profile_async()
+
+    def _reset_state_after_account_change(self) -> None:
+        self._history_save_pending = False
+        timer = getattr(self, "_history_save_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self.history = load_history()
+        self.all_chats.clear()
+        self.current_chat_id = None
+        self.chat_list.clear()
+        self._chat_items_by_id = {}
+        self.clear_feed()
+        self._message_widgets.clear()
+        self._message_cache.clear()
+        self._reply_index.clear()
+        self._chat_last_message_id.clear()
+
+    def _open_account_manager(self) -> None:
+        dlg = AccountManagerDialog(self.tg, self)
+        dlg.account_switched.connect(self._handle_account_switched)
+        dlg.account_add_requested.connect(self._handle_account_add_requested)
+        dlg.exec()
+
+    def _handle_account_switched(self) -> None:
+        self._pending_account_revert = None
+        self._reset_state_after_account_change()
+        self._sync_account_card()
+        self._ensure_authorized()
+
+    def _handle_account_add_requested(self) -> None:
+        try:
+            previous = self.tg.current_session_name()
+        except Exception:
+            previous = None
+        self._pending_account_revert = previous
+        if hasattr(self.tg, "prepare_new_account_session"):
+            new_session = self.tg.prepare_new_account_session()
+            log.info("Switching to new session %s for login", new_session)
+        else:
+            self._toast("Переключение аккаунтов недоступно в этой сборке")
+            self._pending_account_revert = None
+            return
+        self._reset_state_after_account_change()
+        self._sync_account_card()
+        self._ensure_authorized()
+
+    def _account_avatar_pixmap(self, meta: Dict[str, Any]) -> Optional[QPixmap]:
+        avatar_cache = getattr(self, "avatar_cache", None)
+        if not avatar_cache:
+            return None
+        user_id = meta.get("user_id") or meta.get("id") or getattr(self, "_my_id", None)
+        if not user_id:
+            return None
+        title = meta.get("title") or meta.get("username") or meta.get("phone") or "User"
+        try:
+            return avatar_cache.user(str(user_id), title)
+        except Exception:
+            return None
+
+    def _open_settings_window(self) -> None:
+        state = {
+            "auto_download": getattr(self, "_auto_download_enabled", False),
+            "ghost_mode": getattr(self, "_ghost_mode_enabled", False),
+            "voice_waveform": getattr(self, "_voice_waveform_enabled", True),
+            "night_mode": getattr(self, "_night_mode_enabled", True),
+            "streamer_mode": getattr(self, "_streamer_mode_enabled", False),
+            "hide_hidden_chats": getattr(self, "_hide_hidden_chats", True),
+            "show_my_avatar": getattr(self, "_show_my_avatar_enabled", True),
+            "keep_deleted_messages": getattr(self, "_keep_deleted_messages", True),
+            "auto_ai": bool(self.auto_ai_checkbox.isChecked()) if hasattr(self, "auto_ai_checkbox") else False,
+        }
+        callbacks = {
+            "auto_download": self.on_auto_download_setting_changed,
+            "ghost_mode": self.on_ghost_mode_setting_changed,
+            "voice_waveform": self.on_voice_waveform_setting_changed,
+            "night_mode": self._set_night_mode,
+            "streamer_mode": lambda checked: self._set_streamer_mode(bool(checked)),
+            "hide_hidden_chats": self.on_hide_hidden_chats_setting_changed,
+            "show_my_avatar": self.on_show_my_avatar_setting_changed,
+            "keep_deleted_messages": self.on_keep_deleted_messages_setting_changed,
+        }
+        if hasattr(self, "auto_ai_checkbox"):
+            callbacks["auto_ai"] = lambda checked: self.auto_ai_checkbox.setChecked(bool(checked))
+        ai_state = self._config.get("ai") if isinstance(self._config.get("ai"), dict) else {}
+        dlg = SettingsWindow(
+            state=state,
+            callbacks=callbacks,
+            ai_state=dict(ai_state),
+            ai_callbacks={"on_change": self._on_ai_settings_changed},
+            parent=self,
+        )
+        dlg.exec()
+
+    def _shutdown_background_workers(self) -> None:
+        def _thread_is_running(thread: object) -> bool:
+            if thread is None:
+                return False
+            try:
+                if not _qt_is_valid(thread):
+                    return False
+            except Exception:
+                pass
+            try:
+                return bool(getattr(thread, "isRunning")())
+            except Exception:
+                return False
+
+        for timer_name in ("_timer", "_resort_timer", "_repaint_timer", "_bubble_width_timer", "_send_hold", "_voice_hold", "_history_save_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is None:
+                continue
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+        pump = getattr(self, "pump", None)
+        if pump is not None:
+            try:
+                pump._running = False
+            except Exception:
+                pass
+        pump_thread = getattr(self, "pump_thread", None)
+        if _thread_is_running(pump_thread):
+            try:
+                pump_thread.quit()
+                pump_thread.wait(1500)
+            except Exception:
+                pass
+
+        dialog_workers = list(getattr(self, "_dialogs_workers", set()) or [])
+        for worker in dialog_workers:
+            if worker is None:
+                continue
+            if hasattr(worker, "stop"):
+                try:
+                    worker.stop()
+                except Exception:
+                    pass
+        self._dialogs_workers.clear()
+
+        dialog_threads = list(getattr(self, "_dialogs_threads", set()) or [])
+        for dthread in dialog_threads:
+            if not _thread_is_running(dthread):
+                continue
+            try:
+                dthread.quit()
+                dthread.wait(1500)
+            except Exception:
+                pass
+        self._dialogs_threads.clear()
+        self._dialogs_stream_active = False
+
+        hist_worker = getattr(self, "_hist_worker", None)
+        if hist_worker is not None and hasattr(hist_worker, "stop"):
+            try:
+                hist_worker.stop()
+            except Exception:
+                pass
+        hist_thread = getattr(self, "_hist_thread", None)
+        if _thread_is_running(hist_thread):
+            try:
+                hist_thread.quit()
+                hist_thread.wait(1500)
+            except Exception:
+                pass
+        self._hist_worker = None
+        self._hist_thread = None
+        self._loading_history = False
+
+        ts_thread = getattr(self, "_ts_thread", None)
+        ts_worker = getattr(self, "_ts_worker", None)
+        if ts_worker is not None and hasattr(ts_worker, "stop"):
+            try:
+                ts_worker.stop()
+            except Exception:
+                pass
+        if _thread_is_running(ts_thread):
+            try:
+                ts_thread.quit()
+                ts_thread.wait(1000)
+            except Exception:
+                pass
+        self._ts_worker = None
+        self._ts_thread = None
+
+        profile_thread = getattr(self, "_account_profile_thread", None)
+        if _thread_is_running(profile_thread):
+            try:
+                profile_thread.quit()
+                profile_thread.wait(1000)
+            except Exception:
+                pass
+        self._account_profile_thread = None
+
+        self._stop_media_busy()
+        self._media_job_active = False
+        self._safe_cleanup_temp_dir(getattr(self, "_media_active_tmpdir", None))
+        self._media_active_tmpdir = None
+
+        convert_thread = getattr(self, "_media_convert_thread", None)
+        if _thread_is_running(convert_thread):
+            try:
+                convert_thread.quit()
+                convert_thread.wait(1000)
+            except Exception:
+                pass
+        self._clear_media_convert_refs()
+
+        send_thread = getattr(self, "_media_send_thread", None)
+        if _thread_is_running(send_thread):
+            try:
+                send_thread.quit()
+                send_thread.wait(1500)
+            except Exception:
+                pass
+        self._clear_media_send_refs()
+        self._media_send_ctx = None
+
+        batch_thread = getattr(self, "_media_batch_thread", None)
+        if _thread_is_running(batch_thread):
+            try:
+                batch_thread.quit()
+                batch_thread.wait(1500)
+            except Exception:
+                pass
+        self._clear_media_batch_refs()
+        self._media_batch_ctx = None
+
+        try:
+            self.clear_feed()
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._shutdown_background_workers()
+        self._flush_history_save()
+        save_history(self.history)
+        self._persist_window_config()
+        save_config(self._config)
+        try:
+            self.avatar_cache.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _ensure_my_id_for_history(self) -> None:
+        if self._my_id:
+            return
+        for name in ("get_self_id", "get_my_id", "get_self_user_id", "my_user_id", "get_self_id_sync"):
+            if hasattr(self.tg, name):
+                try:
+                    mid = getattr(self.tg, name)()
+                    if mid:
+                        self._my_id = str(mid)
+                        return
+                except Exception:
+                    continue
+
+
+def run_gui(server, tg_adapter) -> None:
+    # When GUI is launched directly, keep logs in the selected data dir by default.
+    configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
+    app = QApplication.instance() or QApplication([])
+    config = load_config()
+    window = ChatWindow(server, tg_adapter, config=config)
+    window.show()
+    app.exec()

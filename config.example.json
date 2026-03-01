@@ -1,0 +1,11 @@
+{
+  "telegram_api_id": 123456,
+  "telegram_api_hash": "PASTE_YOUR_API_HASH_HERE",
+  "allowed_users": [],
+  "admin_users": [],
+  "chat_ids": [],
+  "strict_live_filter": false,
+  "socket_host": "127.0.0.1",
+  "socket_port": 8765,
+  "transcription_model": "base"
+}

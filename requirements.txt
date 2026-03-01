@@ -1,0 +1,18 @@
+# Core runtime dependencies
+PySide6>=6.6
+requests>=2.31
+cryptography>=41
+Pillow>=10.0
+
+# Telegram (optional but recommended)
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+qrcode>=7.4
+
+# Voice recording (optional)
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# Local AI via Ollama (optional)
+langchain-core>=0.2
+langchain-ollama>=0.2
