@@ -11,7 +11,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-OutputDir=dist_installer
+OutputDir=..\..\dist_installer
 OutputBaseFilename=ESCgram-Setup
 Compression=lzma2
 SolidCompression=yes
@@ -24,11 +24,11 @@ Name: "russian"; MessagesFile: "compiler:Languages\\Russian.isl"
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Ярлыки:"; Flags: unchecked
 
 [Files]
-Source: "dist\\ESCgram\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\\..\\dist\\ESCgram\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir \"{code:GetDataDir}\""
-Name: "{autodesktop}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir \"{code:GetDataDir}\""; Tasks: desktopicon
+Name: "{autoprograms}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""
+Name: "{autodesktop}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""; Tasks: desktopicon
 
 [Code]
 var
@@ -52,4 +52,3 @@ function GetDataDir(Param: String): String;
 begin
   Result := DataDirPage.Values[0];
 end;
-
