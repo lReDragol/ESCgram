@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -57,4 +60,3 @@ jobs:
           files: |
             dist_installer/ESCgram-Setup.exe
             dist_installer/ESCgram-portable.zip
-
