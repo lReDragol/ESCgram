@@ -19,7 +19,7 @@ datas = [
 
 
 a = Analysis(
-    ["main.py"],
+    [str(project_root / "main.py")],
     pathex=[str(project_root)],
     binaries=[],
     datas=datas,
