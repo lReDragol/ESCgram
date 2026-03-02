@@ -1227,6 +1227,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         # runtime
         self._bg_threads = []
         self._disposed = False
+        self.on_media_activate: Optional[Callable[[Dict[str, Any]], bool]] = None
         try:
             self.destroyed.connect(self._on_widget_destroyed)
         except Exception:

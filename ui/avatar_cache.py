@@ -92,7 +92,8 @@ class AvatarCache:
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
         can_retry = (time.time() - failed_at) >= 12.0
-        if photo_small and (cache_key not in self._paths or not path) and can_retry:
+        if can_retry:
+            # Even if photo id is missing in dialog payload, Telegram can often resolve it by chat id.
             self._schedule_download(
                 cache_key=cache_key,
                 kind="chat",
@@ -100,10 +101,8 @@ class AvatarCache:
                 title=title,
                 initials=initials,
                 background=background,
-                fetch_args={"chat_id": str(chat_id), "file_id": photo_small},
+                fetch_args={"chat_id": str(chat_id), "file_id": (str(photo_small) if photo_small else None)},
             )
-        elif photo_small is None:
-            self._paths.setdefault(cache_key, None)
 
         return placeholder
 
@@ -154,7 +153,12 @@ class AvatarCache:
         fetch_args: Dict[str, Any],
     ) -> None:
         with self._lock:
-            if cache_key in self._paths or cache_key in self._pending:
+            if cache_key in self._pending:
+                return
+            cached_path = self._paths.get(cache_key)
+            # Do not queue duplicate work when we already have a resolved avatar path.
+            # Empty strings/None mean previous attempt failed and should be retryable.
+            if isinstance(cached_path, str) and cached_path.strip():
                 return
             self._pending[cache_key] = _AvatarMeta(
                 kind=kind,

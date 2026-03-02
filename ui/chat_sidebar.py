@@ -790,6 +790,7 @@ class ChatSidebarMixin:
                 int(hide_hidden),
             )
             if data_signature == getattr(self, "_chat_list_data_signature", None):
+                self._refresh_visible_chat_avatars()
                 if current_id:
                     item = self._chat_items_by_id.get(current_id)
                     if item:
@@ -872,6 +873,30 @@ class ChatSidebarMixin:
             self._chat_row_widgets_by_id = chat_rows_by_id
         finally:
             self.chat_list.setUpdatesEnabled(True)
+
+    def _refresh_visible_chat_avatars(self) -> None:
+        count = int(self.chat_list.count() or 0)
+        for idx in range(count):
+            item = self.chat_list.item(idx)
+            if item is None:
+                continue
+            cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if not cid:
+                continue
+            info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+            info_dict = dict(info) if isinstance(info, dict) else {}
+            title = str(info_dict.get("title_display") or info_dict.get("title") or cid)
+            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info_dict, title)
+            if pixmap is None:
+                continue
+            row_widget = self.chat_list.itemWidget(item)
+            if isinstance(row_widget, ChatListRowWidget):
+                row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+            elif row_widget and hasattr(row_widget, "set_avatar"):
+                try:
+                    row_widget.set_avatar(pixmap)
+                except Exception:
+                    pass
 
     def _chat_list_avatar_payload(
         self,

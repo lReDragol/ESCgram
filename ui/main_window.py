@@ -67,6 +67,7 @@ from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_pa
 from utils.logging_setup import configure_logging
 from ui.message_feed import MessageFeedMixin
 from ui.message_widgets import DEFAULT_BUBBLE_THEME, ChatItemWidget, ReplyPreviewWidget, TextMessageWidget, set_bubble_theme
+from ui.media_viewer import MediaViewerDialog
 from ui.media_picker import MediaPickerPopup
 from ui.send_media_inline_preview import InlineMediaPreviewBar
 from ui.send_media_workers import FfmpegConvertWorker, MediaBatchSendWorker, MediaSendWorker
@@ -168,6 +169,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._selection_anchor_mid: Optional[int] = None
         self._selection_drag_active: bool = False
         self._selection_last_range_mid: Optional[int] = None
+        self._selection_drag_base_ids: set[int] = set()
+        self._selection_drag_range_ids: set[int] = set()
         self._runtime_toasts_enabled = bool(int(os.getenv("DRAGO_RUNTIME_TOASTS", "0") or 0))
         self._pending_reply_to: Optional[int] = None
         self._reply_bar: Optional[QFrame] = None
@@ -206,6 +209,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._update_download_thread: Optional[QThread] = None
         self._update_download_worker: Optional[UpdateDownloadWorker] = None
         self._update_in_progress: bool = False
+        self._media_viewers: set[QWidget] = set()
 
         # аватары
         self.avatar_cache = AvatarCache(
@@ -816,16 +820,19 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     widget = self._find_message_widget_at(viewport, pos)
                     mid = self._message_id_from_widget(widget) if widget is not None else None
                     if mid is not None and int(mid) > 0 and self._selected_message_ids:
+                        start_mid = int(mid)
                         self._selection_drag_active = True
-                        if self._selection_anchor_mid is None:
-                            self._selection_anchor_mid = int(mid)
-                        self._set_message_selection_state(int(mid), True, notify=False)
-                        self._extend_message_selection_range(int(mid))
+                        self._selection_drag_base_ids = set(self._selected_message_ids)
+                        self._selection_drag_range_ids = set()
+                        self._selection_anchor_mid = start_mid
+                        self._extend_message_selection_range(start_mid)
                         return True
                     if mid is None and self._selected_message_ids:
                         self._selection_drag_active = False
                         self._selection_anchor_mid = None
                         self._selection_last_range_mid = None
+                        self._selection_drag_base_ids.clear()
+                        self._selection_drag_range_ids.clear()
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseMove:
             if self._selection_drag_active and (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
                 try:
@@ -850,6 +857,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 button = None
             if button == Qt.MouseButton.LeftButton:
                 self._selection_drag_active = False
+                self._selection_drag_base_ids.clear()
+                self._selection_drag_range_ids.clear()
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.Resize:
             self._schedule_bubble_width_update()
         return False
@@ -1358,6 +1367,42 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     bubble.setMaximumWidth(maxw)
                 except Exception:
                     pass
+        if isinstance(widget, ChatItemWidget):
+            try:
+                widget.on_media_activate = self._on_media_widget_activate
+            except Exception:
+                pass
+
+    def _on_media_widget_activate(self, payload: Dict[str, Any]) -> bool:
+        kind = str(payload.get("kind") or "").strip().lower()
+        file_path = str(payload.get("file_path") or "").strip()
+        thumb_path = str(payload.get("thumb_path") or "").strip()
+        path = str(payload.get("path") or "").strip()
+        candidate = path
+        if not candidate:
+            if file_path and os.path.isfile(file_path):
+                candidate = file_path
+            elif thumb_path and os.path.isfile(thumb_path):
+                candidate = thumb_path
+
+        if kind in {"video", "video_note"}:
+            # Video viewer requires the media file itself; thumbnail-only fallback is not enough.
+            if not file_path or not os.path.isfile(file_path):
+                return False
+            candidate = file_path
+        elif not candidate or not os.path.isfile(candidate):
+            return False
+
+        try:
+            viewer = MediaViewerDialog(media_path=candidate, kind=kind, parent=self)
+            self._media_viewers.add(viewer)
+            viewer.destroyed.connect(lambda *_args, w=viewer: self._media_viewers.discard(w))
+            viewer.showFullScreen()
+            viewer.raise_()
+            viewer.activateWindow()
+            return True
+        except Exception:
+            return False
 
     def _init_refresh_timers(self) -> None:
         self._timer = QTimer(self)
@@ -3812,7 +3857,22 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._toast("Реакция отправлена" if ok else "Не удалось отправить реакцию")
 
     def _set_message_selected(self, msg_id: int, selected: bool) -> None:
-        widget = self._message_widgets.get(int(msg_id))
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        widget = self._message_widgets.get(mid)
+        if widget is None:
+            # Fallback for widgets that are in feed but absent in id-map.
+            for candidate in list(getattr(self, "_message_order", []) or []):
+                found = self._message_id_from_widget(candidate)
+                try:
+                    if found is not None and int(found) == mid:
+                        widget = candidate
+                        self._message_widgets[mid] = candidate
+                        break
+                except Exception:
+                    continue
         if widget is None:
             return
         setter = getattr(widget, "set_selected", None)
@@ -3846,6 +3906,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._selection_anchor_mid = None
             self._selection_last_range_mid = None
             self._selection_drag_active = False
+            self._selection_drag_base_ids.clear()
+            self._selection_drag_range_ids.clear()
         if notify:
             self._toast(f"Выбрано: {count}" if count else "Выделение снято")
 
@@ -3882,6 +3944,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         if target <= 0:
             return
+        if self._selection_drag_active:
+            self._apply_drag_selection_range(target)
+            return
         anchor = self._selection_anchor_mid
         if anchor is None or anchor <= 0:
             self._selection_anchor_mid = target
@@ -3909,6 +3974,46 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._set_message_selection_state(mid, True, notify=False)
         self._selection_last_range_mid = target
 
+    def _apply_drag_selection_range(self, target_mid: int) -> None:
+        try:
+            target = int(target_mid)
+        except Exception:
+            return
+        if target <= 0:
+            return
+        anchor = self._selection_anchor_mid
+        if anchor is None or anchor <= 0:
+            self._selection_anchor_mid = target
+            anchor = target
+        if self._selection_last_range_mid == target:
+            return
+
+        ordered = self._ordered_message_ids()
+        if not ordered:
+            return
+        try:
+            i1 = ordered.index(int(anchor))
+            i2 = ordered.index(target)
+        except ValueError:
+            self._selection_last_range_mid = target
+            return
+        start = min(i1, i2)
+        end = max(i1, i2)
+        range_ids = set(ordered[start : end + 1])
+        base = set(getattr(self, "_selection_drag_base_ids", set()))
+        desired = base | range_ids
+        current = set(self._selected_message_ids)
+
+        for mid in sorted(current - desired):
+            self._selected_message_ids.discard(mid)
+            self._set_message_selected(mid, False)
+        for mid in sorted(desired - current):
+            self._selected_message_ids.add(mid)
+            self._set_message_selected(mid, True)
+
+        self._selection_drag_range_ids = range_ids
+        self._selection_last_range_mid = target
+
     def _extend_selection_to_cursor(self) -> None:
         viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
         if viewport is None:
@@ -3916,6 +4021,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         try:
             local = viewport.mapFromGlobal(self.cursor().pos())
         except Exception:
+            return
+        if not viewport.rect().contains(local):
             return
         widget = self._find_message_widget_at(viewport, local)
         mid = self._message_id_from_widget(widget) if widget is not None else None
@@ -3976,13 +4083,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QMessageBox.warning(self, "Скриншот", "Не удалось сохранить файл.")
 
     def _clear_message_selection(self) -> None:
-        if not self._selected_message_ids:
-            return
         ids = list(self._selected_message_ids)
         self._selected_message_ids.clear()
         self._selection_anchor_mid = None
         self._selection_last_range_mid = None
         self._selection_drag_active = False
+        self._selection_drag_base_ids.clear()
+        self._selection_drag_range_ids.clear()
+        if not ids:
+            return
         for mid in ids:
             self._set_message_selected(mid, False)
 

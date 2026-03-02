@@ -238,6 +238,7 @@ class MediaRenderingMixin:
     _thumb_audio: Optional[QAudioOutput]
     _thumb_started: bool
     _thumb_finished: bool
+    on_media_activate: Optional[Callable[[dict], bool]]
 
     FRAME_LANDSCAPE = QSize(520, 292)
     FRAME_PORTRAIT  = QSize(360, 520)
@@ -383,11 +384,44 @@ class MediaRenderingMixin:
         lbl.setPixmap(rounded)
         self._frame_size = target
 
+    def _request_media_activate(self, *, kind: Optional[str] = None, path: Optional[str] = None) -> bool:
+        handler = getattr(self, "on_media_activate", None)
+        if not callable(handler):
+            return False
+        candidate = str(path or "").strip()
+        file_path = str(getattr(self, "file_path", "") or "").strip()
+        thumb_path = str(getattr(self, "thumb_path", "") or "").strip()
+        if not candidate:
+            if file_path and os.path.isfile(file_path):
+                candidate = file_path
+            elif thumb_path and os.path.isfile(thumb_path):
+                candidate = thumb_path
+        payload = {
+            "kind": str(kind or getattr(self, "kind", "") or "").lower(),
+            "path": candidate,
+            "file_path": file_path,
+            "thumb_path": thumb_path,
+            "chat_id": str(getattr(self, "chat_id", "") or ""),
+            "msg_id": int(getattr(self, "msg_id", 0) or 0),
+        }
+        try:
+            return bool(handler(payload))
+        except Exception:
+            return False
+
+    def _on_image_surface_clicked(self, _pos: QPointF, *, kind: str) -> None:
+        path = str(getattr(self, "file_path", "") or "").strip()
+        if not path or not os.path.isfile(path):
+            path = str(getattr(self, "thumb_path", "") or "").strip()
+        self._request_media_activate(kind=kind, path=path)
+
     # -------------------- рендер контента --------------------
     def _render_image(self, lay: QVBoxLayout) -> None:
         self._container_layout = lay
-        self.lbl_img = QLabel("Файл не загружен", parent=cast(QWidget, self))
+        self.lbl_img = _ClickLabel("Файл не загружен", parent=cast(QWidget, self))
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_img.setCursor(Qt.CursorShape.PointingHandCursor)
+        cast(Any, self.lbl_img.clicked).connect(lambda p: self._on_image_surface_clicked(p, kind="image"))
         placeholder = QSize(self.IMAGE_PLACEHOLDER)
         self.lbl_img.setFixedSize(placeholder)
         self._frame_size = placeholder
@@ -401,8 +435,10 @@ class MediaRenderingMixin:
 
     def _render_animation(self, lay: QVBoxLayout) -> None:
         self._container_layout = lay
-        self.lbl_anim = QLabel("Файл не загружен", parent=cast(QWidget, self))
+        self.lbl_anim = _ClickLabel("Файл не загружен", parent=cast(QWidget, self))
         self.lbl_anim.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_anim.setCursor(Qt.CursorShape.PointingHandCursor)
+        cast(Any, self.lbl_anim.clicked).connect(lambda p: self._on_image_surface_clicked(p, kind="animation"))
         placeholder = QSize(self.IMAGE_PLACEHOLDER)
         self.lbl_anim.setFixedSize(placeholder)
         self._frame_size = placeholder
@@ -436,7 +472,14 @@ class MediaRenderingMixin:
         self._time_lbl = None
         self._seek = None
         if not circular:
-            bar = QHBoxLayout(); bar.setContentsMargins(4, 0, 4, 0); bar.setSpacing(6)
+            # Keep timeline controls over the preview surface (Telegram-like),
+            # so geometry stays stable and does not jump when opening media.
+            overlay = QWidget(self.preview)
+            overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            overlay.setStyleSheet("background-color: rgba(10, 18, 26, 150); border-radius: 8px;")
+            overlay_layout = QHBoxLayout(overlay)
+            overlay_layout.setContentsMargins(8, 2, 8, 2)
+            overlay_layout.setSpacing(6)
             self._seek = QSlider(Qt.Orientation.Horizontal, parent=cast(QWidget, self))
             self._seek.setRange(0, 0)
             cast(Any, self._seek.sliderPressed).connect(self._on_slider_pressed)
@@ -446,8 +489,14 @@ class MediaRenderingMixin:
             self._time_lbl = QLabel("0:00 / 0:00", parent=cast(QWidget, self))
             label_css = style_mgr.stylesheet("media.time_label")
             self._time_lbl.setStyleSheet(label_css or "color:#9fa6b1; font-size:11px;")
-            bar.addWidget(self._seek, 1); bar.addWidget(self._time_lbl, 0)
-            lay.addLayout(bar); self._controls_bar = bar
+            overlay_layout.addWidget(self._seek, 1)
+            overlay_layout.addWidget(self._time_lbl, 0)
+            holder = QVBoxLayout(self.preview)
+            holder.setContentsMargins(8, 8, 8, 8)
+            holder.setSpacing(0)
+            holder.addWidget(overlay, 0, Qt.AlignmentFlag.AlignTop)
+            holder.addStretch(1)
+            self._controls_bar = overlay_layout
 
         # FIX: сброс флагов превью
         self._thumb_player = None
@@ -457,7 +506,7 @@ class MediaRenderingMixin:
         self._thumb_finished = False
 
         if self.file_path and os.path.isfile(self.file_path):
-            self.preview.setText("Готово: нажмите, чтобы воспроизвести" if not circular else "Готово: нажмите по центру")
+            self.preview.setText("Готово: нажмите, чтобы открыть" if not circular else "Готово: нажмите по центру")
             # Планируем генерацию превью после отрисовки виджета, чтобы не блокировать UI на создании элемента.
             delay_ms = 220 if bool(getattr(self, "_loading_history", False)) else 0
             QTimer.singleShot(delay_ms, lambda c=circular: self._spawn_local_video_thumb(circular=c))
@@ -848,7 +897,7 @@ class MediaRenderingMixin:
             if os.path.isfile(path):
                 self._spawn_local_video_thumb(circular=False)
             if self.preview:
-                self.preview.setText("Готово: нажмите для воспроизведения")
+                self.preview.setText("Готово: нажмите, чтобы открыть")
         elif k == "video_note":
             if os.path.isfile(path):
                 self._spawn_local_video_thumb(circular=True)
@@ -881,4 +930,8 @@ class MediaRenderingMixin:
             if r < R_in:
                 self._toggle_play(circular=True)
         else:
+            path = str(getattr(self, "file_path", "") or "").strip()
+            if path and os.path.isfile(path):
+                if self._request_media_activate(kind="video", path=path):
+                    return
             self._toggle_play(circular=False)
