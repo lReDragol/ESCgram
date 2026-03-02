@@ -6,8 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -312,6 +312,16 @@ class SettingsWindow(QDialog):
         model_layout.addWidget(self.ai_model_progress)
         layout.addWidget(model_box)
 
+        ollama_box = QGroupBox("Ollama")
+        ollama_layout = QVBoxLayout(ollama_box)
+        ollama_hint = QLabel("Чтоб установить и работать с моделями нужно установить и запустить ollama.")
+        ollama_hint.setWordWrap(True)
+        ollama_layout.addWidget(ollama_hint)
+        self.btn_ollama_download = QPushButton("Скачать Ollama")
+        self.btn_ollama_download.clicked.connect(self._open_ollama_download_page)
+        ollama_layout.addWidget(self.btn_ollama_download, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(ollama_box)
+
         ctx_box = QGroupBox("Контекст")
         ctx_layout = QVBoxLayout(ctx_box)
         ctx_row = QHBoxLayout()
@@ -595,6 +605,9 @@ class SettingsWindow(QDialog):
 
     def _on_ai_cuda_toggled(self, checked: bool) -> None:
         self._emit_ai_change({"use_cuda": bool(checked)})
+
+    def _open_ollama_download_page(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://ollama.com/download"))
 
 
 class StyleEditorTab(QWidget):
