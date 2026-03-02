@@ -82,8 +82,9 @@ end;
 
 function _JsonEscape(const S: String): String;
 begin
-  Result := StringChangeEx(S, '\', '\\', True);
-  Result := StringChangeEx(Result, '"', '\"', True);
+  Result := S;
+  StringChangeEx(Result, '\', '\\', True);
+  StringChangeEx(Result, '"', '\"', True);
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
