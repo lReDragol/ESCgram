@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 class AccountManagerDialog(QDialog):
     account_switched = Signal()
     account_add_requested = Signal()
+    account_deleted = Signal()
 
     def __init__(self, tg_adapter, parent=None) -> None:
         super().__init__(parent)
@@ -33,9 +34,12 @@ class AccountManagerDialog(QDialog):
         btn_row = QHBoxLayout()
         self.btn_add = QPushButton("Добавить аккаунт")
         self.btn_use = QPushButton("Использовать")
+        self.btn_delete = QPushButton("Удалить")
         self.btn_use.setEnabled(False)
+        self.btn_delete.setEnabled(False)
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_use)
+        btn_row.addWidget(self.btn_delete)
         btn_row.addStretch(1)
         root.addLayout(btn_row)
 
@@ -45,6 +49,7 @@ class AccountManagerDialog(QDialog):
 
         self.btn_add.clicked.connect(self._emit_add)
         self.btn_use.clicked.connect(self._switch_selected)
+        self.btn_delete.clicked.connect(self._delete_selected)
         self.list_widget.currentItemChanged.connect(lambda *_: self._update_buttons())
 
         self._populate()
@@ -75,9 +80,11 @@ class AccountManagerDialog(QDialog):
         item = self.list_widget.currentItem()
         if not item:
             self.btn_use.setEnabled(False)
+            self.btn_delete.setEnabled(False)
             return
         is_active = bool(item.data(Qt.ItemDataRole.UserRole + 1))
         self.btn_use.setEnabled(not is_active)
+        self.btn_delete.setEnabled(not is_active)
 
     def _emit_add(self) -> None:
         self.account_add_requested.emit()
@@ -98,3 +105,37 @@ class AccountManagerDialog(QDialog):
             return
         self.account_switched.emit()
         self.accept()
+
+    def _delete_selected(self) -> None:
+        session = self._selected_session()
+        if not session:
+            QMessageBox.information(self, "Аккаунты", "Выберите аккаунт для удаления")
+            return
+
+        item = self.list_widget.currentItem()
+        is_active = bool(item.data(Qt.ItemDataRole.UserRole + 1)) if item else False
+        if is_active:
+            QMessageBox.warning(self, "Аккаунты", "Нельзя удалить активный аккаунт. Сначала переключитесь на другой.")
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Удалить аккаунт",
+            "Удалить выбранный аккаунт из менеджера и удалить его session-файлы?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if hasattr(self.tg, "delete_account"):
+                self.tg.delete_account(session)
+            else:
+                raise RuntimeError("Удаление аккаунта недоступно в этой сборке.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Аккаунты", str(exc))
+            return
+
+        self._populate()
+        self.account_deleted.emit()
