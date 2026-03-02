@@ -1117,12 +1117,20 @@ class TelegramAdapter:
         if not HAVE_QR:
             raise RuntimeError("qrcode не установлен (pip install qrcode pillow)")
 
+        if not self._thread:
+            self.start()
+
+        try:
+            on_status("QR: подключаем Telegram-клиент...")
+        except Exception:
+            pass
+
         # дождаться подключения клиента (он стартуется в отдельном потоке)
-        deadline = time.time() + 10.0
+        deadline = time.time() + 45.0
         while not self._connected and time.time() < deadline:
             time.sleep(0.05)
         if not self._connected:
-            raise RuntimeError("Client has not been started yet")
+            raise RuntimeError("Client has not been started yet (timeout waiting for connection)")
 
         async def _qr_flow():
             from io import BytesIO
