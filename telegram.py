@@ -214,10 +214,12 @@ class TelegramAdapter:
         self._avatar_dir = app_paths.avatars_dir()
         self._account_store = AccountStore(self._workdir)
         stored_session = self._account_store.active_session
-        picked = stored_session or self._pick_existing_session_name(["my_account_gui"])
+        picked = self._resolve_startup_session(stored_session)
         self._session_name = picked
-        self._account_store.ensure_account(self._session_name)
-        self._account_store.set_active(self._session_name)
+        self._pending_session_name: Optional[str] = None
+        if self._session_exists(self._session_name):
+            self._account_store.ensure_account(self._session_name)
+            self._account_store.set_active(self._session_name)
         self._download_jobs: Dict[str, _DownloadJob] = {}
         self._message_to_job: Dict[Tuple[str, int], str] = {}
         self._download_lock = threading.Lock()
@@ -241,9 +243,34 @@ class TelegramAdapter:
 
     def _pick_existing_session_name(self, candidates: List[str]) -> str:
         for name in candidates:
-            if (self._workdir / f"{name}.session").exists():
+            if self._session_exists(name):
                 return name
         return candidates[0]
+
+    def _session_exists(self, session_name: Optional[str]) -> bool:
+        if not session_name:
+            return False
+        return (self._workdir / f"{session_name}.session").exists()
+
+    def _resolve_startup_session(self, active_session: Optional[str]) -> str:
+        if self._session_exists(active_session):
+            return str(active_session)
+
+        accounts = self._account_store.list_accounts(active_session)
+        for row in accounts:
+            candidate = str(row.get("session") or "").strip()
+            if self._session_exists(candidate):
+                return candidate
+
+        session_files = sorted(
+            [p for p in self._workdir.glob("*.session") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if session_files:
+            return session_files[0].stem
+
+        return "my_account_gui"
 
     def _generate_session_name(self, base: str = "account") -> str:
         idx = 1
@@ -264,7 +291,21 @@ class TelegramAdapter:
         return self._session_name
 
     def list_accounts(self) -> List[Dict[str, Any]]:
-        return self._account_store.list_accounts(self._session_name)
+        rows = self._account_store.list_accounts(self._session_name)
+        out: List[Dict[str, Any]] = []
+        stale: List[str] = []
+        for row in rows:
+            session = str(row.get("session") or "").strip()
+            if self._session_exists(session):
+                out.append(row)
+            else:
+                stale.append(session)
+        for session in stale:
+            try:
+                self._account_store.remove_account(session)
+            except Exception:
+                pass
+        return out
 
     def get_active_account_meta(self) -> Dict[str, Any]:
         meta = self._account_store.get_account(self._session_name)
@@ -273,29 +314,67 @@ class TelegramAdapter:
 
     def prepare_new_account_session(self) -> str:
         new_session = self._generate_session_name()
-        self._activate_session(new_session, clean=True)
-        self._account_store.update_account(new_session, title="Новый аккаунт")
+        self._pending_session_name = new_session
+        self._activate_session(new_session, clean=True, register=False)
         return new_session
 
     def switch_account(self, session_name: str) -> None:
         if not session_name or session_name == self._session_name:
             return
-        if not (self._workdir / f"{session_name}.session").exists():
+        if not self._session_exists(session_name):
             raise FileNotFoundError(f"Session '{session_name}' не найден")
-        self._activate_session(session_name)
+        self._pending_session_name = None
+        self._activate_session(session_name, register=True)
 
-    def _activate_session(self, session_name: str, *, clean: bool = False) -> None:
+    def delete_account(self, session_name: str) -> None:
+        name = str(session_name or "").strip()
+        if not name:
+            raise ValueError("Не указан аккаунт")
+        if name == self._session_name:
+            raise RuntimeError("Нельзя удалить активный аккаунт. Сначала переключитесь на другой.")
+        self._delete_session_files(name)
+        self._account_store.remove_account(name)
+
+    def _activate_session(self, session_name: str, *, clean: bool = False, register: bool = True) -> None:
         self.stop()
         if clean:
             self._delete_session_files(session_name)
         self._session_name = session_name
-        self._account_store.ensure_account(session_name)
-        self._account_store.set_active(session_name)
-        self._account_store.update_account(session_name, last_used=time.time())
+        if register:
+            self._account_store.ensure_account(session_name)
+            self._account_store.set_active(session_name)
+            self._account_store.update_account(session_name, last_used=time.time())
         self._connected = False
         self._initialized = False
         self._auth_invalid = False
         self.start()
+
+    def _finalize_authenticated_session(self, profile: Optional[Dict[str, Any]] = None) -> None:
+        self._pending_session_name = None
+        self._account_store.ensure_account(self._session_name)
+        self._account_store.set_active(self._session_name)
+        base_meta: Dict[str, Any] = {"last_used": time.time()}
+        if isinstance(profile, dict):
+            for key in ("title", "phone", "username", "user_id", "full_name"):
+                value = profile.get(key)
+                if value is not None:
+                    base_meta[key] = value
+        self._account_store.update_account(self._session_name, **base_meta)
+
+    def _profile_from_raw_me(self, me: Any) -> Dict[str, Any]:
+        first = str(getattr(me, "first_name", "") or "")
+        last = str(getattr(me, "last_name", "") or "")
+        username = str(getattr(me, "username", "") or "")
+        phone = str(getattr(me, "phone_number", None) or getattr(me, "phone", None) or "")
+        full_name = " ".join(filter(None, [first, last])).strip()
+        title = f"@{username}" if username else (full_name or self._session_name)
+        return {
+            "title": title,
+            "phone": phone,
+            "username": username,
+            "user_id": int(getattr(me, "id", 0) or 0),
+            "full_name": full_name,
+        }
 
     def refresh_active_account_profile(self) -> Optional[Dict[str, Any]]:
         profile = self.get_self_profile_sync()
@@ -311,7 +390,7 @@ class TelegramAdapter:
             "full_name": full_name,
             "last_used": time.time(),
         }
-        self._account_store.update_account(self._session_name, **meta)
+        self._finalize_authenticated_session(meta)
         return meta
 
     def get_self_profile_sync(self, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
@@ -396,7 +475,9 @@ class TelegramAdapter:
             await _connect_only()
             # если уже авторизованы — поднимем апдейты
             try:
-                _ = await self._client.get_me()
+                me = await self._client.get_me()
+                self._auth_invalid = False
+                self._finalize_authenticated_session(self._profile_from_raw_me(me))
                 await self._initialize_updates()
             except Exception:
                 pass
@@ -954,12 +1035,24 @@ class TelegramAdapter:
 
         log.info("[TG] updates initialized (me=%s, premium=%s)",
                  getattr(m, "id", None), getattr(m, "is_premium", None))
+        self._auth_invalid = False
+        if m is not None:
+            try:
+                self._finalize_authenticated_session(self._profile_from_raw_me(m))
+            except Exception:
+                pass
 
     # -------------------- state / identity --------------------
     def is_authorized_sync(self, timeout: float = 5.0) -> bool:
-        if not (self._enabled and self._client and self._loop):
+        if not self._enabled:
             return False
-        if self._auth_invalid:
+
+        # Give the background thread time to initialize loop/client after start().
+        warmup_deadline = time.time() + 5.0
+        while self._thread and (self._client is None or self._loop is None) and time.time() < warmup_deadline:
+            time.sleep(0.05)
+
+        if not (self._client and self._loop):
             return False
 
         # чуть подождать подключение
@@ -967,12 +1060,20 @@ class TelegramAdapter:
         while not self._connected and time.time() < end:
             time.sleep(0.05)
 
+        if not self._connected:
+            return False
+
         async def _check():
             mid = await self._get_me_id_cached(ttl_sec=60.0)
             return bool(mid)
 
         try:
-            return bool(self._call(_check(), timeout))
+            ok = bool(self._call(_check(), timeout))
+            if ok:
+                self._auth_invalid = False
+            elif self._auth_invalid:
+                return False
+            return ok
         except Exception:
             return False
 
@@ -1171,6 +1272,7 @@ class TelegramAdapter:
         ok = bool(self._call(_signin(), timeout))
         if ok:
             self._auth_invalid = False
+            self._finalize_authenticated_session()
         return ok
 
     # -------------------- AUTH: QR login (+2FA) --------------------
@@ -1333,6 +1435,7 @@ class TelegramAdapter:
         ok = bool(self._call(_qr_flow(), timeout_total))
         if ok:
             self._auth_invalid = False
+            self._finalize_authenticated_session()
         return ok
 
     # -------------------- dialogs / messaging --------------------
