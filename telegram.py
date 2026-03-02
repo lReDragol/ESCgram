@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import sys
 import threading
 import time
 import subprocess
@@ -69,23 +70,67 @@ except Exception:
 # ----------------------------- config -----------------------------
 def _load_config() -> Dict[str, Any]:
     candidates: List[Path] = []
+    seen: Set[str] = set()
+
+    def _add(path: Optional[Path]) -> None:
+        if not path:
+            return
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
     env_path = str(os.getenv("DRAGO_CONFIG_PATH") or "").strip()
     if env_path:
-        candidates.append(Path(env_path).expanduser())
+        _add(Path(env_path).expanduser())
 
     # Preferred: config stored alongside app data (safe for installs).
     try:
-        candidates.append(app_paths.get_data_dir() / "config.json")
+        data_dir = app_paths.get_data_dir()
+        _add(data_dir / "config.json")
+        _add(data_dir / "userdata" / "config.json")
     except Exception:
+        data_dir = None
         pass
 
     # Backward-compat: project root config.json.
-    candidates.append(Path(__file__).resolve().parent / "config.json")
+    module_dir = Path(__file__).resolve().parent
+    _add(module_dir / "config.json")
+    _add(module_dir / "userdata" / "config.json")
+
+    # Current working directory fallbacks.
+    cwd = Path.cwd()
+    _add(cwd / "config.json")
+    _add(cwd / "userdata" / "config.json")
+
+    # Frozen binary dir fallbacks.
+    try:
+        exe_dir = Path(sys.executable).resolve().parent
+    except Exception:
+        exe_dir = None
+    _add(exe_dir / "config.json" if exe_dir else None)
+    _add(exe_dir / "userdata" / "config.json" if exe_dir else None)
+
+    # Last-resort defaults from bundled/project example config.
+    _add(module_dir / "config.example.json")
+    _add(cwd / "config.example.json")
+    _add(exe_dir / "config.example.json" if exe_dir else None)
+    try:
+        _add(app_paths.user_config_dir() / "config.json")
+    except Exception:
+        pass
 
     for path in candidates:
         try:
             if path.is_file():
-                return json.loads(path.read_text(encoding="utf-8"))
+                cfg = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(cfg, dict):
+                    log.info("[TG] config loaded from %s", path)
+                    return cfg
         except Exception:
             continue
     return {}
