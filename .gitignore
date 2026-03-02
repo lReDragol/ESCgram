@@ -25,6 +25,7 @@ Desktop.ini
 build/
 dist/
 dist_installer/
+dist_linux/
 *.egg-info/
 
 # App runtime data (never commit)
