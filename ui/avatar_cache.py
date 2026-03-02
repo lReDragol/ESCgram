@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -40,6 +41,7 @@ class AvatarCache:
         self._size = max(16, size)
         self._cache: Dict[str, QPixmap] = {}
         self._paths: Dict[str, Optional[str]] = {}
+        self._failed_at: Dict[str, float] = {}
         self._pending: Dict[str, _AvatarMeta] = {}
         self._on_ready = on_ready
         self._lock = threading.Lock()
@@ -69,7 +71,7 @@ class AvatarCache:
 
     def chat(self, chat_id: str, info: Dict[str, Any]) -> QPixmap:
         title = str(info.get("title") or chat_id)
-        photo_small = info.get("photo_small_id")
+        photo_small = info.get("photo_small_id") or info.get("photo_small")
         cache_key = f"chat:{chat_id}:{photo_small or 'none'}"
         path = self._paths.get(cache_key)
         background = self._color(f"chat:{chat_id}")
@@ -88,7 +90,9 @@ class AvatarCache:
             placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
-        if photo_small and cache_key not in self._paths:
+        failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
+        can_retry = (time.time() - failed_at) >= 12.0
+        if photo_small and (cache_key not in self._paths or not path) and can_retry:
             self._schedule_download(
                 cache_key=cache_key,
                 kind="chat",
@@ -123,7 +127,9 @@ class AvatarCache:
             placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
-        if cache_key not in self._paths:
+        failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
+        can_retry = (time.time() - failed_at) >= 12.0
+        if (cache_key not in self._paths or not path) and can_retry:
             self._schedule_download(
                 cache_key=cache_key,
                 kind="user",
@@ -182,11 +188,16 @@ class AvatarCache:
     @Slot(str, str, str, str)
     def _on_download_ready(self, cache_key: str, kind: str, entity_id: str, path: str) -> None:
         meta = self._pending.pop(cache_key, None)
-        self._paths[cache_key] = path or ""
+        normalized = path or ""
+        self._paths[cache_key] = normalized
+        if normalized:
+            self._failed_at.pop(cache_key, None)
+        else:
+            self._failed_at[cache_key] = time.time()
         if not meta:
             return
 
-        if path:
+        if normalized:
             pix = make_avatar_pixmap(self._size, path, meta.initials, background=meta.background)
             self._cache[cache_key] = pix
 

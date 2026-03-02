@@ -165,6 +165,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._reply_index: Dict[int, List[int]] = {}
         self._chat_last_message_id: Dict[str, int] = {}
         self._selected_message_ids: set[int] = set()
+        self._selection_anchor_mid: Optional[int] = None
+        self._selection_drag_active: bool = False
+        self._selection_last_range_mid: Optional[int] = None
         self._runtime_toasts_enabled = bool(int(os.getenv("DRAGO_RUNTIME_TOASTS", "0") or 0))
         self._pending_reply_to: Optional[int] = None
         self._reply_bar: Optional[QFrame] = None
@@ -796,6 +799,57 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     if global_pos is not None:
                         self._show_message_context_menu(widget, global_pos)
                         return True
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseButtonPress:
+            try:
+                button = event.button()
+            except Exception:
+                button = None
+            if button == Qt.MouseButton.LeftButton:
+                try:
+                    pos = event.position().toPoint()
+                except Exception:
+                    try:
+                        pos = event.pos()
+                    except Exception:
+                        pos = None
+                if pos is not None:
+                    widget = self._find_message_widget_at(viewport, pos)
+                    mid = self._message_id_from_widget(widget) if widget is not None else None
+                    if mid is not None and int(mid) > 0 and self._selected_message_ids:
+                        self._selection_drag_active = True
+                        if self._selection_anchor_mid is None:
+                            self._selection_anchor_mid = int(mid)
+                        self._set_message_selection_state(int(mid), True, notify=False)
+                        self._extend_message_selection_range(int(mid))
+                        return True
+                    if mid is None and self._selected_message_ids:
+                        self._selection_drag_active = False
+                        self._selection_anchor_mid = None
+                        self._selection_last_range_mid = None
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseMove:
+            if self._selection_drag_active and (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+                try:
+                    pos = event.position().toPoint()
+                except Exception:
+                    try:
+                        pos = event.pos()
+                    except Exception:
+                        pos = None
+                if pos is not None:
+                    widget = self._find_message_widget_at(viewport, pos)
+                    mid = self._message_id_from_widget(widget) if widget is not None else None
+                    if mid is not None and int(mid) > 0:
+                        self._extend_message_selection_range(int(mid))
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.Wheel:
+            if self._selection_drag_active and (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+                QTimer.singleShot(0, self._extend_selection_to_cursor)
+        if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseButtonRelease:
+            try:
+                button = event.button()
+            except Exception:
+                button = None
+            if button == Qt.MouseButton.LeftButton:
+                self._selection_drag_active = False
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.Resize:
             self._schedule_bubble_width_update()
         return False
@@ -1399,7 +1453,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     # Chat list interactions
 
     def on_chat_list_clicked(self, item) -> None:
-        chat_id = str(item.data(Qt.ItemDataRole.UserRole))
+        chat_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not chat_id:
+            return
+        if chat_id == "__back__":
+            if hasattr(self, "clear_chat_list_override"):
+                self.clear_chat_list_override()
+            return
+        if getattr(self, "_chat_list_override_mode", ""):
+            if hasattr(self, "clear_chat_list_override"):
+                self.clear_chat_list_override()
         self.switch_chat(chat_id)
 
     def switch_chat(self, chat_id: str) -> None:
@@ -1976,7 +2039,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not contacts:
             QMessageBox.information(self, "Контакты", "Список контактов пуст.")
             return
-        items = []
+        rows: List[Dict[str, Any]] = [
+            {
+                "id": "__back__",
+                "title": "← Назад к чатам",
+                "meta": "",
+                "unread": 0,
+                "info": {"title": "Назад", "type": "service"},
+            }
+        ]
         for row in contacts:
             title = str(row.get("title") or row.get("username") or row.get("id") or "")
             username = str(row.get("username") or "")
@@ -1987,10 +2058,37 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             if phone:
                 parts.append(phone)
             label = " • ".join([p for p in parts if p])
-            items.append({"id": str(row.get("id") or ""), "label": label})
-        choice = self._pick_from_list("Контакты", "Выберите контакт:", items)
-        if choice and choice.get("id"):
-            self.switch_chat(str(choice["id"]))
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            existing = dict(self.all_chats.get(cid, {}))
+            ctype = str(existing.get("type") or ("bot" if username.endswith("bot") else "private"))
+            info = {
+                **existing,
+                "id": cid,
+                "title": title or cid,
+                "type": ctype,
+                "username": username,
+                "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or existing.get("photo_small_id") or existing.get("photo_small"),
+            }
+            rows.append(
+                {
+                    "id": cid,
+                    "title": title or cid,
+                    "meta": label,
+                    "unread": int(existing.get("unread_count") or 0),
+                    "info": info,
+                }
+            )
+        if hasattr(self, "set_chat_list_override"):
+            self.set_chat_list_override(mode="contacts", rows=rows)
+            return
+        # Fallback (shouldn't happen): open first contact.
+        for row in rows:
+            cid = str(row.get("id") or "")
+            if cid and cid != "__back__":
+                self.switch_chat(cid)
+                return
 
     def _open_archive_picker(self) -> None:
         if not hasattr(self.tg, "list_archived_chats_sync"):
@@ -2003,15 +2101,53 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not rows:
             QMessageBox.information(self, "Архив", "Архив пуст.")
             return
-        items = []
+        override_rows: List[Dict[str, Any]] = [
+            {
+                "id": "__back__",
+                "title": "← Назад к чатам",
+                "meta": "",
+                "unread": 0,
+                "info": {"title": "Назад", "type": "service"},
+            }
+        ]
         for row in rows:
-            title = str(row.get("title") or row.get("id") or "")
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            title = str(row.get("title") or cid)
             username = str(row.get("username") or "")
-            label = f"{title} @{username}".strip() if username else title
-            items.append({"id": str(row.get("id") or ""), "label": label})
-        choice = self._pick_from_list("Архив", "Открыть чат:", items)
-        if choice and choice.get("id"):
-            self.switch_chat(str(choice["id"]))
+            ctype = str(row.get("type") or self.all_chats.get(cid, {}).get("type") or "private")
+            meta_parts: List[str] = [self._type_label(ctype)] if self._type_label(ctype) else []
+            if username:
+                meta_parts.append(f"@{username}")
+            meta = " • ".join([x for x in meta_parts if x])
+            info = {
+                **dict(self.all_chats.get(cid, {})),
+                "id": cid,
+                "title": title,
+                "type": ctype,
+                "username": username,
+                "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or self.all_chats.get(cid, {}).get("photo_small_id"),
+                "last_ts": int(row.get("last_ts") or row.get("last_message_date") or self.all_chats.get(cid, {}).get("last_ts") or 0),
+                "unread_count": int(row.get("unread_count") or self.all_chats.get(cid, {}).get("unread_count") or 0),
+            }
+            override_rows.append(
+                {
+                    "id": cid,
+                    "title": title,
+                    "meta": meta,
+                    "unread": int(info.get("unread_count") or 0),
+                    "info": info,
+                }
+            )
+        if hasattr(self, "set_chat_list_override"):
+            self.set_chat_list_override(mode="archive", rows=override_rows)
+            return
+        for row in override_rows:
+            cid = str(row.get("id") or "")
+            if cid and cid != "__back__":
+                self.switch_chat(cid)
+                return
 
     def _create_group_dialog(self) -> None:
         if not hasattr(self.tg, "create_group_sync"):
@@ -3112,9 +3248,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 media_group_id_raw = entry.get("media_group_id")
                 media_group_id = str(media_group_id_raw).strip() if media_group_id_raw else None
 
-                mine = self._my_id and sender_id == self._my_id
-                role = "me" if mine else ("assistant" if kind_raw == "assistant" else "other")
-                header = "Вы" if mine else (entry.get("sender") or "Неизвестно")
+                role_hint = str(entry.get("role") or "").strip().lower()
+                mine = bool(self._my_id and sender_id == self._my_id)
+                if role_hint == "assistant":
+                    role = "assistant"
+                else:
+                    role = "me" if mine else ("assistant" if kind_raw == "assistant" else "other")
+                if role == "assistant":
+                    header = str(entry.get("sender") or "🤖 AI")
+                else:
+                    header = "Вы" if mine else (entry.get("sender") or "Неизвестно")
 
                 reply_preview = self._build_reply_preview(reply_to)
                 media_kinds = {"image", "photo", "animation", "gif", "video", "video_note", "audio", "voice", "document", "sticker"}
@@ -3314,39 +3457,36 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         target_id = str(entity_id or "")
         if not target_id:
             return
-
-        if kind == "chat":
-            item_map = getattr(self, "_chat_items_by_id", {})
-            item = item_map.get(target_id) if isinstance(item_map, dict) else None
-            if item:
+        if kind in {"chat", "user"}:
+            for idx in range(self.chat_list.count()):
+                item = self.chat_list.item(idx)
+                if not item:
+                    continue
+                cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                if not cid or cid != target_id:
+                    continue
                 info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+                chat_type = str((info or {}).get("type") or "").lower()
+                is_user_chat = chat_type in {"private", "bot"}
+                if (kind == "user" and not is_user_chat) or (kind == "chat" and is_user_chat):
+                    continue
                 try:
-                    pixmap = self.avatar_cache.chat(target_id, info)
-                    # Chat list rows already render avatar via ChatListRowWidget.
-                    # Keeping QListWidgetItem icon causes duplicate avatars.
+                    title = str((info or {}).get("title_display") or (info or {}).get("title") or cid)
+                    payload = getattr(self, "_chat_list_avatar_payload", None)
+                    if callable(payload):
+                        pixmap, avatar_key = payload(cid, dict(info or {}), title)
+                    else:
+                        pixmap, avatar_key = None, None
+                    if pixmap is None:
+                        continue
                     item.setIcon(QIcon())
                     row_widget = self.chat_list.itemWidget(item)
-                    if row_widget and hasattr(row_widget, "set_avatar"):
+                    if row_widget and hasattr(row_widget, "set_avatar_cached"):
+                        row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+                    elif row_widget and hasattr(row_widget, "set_avatar"):
                         row_widget.set_avatar(pixmap)
                 except Exception:
                     pass
-            else:
-                for idx in range(self.chat_list.count()):
-                    item = self.chat_list.item(idx)
-                    if not item:
-                        continue
-                    cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
-                    if cid != target_id:
-                        continue
-                    info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
-                    try:
-                        pixmap = self.avatar_cache.chat(cid, info)
-                        item.setIcon(QIcon())
-                        row_widget = self.chat_list.itemWidget(item)
-                        if row_widget and hasattr(row_widget, "set_avatar"):
-                            row_widget.set_avatar(pixmap)
-                    except Exception:
-                        pass
 
         self._refresh_feed_avatars(kind, target_id)
         if kind == "user" and target_id and target_id == str(getattr(self, "_active_account_user_id", "") or ""):
@@ -3420,7 +3560,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 "type": info.get("type") or prev.get("type") or "",
                 "last_ts": merged_last_ts,
                 "username": info.get("username") or prev.get("username"),
-                "photo_small_id": info.get("photo_small_id") or prev.get("photo_small_id"),
+                "photo_small_id": info.get("photo_small_id") or info.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
                 "pinned": bool(info.get("pinned", prev.get("pinned", False))),
                 "unread_count": merged_unread,
             }
@@ -3681,7 +3821,34 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 pass
 
-    def _toggle_message_selection(self, msg_id: int) -> None:
+    def _set_message_selection_state(self, msg_id: int, selected: bool, *, notify: bool = True) -> None:
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        already = mid in self._selected_message_ids
+        if selected:
+            if not already:
+                self._selected_message_ids.add(mid)
+                self._set_message_selected(mid, True)
+        else:
+            if already:
+                self._selected_message_ids.discard(mid)
+                self._set_message_selected(mid, False)
+        count = len(self._selected_message_ids)
+        if count == 1 and selected:
+            self._selection_anchor_mid = mid
+            self._selection_last_range_mid = mid
+        elif count == 0:
+            self._selection_anchor_mid = None
+            self._selection_last_range_mid = None
+            self._selection_drag_active = False
+        if notify:
+            self._toast(f"Выбрано: {count}" if count else "Выделение снято")
+
+    def _toggle_message_selection(self, msg_id: int, *, notify: bool = True) -> None:
         try:
             mid = int(msg_id)
         except Exception:
@@ -3689,19 +3856,132 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if mid <= 0:
             return
         if mid in self._selected_message_ids:
-            self._selected_message_ids.discard(mid)
-            self._set_message_selected(mid, False)
+            self._set_message_selection_state(mid, False, notify=notify)
         else:
-            self._selected_message_ids.add(mid)
-            self._set_message_selected(mid, True)
-        count = len(self._selected_message_ids)
-        self._toast(f"Выбрано: {count}" if count else "Выделение снято")
+            self._set_message_selection_state(mid, True, notify=notify)
+
+    def _ordered_message_ids(self) -> List[int]:
+        ordered: List[int] = []
+        for widget in list(getattr(self, "_message_order", []) or []):
+            mid = self._message_id_from_widget(widget)
+            if mid is None:
+                continue
+            try:
+                val = int(mid)
+            except Exception:
+                continue
+            if val > 0:
+                ordered.append(val)
+        return ordered
+
+    def _extend_message_selection_range(self, target_mid: int) -> None:
+        try:
+            target = int(target_mid)
+        except Exception:
+            return
+        if target <= 0:
+            return
+        anchor = self._selection_anchor_mid
+        if anchor is None or anchor <= 0:
+            self._selection_anchor_mid = target
+            self._set_message_selection_state(target, True, notify=False)
+            self._selection_last_range_mid = target
+            return
+        if self._selection_last_range_mid == target:
+            return
+
+        ordered = self._ordered_message_ids()
+        if not ordered:
+            self._set_message_selection_state(target, True, notify=False)
+            self._selection_last_range_mid = target
+            return
+        try:
+            i1 = ordered.index(int(anchor))
+            i2 = ordered.index(target)
+        except ValueError:
+            self._set_message_selection_state(target, True, notify=False)
+            self._selection_last_range_mid = target
+            return
+        start = min(i1, i2)
+        end = max(i1, i2)
+        for mid in ordered[start : end + 1]:
+            self._set_message_selection_state(mid, True, notify=False)
+        self._selection_last_range_mid = target
+
+    def _extend_selection_to_cursor(self) -> None:
+        viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
+        if viewport is None:
+            return
+        try:
+            local = viewport.mapFromGlobal(self.cursor().pos())
+        except Exception:
+            return
+        widget = self._find_message_widget_at(viewport, local)
+        mid = self._message_id_from_widget(widget) if widget is not None else None
+        if mid is None:
+            return
+        self._extend_message_selection_range(int(mid))
+
+    def _capture_selected_messages_screenshot(self) -> None:
+        mids = sorted({int(mid) for mid in self._selected_message_ids if int(mid) > 0})
+        if not mids:
+            QMessageBox.information(self, "Скриншот", "Сначала выделите сообщения.")
+            return
+
+        wraps: List[QWidget] = []
+        for mid in mids:
+            widget = self._message_widgets.get(mid)
+            if widget is None:
+                continue
+            wrap = getattr(widget, "_row_wrap", None) or widget
+            if isinstance(wrap, QWidget):
+                wraps.append(wrap)
+        if not wraps:
+            QMessageBox.information(self, "Скриншот", "Не удалось получить выделенные сообщения.")
+            return
+
+        target_rect: Optional[QRect] = None
+        for wrap in wraps:
+            rect = wrap.geometry()
+            target_rect = rect if target_rect is None else target_rect.united(rect)
+        if target_rect is None:
+            QMessageBox.information(self, "Скриншот", "Не удалось подготовить область скриншота.")
+            return
+        target_rect.adjust(-8, -8, 8, 8)
+        bounds = self.chat_history_wrap.rect()
+        target_rect = target_rect.intersected(bounds)
+        if target_rect.isEmpty():
+            QMessageBox.information(self, "Скриншот", "Пустая область скриншота.")
+            return
+
+        default_name = f"escgram_selected_{int(time.time())}.png"
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить скриншот сообщений",
+            default_name,
+            "PNG (*.png)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".png"):
+            out_path += ".png"
+        pix = self.chat_history_wrap.grab(target_rect)
+        if pix.isNull():
+            QMessageBox.warning(self, "Скриншот", "Не удалось создать скриншот.")
+            return
+        if pix.save(out_path, "PNG"):
+            self._toast("Скриншот сохранён")
+        else:
+            QMessageBox.warning(self, "Скриншот", "Не удалось сохранить файл.")
 
     def _clear_message_selection(self) -> None:
         if not self._selected_message_ids:
             return
         ids = list(self._selected_message_ids)
         self._selected_message_ids.clear()
+        self._selection_anchor_mid = None
+        self._selection_last_range_mid = None
+        self._selection_drag_active = False
         for mid in ids:
             self._set_message_selected(mid, False)
 
@@ -3842,6 +4122,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             menu.addSeparator()
             menu.addAction(f"Удалить выбранные ({len(self._selected_message_ids)})").triggered.connect(self._delete_selected_messages)
             menu.addAction(f"Переслать выбранные ({len(self._selected_message_ids)})").triggered.connect(self._forward_selected_messages)
+            menu.addAction(f"Скриншот выбранных ({len(self._selected_message_ids)})").triggered.connect(self._capture_selected_messages_screenshot)
             menu.addAction("Снять выделение со всех").triggered.connect(self._clear_message_selection)
 
         menu.addSeparator()

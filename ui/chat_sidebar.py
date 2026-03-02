@@ -332,6 +332,8 @@ class ChatSidebarMixin:
         left = QVBoxLayout()
         left.setContentsMargins(0, 8, 8, 8)
         left.setSpacing(10)
+        self._chat_list_override_mode: str = ""
+        self._chat_list_override_rows: List[Dict[str, Any]] = []
 
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
@@ -572,8 +574,31 @@ class ChatSidebarMixin:
     def _on_folder_button_toggled(self, button: FolderButton, checked: bool) -> None:
         if not (button and checked):
             return
+        if getattr(self, "_chat_list_override_mode", ""):
+            self._chat_list_override_mode = ""
+            self._chat_list_override_rows = []
         folder_id = button.property("folder_id") or "all"
         self._active_folder = str(folder_id)
+        self.populate_chat_list()
+
+    def set_chat_list_override(self, *, mode: str, rows: List[Dict[str, Any]]) -> None:
+        self._chat_list_override_mode = str(mode or "").strip()
+        normalized: List[Dict[str, Any]] = []
+        for row in list(rows or []):
+            if isinstance(row, dict):
+                normalized.append(dict(row))
+        self._chat_list_override_rows = normalized
+        try:
+            self.search.clear()
+        except Exception:
+            pass
+        self.populate_chat_list()
+
+    def clear_chat_list_override(self) -> None:
+        if not getattr(self, "_chat_list_override_mode", "") and not getattr(self, "_chat_list_override_rows", None):
+            return
+        self._chat_list_override_mode = ""
+        self._chat_list_override_rows = []
         self.populate_chat_list()
 
     # ------------------------------------------------------------------ #
@@ -665,6 +690,16 @@ class ChatSidebarMixin:
 
         self.chat_list.setUpdatesEnabled(False)
         try:
+            override_mode = str(getattr(self, "_chat_list_override_mode", "") or "").strip()
+            if override_mode:
+                self._populate_chat_list_override(
+                    current_id=current_id,
+                    search_text=search_text,
+                    chat_items_by_id=chat_items_by_id,
+                    chat_rows_by_id=chat_rows_by_id,
+                )
+                return
+
             all_ids = set(self.history.get("chats", {}).keys()) | set(self.all_chats.keys())
             search_active = bool((search_text or "").strip())
 
@@ -791,17 +826,9 @@ class ChatSidebarMixin:
                     row_widget = self.chat_list.itemWidget(item)
                     if isinstance(row_widget, ChatListRowWidget):
                         row_widget.update_row(title=title, meta=meta, unread=unread)
-                        if hasattr(self, "avatar_cache"):
-                            try:
-                                avatar_key = (
-                                    cid,
-                                    str(info.get("photo_small_id") or info.get("photo_small") or ""),
-                                    int(self._avatar_size),
-                                )
-                                pixmap = self.avatar_cache.chat(cid, info)  # type: ignore[attr-defined]
-                                row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
-                            except Exception:
-                                pass
+                        pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+                        if pixmap is not None:
+                            row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
                         chat_rows_by_id[cid] = row_widget
                     chat_items_by_id[cid] = item
                     if current_id and cid == current_id:
@@ -825,17 +852,9 @@ class ChatSidebarMixin:
                         avatar_size=self._avatar_size,
                         parent=self.chat_list,
                     )
-                    if hasattr(self, "avatar_cache"):
-                        try:
-                            avatar_key = (
-                                cid,
-                                str(info.get("photo_small_id") or info.get("photo_small") or ""),
-                                int(self._avatar_size),
-                            )
-                            pixmap = self.avatar_cache.chat(cid, info)  # type: ignore[attr-defined]
-                            row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
-                        except Exception:
-                            pass
+                    pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+                    if pixmap is not None:
+                        row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
                     self.chat_list.addItem(item)
                     self.chat_list.setItemWidget(item, row_widget)
                     chat_items_by_id[cid] = item
@@ -853,6 +872,110 @@ class ChatSidebarMixin:
             self._chat_row_widgets_by_id = chat_rows_by_id
         finally:
             self.chat_list.setUpdatesEnabled(True)
+
+    def _chat_list_avatar_payload(
+        self,
+        chat_id: str,
+        info: Dict[str, Any],
+        title: str,
+    ) -> tuple[Optional[QPixmap], Optional[tuple]]:
+        if not hasattr(self, "avatar_cache"):
+            return None, None
+        if str(chat_id).startswith("__"):
+            return None, None
+        try:
+            chat_type = str(info.get("type") or "").lower()
+            photo_id = str(info.get("photo_small_id") or info.get("photo_small") or "")
+            if chat_type in {"private", "bot"} and str(chat_id).lstrip("-").isdigit():
+                avatar_key = ("user", str(chat_id), photo_id, int(self._avatar_size))
+                pixmap = self.avatar_cache.user(str(chat_id), title)  # type: ignore[attr-defined]
+                return pixmap, avatar_key
+            avatar_key = ("chat", str(chat_id), photo_id, int(self._avatar_size))
+            pixmap = self.avatar_cache.chat(str(chat_id), info)  # type: ignore[attr-defined]
+            return pixmap, avatar_key
+        except Exception:
+            return None, None
+
+    def _populate_chat_list_override(
+        self,
+        *,
+        current_id: Optional[str],
+        search_text: str,
+        chat_items_by_id: Dict[str, QListWidgetItem],
+        chat_rows_by_id: Dict[str, ChatListRowWidget],
+    ) -> None:
+        rows = list(getattr(self, "_chat_list_override_rows", []) or [])
+        mode = str(getattr(self, "_chat_list_override_mode", "") or "")
+        row_h = max(32, self._avatar_size + 8)
+        visible_rows: List[Dict[str, object]] = []
+        signature_rows: List[tuple] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            info = dict(row.get("info") or {})
+            title = str(row.get("title") or info.get("title") or cid)
+            meta = str(row.get("meta") or "")
+            unread = max(0, int(row.get("unread") or info.get("unread_count") or 0))
+            info.setdefault("id", cid)
+            info.setdefault("title", title)
+            info.setdefault("title_display", title)
+            info.setdefault("_id_aliases", self._chat_id_aliases(cid))
+            info.setdefault("_search_blob", self._build_chat_search_blob(cid, info))
+            visible_rows.append(
+                {"id": cid, "info": info, "title": title, "meta": meta, "unread": unread}
+            )
+            signature_rows.append((cid, title, meta, unread, str(info.get("type") or ""), str(info.get("photo_small_id") or info.get("photo_small") or "")))
+
+        data_signature = ("override", mode, tuple(signature_rows))
+        if data_signature == getattr(self, "_chat_list_data_signature", None):
+            if current_id:
+                item = self._chat_items_by_id.get(current_id)
+                if item:
+                    self.chat_list.setCurrentItem(item)
+            if search_text:
+                self._apply_filter(search_text)
+            return
+
+        self.chat_list.clear()
+        current_item: Optional[QListWidgetItem] = None
+        for row in visible_rows:
+            cid = str(row["id"])
+            info = dict(row["info"]) if isinstance(row.get("info"), dict) else {}
+            title = str(row.get("title") or cid)
+            meta = str(row.get("meta") or "")
+            unread = int(row.get("unread") or 0)
+            item = QListWidgetItem("")
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            item.setData(Qt.ItemDataRole.UserRole + 1, info)
+            item.setSizeHint(QSize(270, max(row_h, self._avatar_size + 12)))
+            row_widget = ChatListRowWidget(
+                title=title,
+                meta=meta,
+                unread=unread,
+                avatar_size=self._avatar_size,
+                parent=self.chat_list,
+            )
+            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+            if pixmap is not None:
+                row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+            self.chat_list.addItem(item)
+            self.chat_list.setItemWidget(item, row_widget)
+            chat_items_by_id[cid] = item
+            chat_rows_by_id[cid] = row_widget
+            if current_id and cid == current_id:
+                current_item = item
+
+        if current_item:
+            self.chat_list.setCurrentItem(current_item)
+        if search_text:
+            self._apply_filter(search_text)
+        self._chat_list_order = [str(row["id"]) for row in visible_rows]
+        self._chat_list_data_signature = data_signature
+        self._chat_items_by_id = chat_items_by_id
+        self._chat_row_widgets_by_id = chat_rows_by_id
 
     def _history_has_ai_messages(self, chat_id: str) -> bool:
         cache = getattr(self, "_history_ai_cache", None)

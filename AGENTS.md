@@ -1,8 +1,11 @@
-# AGENTS
+## Commit Identity Rule
 
-## Commit Identity
-
-- For all commits in this repository, use only the primary GitHub identity:
+- Для всех коммитов в этом проекте использовать только основной GitHub-аккаунт владельца.
+- Author/Committer:
   - Name: `lReDragol`
   - Email: `lReDragol@users.noreply.github.com`
-- Do not create commits with any other author/committer name or email.
+- Не использовать другие имена/email для коммитов.
+
+## Note
+
+- `/init` может создать/обновить этот `AGENTS.md` с инструкциями для Codex.
