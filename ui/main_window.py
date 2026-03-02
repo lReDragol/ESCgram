@@ -3509,13 +3509,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 if not item:
                     continue
                 cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
-                if not cid or cid != target_id:
+                if not cid:
+                    continue
+                try:
+                    aliases = set(getattr(self, "_chat_id_aliases")(cid))
+                except Exception:
+                    aliases = {cid}
+                if target_id not in aliases and target_id != cid:
                     continue
                 info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
-                chat_type = str((info or {}).get("type") or "").lower()
-                is_user_chat = chat_type in {"private", "bot"}
-                if (kind == "user" and not is_user_chat) or (kind == "chat" and is_user_chat):
-                    continue
                 try:
                     title = str((info or {}).get("title_display") or (info or {}).get("title") or cid)
                     payload = getattr(self, "_chat_list_avatar_payload", None)
@@ -3533,6 +3535,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                         row_widget.set_avatar(pixmap)
                 except Exception:
                     pass
+        try:
+            refresh_list = getattr(self, "_refresh_visible_chat_avatars", None)
+            if callable(refresh_list):
+                refresh_list()
+        except Exception:
+            pass
 
         self._refresh_feed_avatars(kind, target_id)
         if kind == "user" and target_id and target_id == str(getattr(self, "_active_account_user_id", "") or ""):
@@ -4096,19 +4104,38 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._set_message_selected(mid, False)
 
     def _message_id_from_widget(self, widget: object) -> Optional[int]:
-        for attr in ("_message_id", "msg_id"):
+        if widget is None:
+            return None
+
+        def _extract_mid(obj: object) -> Optional[int]:
+            for attr in ("_message_id", "msg_id"):
+                try:
+                    val = getattr(obj, attr, None)
+                except Exception:
+                    val = None
+                if val is None:
+                    continue
+                try:
+                    mid = int(val)
+                except Exception:
+                    continue
+                if mid != 0:
+                    return mid
+            return None
+
+        direct = _extract_mid(widget)
+        if direct is not None:
+            return direct
+
+        # Some message containers store id on nested child widgets.
+        if isinstance(widget, QWidget):
             try:
-                val = getattr(widget, attr, None)
+                for child in widget.findChildren(QWidget):
+                    mid = _extract_mid(child)
+                    if mid is not None:
+                        return mid
             except Exception:
-                val = None
-            if val is None:
-                continue
-            try:
-                mid = int(val)
-            except Exception:
-                continue
-            if mid != 0:
-                return mid
+                pass
         return None
 
     def _purge_messages_locally(self, chat_id: str, message_ids: List[int], *, purge_storage: bool) -> None:

@@ -909,12 +909,7 @@ class ChatSidebarMixin:
         if str(chat_id).startswith("__"):
             return None, None
         try:
-            chat_type = str(info.get("type") or "").lower()
             photo_id = str(info.get("photo_small_id") or info.get("photo_small") or "")
-            if chat_type in {"private", "bot"} and str(chat_id).lstrip("-").isdigit():
-                avatar_key = ("user", str(chat_id), photo_id, int(self._avatar_size))
-                pixmap = self.avatar_cache.user(str(chat_id), title)  # type: ignore[attr-defined]
-                return pixmap, avatar_key
             avatar_key = ("chat", str(chat_id), photo_id, int(self._avatar_size))
             pixmap = self.avatar_cache.chat(str(chat_id), info)  # type: ignore[attr-defined]
             return pixmap, avatar_key

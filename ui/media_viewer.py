@@ -206,6 +206,18 @@ class MediaViewerDialog(QDialog):
             except Exception:
                 pass
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._rescale_pixmap()
+        if self._movie is not None:
+            try:
+                frame_size = self._movie.frameRect().size()
+                target = self._fit_size(frame_size if frame_size.isValid() else QSize(640, 360))
+                if target.isValid():
+                    self._movie.setScaledSize(target)
+            except Exception:
+                pass
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if event.key() in {Qt.Key.Key_Escape, Qt.Key.Key_Backspace}:
             self.close()
