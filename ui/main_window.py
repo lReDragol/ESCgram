@@ -1830,12 +1830,13 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         script_path = str(app_paths.temp_dir() / "escgram_apply_update.cmd")
         quoted_installer = update_path.replace('"', '""')
         quoted_exe = current_exe.replace('"', '""')
+        quoted_data = str(app_paths.get_data_dir()).replace('"', '""')
         script = (
             "@echo off\r\n"
             "setlocal\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
             f"start /wait \"\" \"{quoted_installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n"
-            f"start \"\" \"{quoted_exe}\"\r\n"
+            f"start \"\" \"{quoted_exe}\" --data-dir \"{quoted_data}\"\r\n"
             "del \"%~f0\"\r\n"
         )
         try:

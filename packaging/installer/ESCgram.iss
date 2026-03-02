@@ -1,5 +1,5 @@
 #define AppName "ESCgram"
-#define AppVersion "0.2.1"
+#define AppVersion "0.2.2"
 #define AppPublisher "Drago"
 #define AppExeName "ESCgram.exe"
 
@@ -64,6 +64,35 @@ begin
   Result := DataDirPage.Values[0];
 end;
 
+function _ConfigPathForDataDir(const DataDir: String): String;
+var
+  DirValue: String;
+begin
+  DirValue := Trim(DataDir);
+  if DirValue = '' then
+  begin
+    Result := '';
+    Exit;
+  end;
+  Result := AddBackslash(DirValue) + 'config.json';
+end;
+
+function _ConfigExistsForSelectedDataDir: Boolean;
+var
+  ConfigPath: String;
+begin
+  ConfigPath := _ConfigPathForDataDir(DataDirPage.Values[0]);
+  Result := (ConfigPath <> '') and FileExists(ConfigPath);
+end;
+
+function _LooksLikeUpgradeInstall: Boolean;
+var
+  ExistingExe: String;
+begin
+  ExistingExe := AddBackslash(WizardDirValue()) + '{#AppExeName}';
+  Result := FileExists(ExistingExe);
+end;
+
 function _IsDigitsOnly(const S: String): Boolean;
 var
   I: Integer;
@@ -96,11 +125,20 @@ begin
   Result := True;
   if CurPageID = ApiPage.ID then
   begin
+    if _LooksLikeUpgradeInstall or _ConfigExistsForSelectedDataDir then
+      Exit;
+
     ApiIdValue := Trim(ApiPage.Values[0]);
     ApiHashValue := Trim(ApiPage.Values[1]);
-    if (ApiIdValue = '') or (ApiHashValue = '') then
+    if (ApiIdValue = '') and (ApiHashValue = '') then
     begin
       MsgBox('Введите API ID и API Hash Telegram.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if (ApiIdValue = '') or (ApiHashValue = '') then
+    begin
+      MsgBox('Нужно заполнить оба поля: API ID и API Hash.', mbError, MB_OK);
       Result := False;
       Exit;
     end;
@@ -111,6 +149,13 @@ begin
       Exit;
     end;
   end;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if PageID = ApiPage.ID then
+    Result := _LooksLikeUpgradeInstall or _ConfigExistsForSelectedDataDir;
 end;
 
 procedure _WriteConfigIfMissing;
