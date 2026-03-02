@@ -48,6 +48,7 @@ class AuthDialog(QDialog):
         root = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
+        StyleManager.instance().bind_stylesheet(self.tabs, "settings.tabs")
         root.addWidget(self.tabs)
 
         self._build_phone_tab()
@@ -61,6 +62,10 @@ class AuthDialog(QDialog):
         self.sig_qr_png.connect(self._on_qr_png)
         self.sig_qr_status.connect(self._on_qr_status)
         self.sig_qr_done.connect(self._on_qr_done)
+
+        self._telegram_enabled = bool(getattr(self.tg, "_enabled", False))
+        if not self._telegram_enabled:
+            self._apply_disabled_auth_state()
 
     def _build_phone_tab(self) -> None:
         tab = QWidget()
@@ -205,6 +210,31 @@ class AuthDialog(QDialog):
         text = str(exc or "").upper()
         return "PASSWORD_HASH_INVALID" in text or "PASSWORD" in text and "INVALID" in text
 
+    def _apply_disabled_auth_state(self) -> None:
+        hint = (
+            "Telegram API не настроен: не найден telegram_api_id/telegram_api_hash.\n"
+            "Нужен файл config.json (в папке данных или рядом с программой) "
+            "или переменные окружения DRAGO_TG_API_ID / DRAGO_TG_API_HASH."
+        )
+        self.lbl_phone_step1_hint.setText(hint)
+        self.lbl_phone_status.setText(hint)
+        self.lbl_qr_status.setText(hint)
+        self.lbl_qr.setText("QR недоступен: Telegram API не настроен.")
+
+        for widget in (
+            self.ed_phone,
+            self.ed_phone_password,
+            self.ed_phone_code,
+            self.ed_phone_code_password,
+            self.ed_qr_secret,
+            self.btn_phone_request_code,
+            self.btn_phone_login,
+            self.btn_qr_submit,
+            self.btn_qr_restart,
+            self.btn_qr_refresh,
+        ):
+            widget.setEnabled(False)
+
     def _request_phone_code(self) -> None:
         phone = (self.ed_phone.text() or "").strip()
         if not phone:
@@ -273,6 +303,8 @@ class AuthDialog(QDialog):
         self.lbl_phone_status.setText("")
 
     def _on_tab_changed(self, index: int) -> None:
+        if not self._telegram_enabled:
+            return
         if index == getattr(self, "_qr_tab_index", -1):
             self._start_qr_login()
 
