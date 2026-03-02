@@ -1,6 +1,6 @@
 {
-  "telegram_api_id": 123456,
-  "telegram_api_hash": "PASTE_YOUR_API_HASH_HERE",
+  "telegram_api_id": "",
+  "telegram_api_hash": "",
   "allowed_users": [],
   "admin_users": [],
   "chat_ids": [],
