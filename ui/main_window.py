@@ -4,6 +4,9 @@ import json
 import mimetypes
 import os
 import shutil
+import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Iterable
@@ -57,9 +60,10 @@ from ui.common import HAVE_QTMULTIMEDIA, HAVE_SD, load_history, log, save_histor
 from ui.settings_window import SettingsWindow
 from ui.auto_download import AutoDownloadPolicy
 from ui.config_store import DEFAULT_CONFIG, load_config, save_config
-from ui.dialog_workers import DialogsStreamWorker, HistoryWorker, LastDateWorker
+from ui.dialog_workers import DialogsStreamWorker, HistoryWorker, LastDateWorker, ReleaseCheckWorker, UpdateDownloadWorker
 from ui.account_workers import AccountProfileWorker
 from ui.event_pump import EventPump
+from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
 from utils.logging_setup import configure_logging
 from ui.message_feed import MessageFeedMixin
 from ui.message_widgets import DEFAULT_BUBBLE_THEME, ChatItemWidget, ReplyPreviewWidget, TextMessageWidget, set_bubble_theme
@@ -81,6 +85,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         # базовая инициализация
         QWidget.__init__(self)
         self.setWindowTitle("ESCgram")
+        icon_path = resolve_app_icon_path()
+        if icon_path:
+            try:
+                self.setWindowIcon(QIcon(icon_path))
+            except Exception:
+                pass
         self.server = server
         self.tg = tg_adapter
 
@@ -183,7 +193,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._input_max_height = 260
         self._pending_reply_updates: set[int] = set()
         self._media_group_refresh_pending: bool = False
-        self._use_global_context_menu = True
+        self._use_global_context_menu = False
+        self._app_version = get_app_version()
+        self._update_repo = get_update_repo()
+        self._latest_version: str = ""
+        self._update_download_url: str = ""
+        self._update_thread: Optional[QThread] = None
+        self._update_worker: Optional[ReleaseCheckWorker] = None
+        self._update_download_thread: Optional[QThread] = None
+        self._update_download_worker: Optional[UpdateDownloadWorker] = None
+        self._update_in_progress: bool = False
 
         # аватары
         self.avatar_cache = AvatarCache(
@@ -231,6 +250,21 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self.settings_panel.set_streamer_mode_checked(self._streamer_mode_enabled)
             if hasattr(self.settings_panel, "set_show_my_avatar_checked"):
                 self.settings_panel.set_show_my_avatar_checked(self._show_my_avatar_enabled)
+            if hasattr(self.settings_panel, "update_requested"):
+                try:
+                    self.settings_panel.update_requested.connect(self._on_update_button_clicked)
+                except Exception:
+                    pass
+            if hasattr(self.settings_panel, "set_update_state"):
+                try:
+                    self.settings_panel.set_update_state(
+                        f"Версия {self._app_version}. Проверка обновлений...",
+                        can_update=False,
+                        in_progress=True,
+                    )
+                except Exception:
+                    pass
+            QTimer.singleShot(1500, self._start_update_check)
 
         # применяем ghost-mode (если есть поддержка в адаптере)
         try:
@@ -1579,6 +1613,282 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def on_streamer_mode_setting_changed(self, enabled: bool) -> None:
         self._set_streamer_mode(bool(enabled))
+
+    def _set_update_panel_state(self, text: str, *, can_update: bool, in_progress: bool = False) -> None:
+        panel = getattr(self, "settings_panel", None)
+        if panel is None or not hasattr(panel, "set_update_state"):
+            return
+        try:
+            panel.set_update_state(text, can_update=can_update, in_progress=in_progress)
+        except Exception:
+            pass
+
+    def _start_update_check(self) -> None:
+        thread = getattr(self, "_update_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    return
+            except Exception:
+                pass
+        self._set_update_panel_state(
+            f"Версия {self._app_version}. Проверка обновлений...",
+            can_update=False,
+            in_progress=True,
+        )
+        thread = QThread(self)
+        worker = ReleaseCheckWorker(repo=self._update_repo, current_version=self._app_version)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_check_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    @Slot(dict)
+    def _on_update_check_finished(self, payload: Dict[str, Any]) -> None:
+        self._update_worker = None
+        self._update_thread = None
+        data = payload if isinstance(payload, dict) else {}
+        ok = bool(data.get("ok"))
+        if not ok:
+            self._latest_version = ""
+            self._update_download_url = ""
+            self._set_update_panel_state(
+                f"Версия {self._app_version}. Обновление недоступно.",
+                can_update=False,
+                in_progress=False,
+            )
+            return
+
+        latest = str(data.get("latest_version") or "").strip()
+        self._latest_version = latest
+        self._update_download_url = str(data.get("download_url") or "").strip()
+        update_available = bool(data.get("update_available")) and bool(self._update_download_url)
+        if update_available:
+            self._set_update_panel_state(
+                f"Доступно обновление {latest} (текущая {self._app_version})",
+                can_update=True,
+                in_progress=False,
+            )
+        else:
+            shown = latest or self._app_version
+            self._set_update_panel_state(
+                f"Версия {shown} (актуальная)",
+                can_update=False,
+                in_progress=False,
+            )
+
+    @Slot()
+    def _on_update_button_clicked(self) -> None:
+        if self._update_in_progress:
+            return
+        if not self._update_download_url:
+            self._start_update_check()
+            return
+        self._update_in_progress = True
+        self._set_update_panel_state(
+            "Скачивание обновления...",
+            can_update=True,
+            in_progress=True,
+        )
+        file_name = os.path.basename(self._update_download_url.split("?", 1)[0]) or "ESCgram-update.bin"
+        output_path = str(app_paths.temp_dir() / file_name)
+        thread = QThread(self)
+        worker = UpdateDownloadWorker(url=self._update_download_url, output_path=output_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_update_download_progress)
+        worker.finished.connect(self._on_update_download_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._update_download_thread = thread
+        self._update_download_worker = worker
+        thread.start()
+
+    @Slot(int, int)
+    def _on_update_download_progress(self, downloaded: int, total: int) -> None:
+        if total > 0:
+            ratio = max(0.0, min(1.0, float(downloaded) / float(total)))
+            percent = int(ratio * 100.0)
+            text = f"Скачивание обновления... {percent}%"
+        else:
+            mb = float(downloaded) / (1024.0 * 1024.0)
+            text = f"Скачивание обновления... {mb:.1f} MB"
+        self._set_update_panel_state(text, can_update=True, in_progress=True)
+
+    @Slot(dict)
+    def _on_update_download_finished(self, payload: Dict[str, Any]) -> None:
+        self._update_download_worker = None
+        self._update_download_thread = None
+        self._update_in_progress = False
+        data = payload if isinstance(payload, dict) else {}
+        if not bool(data.get("ok")):
+            err = str(data.get("error") or "Не удалось скачать обновление.")
+            self._set_update_panel_state(
+                f"Ошибка обновления: {err}",
+                can_update=True,
+                in_progress=False,
+            )
+            try:
+                QMessageBox.warning(self, "Обновление", err)
+            except Exception:
+                pass
+            return
+
+        update_path = str(data.get("path") or "").strip()
+        if not update_path or not os.path.isfile(update_path):
+            self._set_update_panel_state(
+                "Ошибка обновления: файл не найден.",
+                can_update=True,
+                in_progress=False,
+            )
+            return
+        self._apply_downloaded_update(update_path)
+
+    def _apply_downloaded_update(self, update_path: str) -> None:
+        if os.name != "nt":
+            self._apply_downloaded_update_posix(update_path)
+            return
+
+        current_exe = str(sys.executable or "").strip()
+        if not current_exe or not os.path.isfile(current_exe):
+            self._set_update_panel_state(
+                "Обновление скачано. Запустите установщик вручную.",
+                can_update=True,
+                in_progress=False,
+            )
+            return
+
+        script_path = str(app_paths.temp_dir() / "escgram_apply_update.cmd")
+        quoted_installer = update_path.replace('"', '""')
+        quoted_exe = current_exe.replace('"', '""')
+        script = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            f"start /wait \"\" \"{quoted_installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n"
+            f"start \"\" \"{quoted_exe}\"\r\n"
+            "del \"%~f0\"\r\n"
+        )
+        try:
+            with open(script_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(script)
+            flags = 0
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                flags = int(getattr(subprocess, "CREATE_NO_WINDOW"))
+            subprocess.Popen(["cmd", "/c", script_path], creationflags=flags)
+            self._set_update_panel_state(
+                "Обновление запускается...",
+                can_update=False,
+                in_progress=False,
+            )
+            QApplication.instance().quit()
+        except Exception as exc:
+            self._set_update_panel_state(
+                "Ошибка запуска обновления.",
+                can_update=True,
+                in_progress=False,
+            )
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Обновление",
+                    f"Не удалось запустить обновление автоматически:\n{exc}\n\nФайл:\n{update_path}",
+                )
+            except Exception:
+                pass
+
+    def _apply_downloaded_update_posix(self, update_path: str) -> None:
+        current_exe = str(sys.executable or "").strip()
+        if not current_exe or not os.path.isfile(current_exe):
+            self._set_update_panel_state(
+                "Обновление скачано. Установите вручную из файла.",
+                can_update=True,
+                in_progress=False,
+            )
+            return
+        if not tarfile.is_tarfile(update_path):
+            self._set_update_panel_state(
+                "Обновление скачано. Формат не поддерживается для автоустановки.",
+                can_update=True,
+                in_progress=False,
+            )
+            return
+
+        install_dir = os.path.dirname(current_exe)
+        if not install_dir:
+            self._set_update_panel_state(
+                "Обновление скачано. Не удалось определить папку установки.",
+                can_update=True,
+                in_progress=False,
+            )
+            return
+
+        data_dir = str(app_paths.get_data_dir())
+        script_path = str(app_paths.temp_dir() / "escgram_apply_update.sh")
+        quoted_archive = update_path.replace('"', '\\"')
+        quoted_install = install_dir.replace('"', '\\"')
+        quoted_exe = current_exe.replace('"', '\\"')
+        quoted_data = data_dir.replace('"', '\\"')
+
+        script = (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "sleep 1\n"
+            "TMP_DIR=\"$(mktemp -d)\"\n"
+            "cleanup(){ rm -rf \"$TMP_DIR\"; }\n"
+            "trap cleanup EXIT\n"
+            f"tar -xzf \"{quoted_archive}\" -C \"$TMP_DIR\"\n"
+            "SRC_DIR=\"\"\n"
+            "if [[ -d \"$TMP_DIR/ESCgram\" ]]; then SRC_DIR=\"$TMP_DIR/ESCgram\"; fi\n"
+            "if [[ -z \"$SRC_DIR\" && -d \"$TMP_DIR/dist_linux/ESCgram\" ]]; then SRC_DIR=\"$TMP_DIR/dist_linux/ESCgram\"; fi\n"
+            "if [[ -z \"$SRC_DIR\" ]]; then\n"
+            "  CANDIDATE=\"$(find \"$TMP_DIR\" -maxdepth 3 -type f -name 'ESCgram' | head -n 1 || true)\"\n"
+            "  if [[ -n \"$CANDIDATE\" ]]; then SRC_DIR=\"$(dirname \"$CANDIDATE\")\"; fi\n"
+            "fi\n"
+            "if [[ -z \"$SRC_DIR\" ]]; then\n"
+            "  exit 2\n"
+            "fi\n"
+            f"mkdir -p \"{quoted_install}\"\n"
+            "if command -v rsync >/dev/null 2>&1; then\n"
+            f"  rsync -a --delete \"$SRC_DIR\"/ \"{quoted_install}\"/\n"
+            "else\n"
+            f"  rm -rf \"{quoted_install}\"/*\n"
+            f"  cp -a \"$SRC_DIR\"/. \"{quoted_install}\"/\n"
+            "fi\n"
+            f"mkdir -p \"{quoted_data}\"\n"
+            f"nohup \"{quoted_exe}\" --data-dir \"{quoted_data}\" >/dev/null 2>&1 &\n"
+        )
+        try:
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(script)
+            os.chmod(script_path, 0o755)
+            subprocess.Popen(["bash", script_path], start_new_session=True)
+            self._set_update_panel_state(
+                "Обновление запускается...",
+                can_update=False,
+                in_progress=False,
+            )
+            QApplication.instance().quit()
+        except Exception as exc:
+            self._set_update_panel_state(
+                "Ошибка запуска обновления.",
+                can_update=True,
+                in_progress=False,
+            )
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Обновление",
+                    f"Не удалось запустить автообновление:\n{exc}\n\nФайл:\n{update_path}",
+                )
+            except Exception:
+                pass
 
     def on_sidebar_action_requested(self, action_id: str) -> None:
         actions = {
@@ -4825,6 +5135,26 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._ts_worker = None
         self._ts_thread = None
 
+        update_thread = getattr(self, "_update_thread", None)
+        if _thread_is_running(update_thread):
+            try:
+                update_thread.quit()
+                update_thread.wait(1200)
+            except Exception:
+                pass
+        self._update_worker = None
+        self._update_thread = None
+
+        update_dl_thread = getattr(self, "_update_download_thread", None)
+        if _thread_is_running(update_dl_thread):
+            try:
+                update_dl_thread.quit()
+                update_dl_thread.wait(1200)
+            except Exception:
+                pass
+        self._update_download_worker = None
+        self._update_download_thread = None
+
         profile_thread = getattr(self, "_account_profile_thread", None)
         if _thread_is_running(profile_thread):
             try:
@@ -4903,6 +5233,12 @@ def run_gui(server, tg_adapter) -> None:
     # When GUI is launched directly, keep logs in the selected data dir by default.
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
     app = QApplication.instance() or QApplication([])
+    icon_path = resolve_app_icon_path()
+    if icon_path:
+        try:
+            app.setWindowIcon(QIcon(icon_path))
+        except Exception:
+            pass
     config = load_config()
     window = ChatWindow(server, tg_adapter, config=config)
     window.show()

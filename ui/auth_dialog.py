@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 
 from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.styles import StyleManager
+from utils.app_meta import resolve_app_icon_path
 
 
 class AuthDialog(QDialog):
@@ -34,6 +35,12 @@ class AuthDialog(QDialog):
         super().__init__(parent)
         self.tg = tg_adapter
         self.setWindowTitle("Вход в Telegram")
+        icon_path = resolve_app_icon_path()
+        if icon_path:
+            try:
+                self.setWindowIcon(QIcon(icon_path))
+            except Exception:
+                pass
         self.setModal(True)
         self.resize(460, 540)
 

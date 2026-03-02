@@ -7,7 +7,8 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 
 class OllamaPullWorker(QObject):
-    progress = Signal(str, int, int)  # status, completed, total
+    # Use object for counters: int overflows on very large model layers in shiboken int conversion.
+    progress = Signal(str, object, object)  # status, completed, total
     finished = Signal(bool, str)      # success, message
 
     def __init__(self, model: str, *, base_url: str = "http://localhost:11434") -> None:
@@ -31,6 +32,7 @@ class OllamaPullWorker(QObject):
             last_total = 0
             last_done = 0
             success = False
+            error_message = ""
 
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
@@ -39,6 +41,10 @@ class OllamaPullWorker(QObject):
                     payload = json.loads(line)
                 except Exception:
                     continue
+                stream_error = str(payload.get("error") or "").strip()
+                if stream_error:
+                    error_message = stream_error
+                    break
                 status = str(payload.get("status") or "")
                 if status:
                     last_status = status
@@ -57,10 +63,14 @@ class OllamaPullWorker(QObject):
                 if payload.get("status") == "success":
                     success = True
 
+            if error_message:
+                self.finished.emit(False, error_message)
+                return
             if success:
                 self.finished.emit(True, f"{self.model} downloaded")
             else:
-                self.finished.emit(True, f"{self.model} pull finished")
+                fallback = last_status or f"{self.model} pull finished"
+                self.finished.emit(False, fallback)
         except Exception as exc:
             self.finished.emit(False, str(exc))
 

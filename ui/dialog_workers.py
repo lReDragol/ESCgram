@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import List
+import re
+from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -216,3 +217,143 @@ class LastDateWorker(QObject):
                 time.sleep(0.1)
                 slept += 0.1
         self.done.emit()
+
+
+class ReleaseCheckWorker(QObject):
+    finished = Signal(dict)
+
+    def __init__(self, *, repo: str, current_version: str):
+        super().__init__()
+        self.repo = str(repo or "").strip()
+        self.current_version = str(current_version or "").strip()
+
+    @staticmethod
+    def _normalize_version(value: str) -> Optional[Tuple[int, ...]]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        raw = raw.lstrip("vV")
+        parts = re.findall(r"\d+", raw)
+        if not parts:
+            return None
+        try:
+            return tuple(int(p) for p in parts[:4])
+        except Exception:
+            return None
+
+    @classmethod
+    def _is_newer(cls, remote: str, local: str) -> bool:
+        rv = cls._normalize_version(remote)
+        lv = cls._normalize_version(local)
+        if rv is None or lv is None:
+            return False
+        width = max(len(rv), len(lv))
+        rvp = rv + (0,) * (width - len(rv))
+        lvp = lv + (0,) * (width - len(lv))
+        return rvp > lvp
+
+    @staticmethod
+    def _pick_asset(assets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not assets:
+            return None
+        target = "windows" if os.name == "nt" else "linux"
+        by_name = {str(a.get("name") or "").lower(): a for a in assets}
+        if target == "windows":
+            for suffix in ("setup.exe", ".exe"):
+                for name, asset in by_name.items():
+                    if name.endswith(suffix):
+                        return asset
+        if target == "linux":
+            for suffix in (".tar.gz", ".tgz", ".appimage"):
+                for name, asset in by_name.items():
+                    if name.endswith(suffix):
+                        return asset
+        for name, asset in by_name.items():
+            if name.endswith(".zip"):
+                return asset
+        return assets[0]
+
+    @Slot()
+    def run(self) -> None:
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "current_version": self.current_version,
+            "latest_version": "",
+            "update_available": False,
+            "download_url": "",
+            "asset_name": "",
+            "release_page": "",
+            "error": "",
+        }
+        repo = self.repo
+        if not repo:
+            payload["error"] = "Не задан репозиторий обновлений"
+            self.finished.emit(payload)
+            return
+        try:
+            import requests
+
+            url = f"https://api.github.com/repos/{repo}/releases/latest"
+            resp = requests.get(url, timeout=(3.5, 8.0), headers={"Accept": "application/vnd.github+json"})
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            tag_name = str(data.get("tag_name") or "").strip()
+            html_url = str(data.get("html_url") or "").strip()
+            assets = list(data.get("assets") or [])
+            picked = self._pick_asset(assets)
+            asset_url = str((picked or {}).get("browser_download_url") or "").strip()
+            asset_name = str((picked or {}).get("name") or "").strip()
+            payload.update(
+                {
+                    "ok": True,
+                    "latest_version": tag_name,
+                    "release_page": html_url,
+                    "download_url": asset_url,
+                    "asset_name": asset_name,
+                    "update_available": bool(tag_name and self._is_newer(tag_name, self.current_version)),
+                }
+            )
+        except Exception as exc:
+            payload["error"] = str(exc)
+        self.finished.emit(payload)
+
+
+class UpdateDownloadWorker(QObject):
+    progress = Signal(int, int)  # downloaded_bytes, total_bytes
+    finished = Signal(dict)
+
+    def __init__(self, *, url: str, output_path: str):
+        super().__init__()
+        self.url = str(url or "").strip()
+        self.output_path = str(output_path or "").strip()
+
+    @Slot()
+    def run(self) -> None:
+        payload: Dict[str, Any] = {"ok": False, "path": self.output_path, "error": ""}
+        if not self.url:
+            payload["error"] = "Пустой URL обновления"
+            self.finished.emit(payload)
+            return
+        if not self.output_path:
+            payload["error"] = "Не задан путь сохранения обновления"
+            self.finished.emit(payload)
+            return
+        try:
+            import requests
+
+            os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+            with requests.get(self.url, stream=True, timeout=(5.0, 30.0)) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                with open(self.output_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        downloaded += len(chunk)
+                        self.progress.emit(downloaded, total)
+            payload["ok"] = True
+        except Exception as exc:
+            payload["error"] = str(exc)
+        self.finished.emit(payload)

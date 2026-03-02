@@ -16,6 +16,7 @@ datas = [
     (str(project_root / "ui" / "assets"), "ui/assets"),
     (str(project_root / "ui" / "styles.json"), "ui"),
     (str(project_root / "config.example.json"), "."),
+    (str(project_root / "version.txt"), "."),
 ]
 
 
@@ -49,6 +50,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(project_root / "ui" / "assets" / "app" / "escgram.ico"),
 )
 
 coll = COLLECT(

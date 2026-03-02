@@ -78,6 +78,7 @@ class SettingsDrawer(QWidget):
     streamer_mode_toggled = Signal(bool)
     show_my_avatar_toggled = Signal(bool)
     menu_action_requested = Signal(str)
+    update_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -123,10 +124,33 @@ class SettingsDrawer(QWidget):
         self._container_layout.setSpacing(12)
         scroll.setWidget(container)
 
+        self._build_update_footer(root)
+
         self._build_account_section()
         self._build_action_section()
         self._build_toggle_section()
         self._container_layout.addStretch(1)
+
+    def _build_update_footer(self, root: QVBoxLayout) -> None:
+        footer = QFrame()
+        self._style_mgr.bind_stylesheet(footer, "settings.drawer.card")
+        layout = QVBoxLayout(footer)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        self._update_label = QLabel("")
+        self._update_label.setWordWrap(True)
+        self._style_mgr.bind_stylesheet(self._update_label, "settings.account.hint")
+        layout.addWidget(self._update_label)
+
+        self._btn_update = QPushButton("Обновить")
+        self._btn_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_update.clicked.connect(self.update_requested.emit)
+        self._btn_update.hide()
+        layout.addWidget(self._btn_update, 0, Qt.AlignmentFlag.AlignLeft)
+
+        root.addWidget(footer, 0)
+        self.set_update_state("Проверка обновлений...", can_update=False, in_progress=True)
 
     def _build_account_section(self) -> None:
         card = QFrame()
@@ -309,4 +333,15 @@ class SettingsDrawer(QWidget):
         self.chk_streamer_mode.blockSignals(True)
         self.chk_streamer_mode.setChecked(bool(checked))
         self.chk_streamer_mode.blockSignals(False)
+
+    def set_update_state(self, text: str, *, can_update: bool, in_progress: bool = False) -> None:
+        if hasattr(self, "_update_label"):
+            self._update_label.setText(str(text or ""))
+        if hasattr(self, "_btn_update"):
+            self._btn_update.setVisible(bool(can_update))
+            self._btn_update.setEnabled(bool(can_update) and not in_progress)
+            if in_progress and can_update:
+                self._btn_update.setText("Обновляем...")
+            else:
+                self._btn_update.setText("Обновить")
 

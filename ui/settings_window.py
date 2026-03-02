@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread, QUrl
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread, QUrl, Slot
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -32,6 +32,11 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
 )
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # pragma: no cover
+    def _qt_is_valid(obj: object) -> bool:
+        return obj is not None
 
 from ui.styles import StyleManager
 
@@ -141,10 +146,24 @@ class SettingsWindow(QDialog):
 
     def reject(self) -> None:  # type: ignore[override]
         thread = getattr(self, "_ai_pull_thread", None)
-        if thread is not None and thread.isRunning():
+        if self._thread_is_running(thread):
             QMessageBox.information(self, "Скачивание модели", "Дождитесь завершения скачивания модели.")
             return
         super().reject()
+
+    @staticmethod
+    def _thread_is_running(thread: Optional[QThread]) -> bool:
+        if thread is None:
+            return False
+        try:
+            if not _qt_is_valid(thread):
+                return False
+        except Exception:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except Exception:
+            return False
 
     def _build_general_tab(self, state: Dict[str, bool], callbacks: Dict[str, Callable[[bool], None]]) -> QWidget:
         tab = QWidget()
@@ -339,6 +358,7 @@ class SettingsWindow(QDialog):
         prompt_box = QGroupBox("Системный промпт")
         prompt_layout = QVBoxLayout(prompt_box)
         self.ai_prompt_edit = QPlainTextEdit()
+        self.ai_prompt_edit.setMinimumHeight(180)
         self.ai_prompt_edit.setPlainText(str(state.get("prompt") or ""))
         prompt_layout.addWidget(self.ai_prompt_edit)
         prompt_save = QPushButton("Сохранить промпт")
@@ -414,7 +434,7 @@ class SettingsWindow(QDialog):
 
     def _start_ai_tags_refresh(self) -> None:
         thread = getattr(self, "_ai_tags_thread", None)
-        if thread is not None and thread.isRunning():
+        if self._thread_is_running(thread):
             return
         base_url = (os.getenv("DRAGO_OLLAMA_URL") or "http://localhost:11434").rstrip("/")
         try:
@@ -428,10 +448,16 @@ class SettingsWindow(QDialog):
         worker.done.connect(self._on_ai_tags_loaded)
         worker.done.connect(thread.quit)
         worker.done.connect(worker.deleteLater)
+        thread.finished.connect(self._on_ai_tags_thread_finished)
         thread.finished.connect(thread.deleteLater)
         self._ai_tags_thread = thread
         self._ai_tags_worker = worker
         thread.start()
+
+    @Slot()
+    def _on_ai_tags_thread_finished(self) -> None:
+        self._ai_tags_thread = None
+        self._ai_tags_worker = None
 
     def _on_ai_tags_loaded(self, models: list) -> None:
         self._ai_tags_worker = None
@@ -507,7 +533,15 @@ class SettingsWindow(QDialog):
             self.ai_model_combo.setEnabled(True)
             self.ai_model_action.setText("Скачать")
             self.ai_model_action.setEnabled(True)
-            self.ai_model_status.setText(f"Не удалось запустить загрузку: {exc}")
+            self.ai_model_status.setText("")
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Скачивание модели",
+                    f"Не удалось запустить загрузку:\n{self._humanize_ollama_error(str(exc))}",
+                )
+            except Exception:
+                pass
             return
 
         thread = QThread(self)
@@ -518,16 +552,28 @@ class SettingsWindow(QDialog):
         worker.finished.connect(self._on_ai_pull_finished)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_ai_pull_thread_finished)
         thread.finished.connect(thread.deleteLater)
         self._ai_pull_thread = thread
         self._ai_pull_worker = worker
         thread.start()
 
-    def _on_ai_pull_progress(self, status: str, completed: int, total: int) -> None:
+    @Slot()
+    def _on_ai_pull_thread_finished(self) -> None:
+        self._ai_pull_thread = None
+        self._ai_pull_worker = None
+
+    def _on_ai_pull_progress(self, status: str, completed: object, total: object) -> None:
         if not hasattr(self, "ai_model_progress"):
             return
-        total_int = int(total or 0)
-        done_int = int(completed or 0)
+        try:
+            total_int = int(total or 0)
+        except Exception:
+            total_int = 0
+        try:
+            done_int = int(completed or 0)
+        except Exception:
+            done_int = 0
         if total_int > 0:
             percent = int(max(0.0, min(1.0, done_int / float(total_int))) * 100.0)
             self.ai_model_progress.setRange(0, 100)
@@ -548,14 +594,26 @@ class SettingsWindow(QDialog):
             self._start_ai_tags_refresh()
             self._emit_ai_change({"model": name})
         else:
-            self.ai_model_status.setText(f"Не удалось: {message}")
+            self.ai_model_status.setText("")
+            error_text = self._humanize_ollama_error(str(message or ""))
             try:
-                QMessageBox.warning(self, "Скачивание модели", f"Не удалось скачать {name}:\n{message}")
+                QMessageBox.warning(self, "Скачивание модели", f"Не удалось скачать {name}:\n{error_text}")
             except Exception:
                 pass
         self._ai_pull_model = ""
-        self._ai_pull_worker = None
-        self._ai_pull_thread = None
+
+    @staticmethod
+    def _humanize_ollama_error(raw: str) -> str:
+        msg = str(raw or "").strip()
+        lower = msg.lower()
+        if "failed to establish a new connection" in lower or "connection refused" in lower:
+            return (
+                "Не удалось подключиться к Ollama (http://localhost:11434).\n"
+                "Установите и запустите Ollama, затем повторите загрузку модели."
+            )
+        if "timed out" in lower or "timeout" in lower:
+            return "Ollama не ответил вовремя. Проверьте, что сервис запущен и сеть не блокирует порт 11434."
+        return msg or "Неизвестная ошибка Ollama."
 
     def _set_ai_context_value(self, ctx: Optional[int]) -> None:
         if not hasattr(self, "ai_ctx_slider"):

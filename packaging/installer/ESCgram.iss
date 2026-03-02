@@ -1,5 +1,5 @@
 #define AppName "ESCgram"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppPublisher "Drago"
 #define AppExeName "ESCgram.exe"
 
@@ -16,6 +16,7 @@ OutputBaseFilename=ESCgram-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\..\ui\assets\app\escgram.ico
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\\Russian.isl"
@@ -27,8 +28,8 @@ Name: "desktopicon"; Description: "Создать ярлык на рабочем
 Source: "..\\..\\dist\\ESCgram\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""
-Name: "{autodesktop}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""; Tasks: desktopicon
+Name: "{autoprograms}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""; IconFilename: "{app}\\ui\\assets\\app\\escgram.ico"
+Name: "{autodesktop}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--data-dir ""{code:GetDataDir}"""; Tasks: desktopicon; IconFilename: "{app}\\ui\\assets\\app\\escgram.ico"
 
 [Code]
 var

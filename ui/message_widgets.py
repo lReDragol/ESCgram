@@ -875,6 +875,9 @@ class TextMessageWidget(QWidget):
         super().__init__(parent)
         self.role = role
         self.kind = "text"
+        self._show_header_label = not (
+            self.role == "me" and str(header or "").strip().lower() in {"", "вы", "you", "me"}
+        )
         self._original_text = text
         self._text_entities: Optional[List[Dict[str, Any]]] = list(entities) if isinstance(entities, list) else None
         self._reply_widget: Optional[ReplyPreviewWidget] = None
@@ -891,11 +894,12 @@ class TextMessageWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(4)
 
-        self.header_label = QLabel(f"<b>{header}</b>")
+        self.header_label = QLabel(f"<b>{header}</b>" if self._show_header_label else "")
         self.header_label.setTextFormat(Qt.TextFormat.RichText)
         self._refresh_header_style()
         alignment = Qt.AlignmentFlag.AlignRight if role == "me" else Qt.AlignmentFlag.AlignLeft
         root.addWidget(self.header_label, 0, alignment)
+        self.header_label.setVisible(self._show_header_label)
 
         self.deleted_label = QLabel("Сообщение удалено")
         self.deleted_label.setStyleSheet(_style_sheet("message.deleted.label", "color:#ff9aa0;font-size:11px;"))
@@ -1206,6 +1210,9 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self.kind = self._normalize_kind(kind)
         self.header = header
         self.role = role
+        self._show_header_label = not (
+            self.role == "me" and str(header or "").strip().lower() in {"", "вы", "you", "me"}
+        )
         self.text = text
         self.text_entities: Optional[List[Dict[str, Any]]] = list(text_entities) if isinstance(text_entities, list) else None
         self.file_path = file_path
@@ -1280,10 +1287,11 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         root.setSpacing(6)
         self._root_layout = root
 
-        header_lbl = QLabel(f"<b>{header}</b>")
+        header_lbl = QLabel(f"<b>{header}</b>" if self._show_header_label else "")
         alignment = Qt.AlignmentFlag.AlignRight if role == "me" else Qt.AlignmentFlag.AlignLeft
         root.addWidget(header_lbl, 0, alignment)
         self.header_label = header_lbl
+        self.header_label.setVisible(self._show_header_label)
         self._header_color: Optional[str] = None
         self._refresh_header_style()
 
@@ -2143,7 +2151,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         header = getattr(self, "header_label", None)
         if header is not None:
             try:
-                header.setVisible(pos in {"single", "top"})
+                header.setVisible(bool(self._show_header_label) and pos in {"single", "top"})
             except Exception:
                 pass
 
