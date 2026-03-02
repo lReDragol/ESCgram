@@ -188,15 +188,17 @@ class TelegramAdapter:
 
         # config
         cfg = _load_config()
-        self._api_id = cfg.get("telegram_api_id") or os.getenv("DRAGO_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
-        self._api_hash = cfg.get("telegram_api_hash") or os.getenv("DRAGO_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
+        raw_api_id = cfg.get("telegram_api_id") or os.getenv("DRAGO_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
+        raw_api_hash = cfg.get("telegram_api_hash") or os.getenv("DRAGO_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
+        self._api_id = self._normalize_api_id(raw_api_id)
+        self._api_hash = self._normalize_api_hash(raw_api_hash)
         self._allowed_users: List[str] = cfg.get("allowed_users", [])
         self._admin_users: List[str] = cfg.get("admin_users", [])
         self._chat_ids: List[str] = cfg.get("chat_ids", [])
         # Legacy allow-lists may block live UI updates; keep strict filtering opt-in.
         self._strict_live_filter: bool = self._as_bool(cfg.get("strict_live_filter", False), default=False)
 
-        self._enabled = HAVE_PYROGRAM and bool(self._api_id and self._api_hash)
+        self._enabled = HAVE_PYROGRAM and bool(self._api_id is not None and self._api_hash)
         self._ghost_mode_enabled = False
 
         # auth state
@@ -543,6 +545,33 @@ class TelegramAdapter:
                 return False
             return bool(default)
         return bool(default)
+
+    @staticmethod
+    def _normalize_api_id(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        text = str(value).strip()
+        if not text or not text.isdigit():
+            return None
+        try:
+            parsed = int(text)
+            return parsed if parsed > 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_api_hash(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        upper = text.upper()
+        if upper in {"YOUR_API_HASH", "ENTER_API_HASH"}:
+            return None
+        return text
 
     def _remember_local_outgoing(self, message_id: Optional[int]) -> None:
         if message_id is None:
