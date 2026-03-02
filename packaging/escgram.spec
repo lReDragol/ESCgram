@@ -15,6 +15,7 @@ app_name = "ESCgram"
 datas = [
     (str(project_root / "ui" / "assets"), "ui/assets"),
     (str(project_root / "ui" / "styles.json"), "ui"),
+    (str(project_root / "config.example.json"), "."),
 ]
 
 
