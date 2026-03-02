@@ -4659,6 +4659,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         dlg = AccountManagerDialog(self.tg, self)
         dlg.account_switched.connect(self._handle_account_switched)
         dlg.account_add_requested.connect(self._handle_account_add_requested)
+        dlg.account_deleted.connect(self._sync_account_card)
         dlg.exec()
 
     def _handle_account_switched(self) -> None:
