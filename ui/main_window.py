@@ -342,6 +342,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         ai_cfg.setdefault("context", defaults.get("context", 2048))
         ai_cfg.setdefault("use_cuda", defaults.get("use_cuda", True))
         ai_cfg.setdefault("prompt", defaults.get("prompt", ""))
+        ai_cfg.setdefault("cross_chat_context", defaults.get("cross_chat_context", True))
+        ai_cfg.setdefault("cross_chat_limit", defaults.get("cross_chat_limit", 6))
 
     def _apply_ai_config_from_settings(self, state: Dict[str, Any], *, reset_model: bool = True) -> None:
         model = str(state.get("model") or "").strip()
@@ -366,6 +368,17 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             os.environ["DRAGO_FORCE_CPU"] = "1"
             os.environ["DRAGO_NUM_GPU"] = "0"
             os.environ.pop("DRAGO_FORCE_GPU", None)
+
+        cross_chat_context = bool(state.get("cross_chat_context", True))
+        os.environ["DRAGO_AI_CROSS_CHAT"] = "1" if cross_chat_context else "0"
+
+        cross_chat_limit = state.get("cross_chat_limit")
+        try:
+            cross_chat_limit_int = int(cross_chat_limit) if cross_chat_limit is not None else 6
+        except Exception:
+            cross_chat_limit_int = 6
+        cross_chat_limit_int = max(0, min(cross_chat_limit_int, 20))
+        os.environ["DRAGO_AI_CROSS_CHAT_LIMIT"] = str(cross_chat_limit_int)
 
         prompt = str(state.get("prompt") or "")
         try:
@@ -1707,6 +1720,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             prompt = str(payload.get("prompt") or "")
             if str(ai_cfg.get("prompt") or "") != prompt:
                 ai_cfg["prompt"] = prompt
+                changed = True
+
+        if "cross_chat_context" in payload:
+            cross_chat_context = bool(payload.get("cross_chat_context", True))
+            if bool(ai_cfg.get("cross_chat_context", True)) != cross_chat_context:
+                ai_cfg["cross_chat_context"] = cross_chat_context
+                changed = True
+
+        if "cross_chat_limit" in payload:
+            value = payload.get("cross_chat_limit")
+            try:
+                parsed = int(value)
+            except Exception:
+                parsed = 6
+            parsed = max(0, min(parsed, 20))
+            if int(ai_cfg.get("cross_chat_limit", 6) or 6) != parsed:
+                ai_cfg["cross_chat_limit"] = parsed
                 changed = True
 
         if changed:

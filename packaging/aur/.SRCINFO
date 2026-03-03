@@ -1,0 +1,23 @@
+pkgbase = escgram-bin
+	pkgdesc = ESCgram desktop Telegram client (prebuilt binary)
+	pkgver = 0.2.4
+	pkgrel = 1
+	url = https://github.com/lReDragol/ESCgram
+	arch = x86_64
+	license = custom:unknown
+	depends = glibc
+	depends = glib2
+	depends = dbus
+	depends = fontconfig
+	depends = libxkbcommon-x11
+	depends = libglvnd
+	depends = hicolor-icon-theme
+	optdepends = ollama: local AI model support
+	provides = escgram
+	conflicts = escgram
+	source_x86_64 = https://github.com/lReDragol/ESCgram/releases/download/v0.2.4/ESCgram-linux.tar.gz
+	source_x86_64 = escgram.desktop
+	sha256sums_x86_64 = 89275fd5409da3ea93e1d690213d188937a3d1d76cba16b8c4b52bca02d9229a
+	sha256sums_x86_64 = SKIP
+
+pkgname = escgram-bin

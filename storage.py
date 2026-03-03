@@ -801,6 +801,73 @@ class Storage:
             })
         return out
 
+    def search_ai_history(
+        self,
+        terms: Iterable[str],
+        *,
+        exclude_chat_id: Optional[str] = None,
+        limit: int = 6,
+    ) -> List[Dict[str, Any]]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw in terms:
+            token = str(raw or "").strip().lower()
+            if len(token) < 2 or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        if not normalized or limit <= 0:
+            return []
+
+        like_params = [f"%{token}%" for token in normalized]
+        where_terms = " OR ".join(["LOWER(content) LIKE ?"] * len(like_params))
+
+        sql = f"""
+            SELECT chat_id, id, role, content, timestamp
+            FROM ai_history
+            WHERE COALESCE(is_deleted, 0) = 0
+              AND COALESCE(TRIM(content), '') <> ''
+              {"AND chat_id <> ?" if exclude_chat_id else ""}
+              AND ({where_terms})
+            LIMIT ?
+        """
+        params: List[Any] = []
+        if exclude_chat_id:
+            params.append(str(exclude_chat_id))
+        params.extend(like_params)
+        # Read a wider candidate set, then rank in Python.
+        params.append(int(max(limit * 12, 40)))
+        rows = self._query(sql, tuple(params))
+
+        scored: List[Tuple[int, str, int, Dict[str, Any]]] = []
+        for row in rows:
+            chat_id = str(row[0] or "")
+            msg_id = int(row[1] or 0)
+            role = str(row[2] or "user")
+            content = str(row[3] or "")
+            timestamp = str(row[4] or "")
+            lowered = content.lower()
+            score = sum(1 for token in normalized if token in lowered)
+            if score <= 0:
+                continue
+            scored.append(
+                (
+                    score,
+                    timestamp,
+                    msg_id,
+                    {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "role": role,
+                        "content": content,
+                        "timestamp": timestamp,
+                    },
+                )
+            )
+
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [entry for _, _, _, entry in scored[: int(limit)]]
+
     def append_ai_messages(
         self,
         chat_id: str,

@@ -1,0 +1,48 @@
+pkgname=escgram-bin
+pkgver=0.2.4
+pkgrel=1
+pkgdesc="ESCgram desktop Telegram client (prebuilt binary)"
+arch=("x86_64")
+url="https://github.com/lReDragol/ESCgram"
+license=("custom:unknown")
+depends=(
+  "glibc"
+  "glib2"
+  "dbus"
+  "fontconfig"
+  "libxkbcommon-x11"
+  "libglvnd"
+  "hicolor-icon-theme"
+)
+optdepends=(
+  "ollama: local AI model support"
+)
+provides=("escgram")
+conflicts=("escgram")
+source_x86_64=(
+  "https://github.com/lReDragol/ESCgram/releases/download/v${pkgver}/ESCgram-linux.tar.gz"
+  "escgram.desktop"
+)
+sha256sums_x86_64=(
+  "89275fd5409da3ea93e1d690213d188937a3d1d76cba16b8c4b52bca02d9229a"
+  "SKIP"
+)
+
+package() {
+  install -d "${pkgdir}/opt/ESCgram"
+  cp -a "${srcdir}/ESCgram-linux/app/." "${pkgdir}/opt/ESCgram/"
+  chmod +x "${pkgdir}/opt/ESCgram/ESCgram"
+
+  install -Dm755 /dev/stdin "${pkgdir}/usr/bin/escgram" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DATA_DIR="${ESCGRAM_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ESCgram}"
+mkdir -p "$DATA_DIR"
+exec /opt/ESCgram/ESCgram --data-dir "$DATA_DIR" "$@"
+EOF
+
+  install -Dm644 "${srcdir}/escgram.desktop" "${pkgdir}/usr/share/applications/escgram.desktop"
+  if [[ -f "${pkgdir}/opt/ESCgram/ui/assets/app/ESCgram_ICO.png" ]]; then
+    install -Dm644 "${pkgdir}/opt/ESCgram/ui/assets/app/ESCgram_ICO.png" "${pkgdir}/usr/share/pixmaps/escgram.png"
+  fi
+}

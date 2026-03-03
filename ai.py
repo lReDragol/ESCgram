@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, UTC
@@ -251,6 +252,14 @@ def gen_message_id(chat_history: List[Dict[str, Any]]) -> int:
 class AIChat:
     """Track per-chat history and provide formatted prompts."""
     MAX_HISTORY_LENGTH = 30
+    MAX_CROSS_CHAT_TERMS = 8
+    MAX_CROSS_CHAT_SNIPPET_LEN = 260
+    _STOP_WORDS = {
+        "когда", "куда", "чтобы", "чтоб", "который", "которая", "которые",
+        "завтра", "сегодня", "послезавтра", "вчера", "тогда",
+        "this", "that", "with", "from", "what", "when", "where", "have",
+        "быть", "будет", "есть", "буду", "если", "еслиб", "пожалуйста",
+    }
 
     def __init__(self, chat_id: str, storage: Optional["Storage"] = None):
         self.chat_id = chat_id
@@ -327,6 +336,79 @@ class AIChat:
             lines.append(f"{role_marker}{content}")
         return "".join(lines)
 
+    def _cross_chat_enabled(self) -> bool:
+        return _bool_env("DRAGO_AI_CROSS_CHAT", True)
+
+    def _cross_chat_limit(self) -> int:
+        try:
+            value = int(os.getenv("DRAGO_AI_CROSS_CHAT_LIMIT", "6") or 6)
+        except Exception:
+            value = 6
+        return max(0, min(value, 20))
+
+    def _extract_terms(self, text: str) -> List[str]:
+        raw = str(text or "").lower()
+        if not raw:
+            return []
+        tokens = re.findall(r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}-\d{2}-\d{2}|[a-zа-яё0-9_]{3,}", raw)
+        out: List[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            item = token.strip().strip(".,:;!?()[]{}\"'")
+            if len(item) < 3 or item in self._STOP_WORDS or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+            if len(out) >= self.MAX_CROSS_CHAT_TERMS:
+                break
+        return out
+
+    @classmethod
+    def _compact_text(cls, text: str) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(compact) > cls.MAX_CROSS_CHAT_SNIPPET_LEN:
+            return compact[: cls.MAX_CROSS_CHAT_SNIPPET_LEN - 1] + "…"
+        return compact
+
+    def _build_cross_chat_context(self, user_input: str) -> str:
+        if not (self._storage and self._cross_chat_enabled()):
+            return ""
+        terms = self._extract_terms(user_input)
+        if not terms:
+            return ""
+        limit = self._cross_chat_limit()
+        if limit <= 0:
+            return ""
+        try:
+            matches = self._storage.search_ai_history(terms, exclude_chat_id=self.chat_id, limit=limit)
+        except Exception:
+            self.log.exception("Failed to resolve cross-chat AI context")
+            return ""
+        if not matches:
+            return ""
+        lines: List[str] = []
+        seen_messages: set[tuple[str, int]] = set()
+        for entry in matches:
+            chat_id = str(entry.get("chat_id") or "")
+            msg_id = int(entry.get("message_id") or 0)
+            key = (chat_id, msg_id)
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+            role = str(entry.get("role") or "user")
+            content = self._compact_text(str(entry.get("content") or ""))
+            if not content:
+                continue
+            lines.append(f"[chat={chat_id}][{role}] {content}")
+        if not lines:
+            return ""
+        joined = "\n".join(lines)
+        return (
+            "<|start_header_id|>system<|end_header_id|>"
+            "Дополнительный контекст из других AI-чатов (используй только если релевантно):\n"
+            f"{joined}"
+        )
+
     def generate_response(self, user_input: str) -> str:
         # ВАЖНО: объявляем global один раз в начале функции, до любых присваиваний
         # Иначе получите: "SyntaxError: name 'X' is assigned to before global declaration"
@@ -334,6 +416,9 @@ class AIChat:
         global _ollama_model
 
         context = self.format_history()
+        cross_chat_context = self._build_cross_chat_context(user_input)
+        if cross_chat_context:
+            context = f"{context}\n{cross_chat_context}"
         try:
             prompt = template_text.format(context=context, question=user_input)
         except Exception:

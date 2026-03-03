@@ -80,6 +80,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "context": 2048,
         "use_cuda": True,
         "prompt": "",
+        "cross_chat_context": True,
+        "cross_chat_limit": 6,
     },
 }
 

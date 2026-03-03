@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ESCgram
+Comment=Telegram client
+Exec=escgram
+Icon=escgram
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupNotify=true
+StartupWMClass=ESCgram

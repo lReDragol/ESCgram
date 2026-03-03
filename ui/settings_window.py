@@ -371,6 +371,33 @@ class SettingsWindow(QDialog):
         self.ai_cuda_checkbox.toggled.connect(self._on_ai_cuda_toggled)
         layout.addWidget(self.ai_cuda_checkbox)
 
+        cross_box = QGroupBox("Память между чатами")
+        cross_layout = QVBoxLayout(cross_box)
+        self.ai_cross_chat_checkbox = QCheckBox("Подтягивать релевантный контекст из других AI-чатов")
+        self.ai_cross_chat_checkbox.setChecked(bool(state.get("cross_chat_context", True)))
+        self.ai_cross_chat_checkbox.toggled.connect(self._on_ai_cross_chat_toggled)
+        cross_layout.addWidget(self.ai_cross_chat_checkbox)
+
+        cross_limit_row = QHBoxLayout()
+        cross_limit_row.addWidget(QLabel("Лимит фрагментов:"))
+        self.ai_cross_chat_limit_spin = QSpinBox()
+        self.ai_cross_chat_limit_spin.setRange(0, 20)
+        try:
+            cross_limit = int(state.get("cross_chat_limit", 6) or 6)
+        except Exception:
+            cross_limit = 6
+        self.ai_cross_chat_limit_spin.setValue(max(0, min(cross_limit, 20)))
+        self.ai_cross_chat_limit_spin.valueChanged.connect(self._on_ai_cross_chat_limit_changed)
+        self.ai_cross_chat_limit_spin.setEnabled(bool(self.ai_cross_chat_checkbox.isChecked()))
+        cross_limit_row.addWidget(self.ai_cross_chat_limit_spin)
+        cross_limit_row.addStretch(1)
+        cross_layout.addLayout(cross_limit_row)
+
+        cross_hint = QLabel("0 — полностью отключить межчатовый контекст.")
+        cross_hint.setWordWrap(True)
+        cross_layout.addWidget(cross_hint)
+        layout.addWidget(cross_box)
+
         layout.addStretch(1)
 
         self._refresh_ai_models(state)
@@ -663,6 +690,14 @@ class SettingsWindow(QDialog):
 
     def _on_ai_cuda_toggled(self, checked: bool) -> None:
         self._emit_ai_change({"use_cuda": bool(checked)})
+
+    def _on_ai_cross_chat_toggled(self, checked: bool) -> None:
+        self._emit_ai_change({"cross_chat_context": bool(checked)})
+        if hasattr(self, "ai_cross_chat_limit_spin"):
+            self.ai_cross_chat_limit_spin.setEnabled(bool(checked))
+
+    def _on_ai_cross_chat_limit_changed(self, value: int) -> None:
+        self._emit_ai_change({"cross_chat_limit": int(value)})
 
     def _open_ollama_download_page(self) -> None:
         QDesktopServices.openUrl(QUrl("https://ollama.com/download"))
