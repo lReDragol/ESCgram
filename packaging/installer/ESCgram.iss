@@ -66,7 +66,9 @@ begin
   BootstrapPath := ExpandConstant('{userappdata}\\DragoGUI\\bootstrap.json');
   if not FileExists(BootstrapPath) then
     Exit;
-  if not LoadStringFromFile(BootstrapPath, Content) then
+  Content := '';
+  LoadStringFromFile(BootstrapPath, Content);
+  if Trim(Content) = '' then
     Exit;
 
   KeyPos := Pos('"data_dir"', Content);
@@ -83,7 +85,6 @@ begin
     Exit;
 
   Result := Copy(Content, QuoteStart + 1, QuoteEnd - QuoteStart - 1);
-  StringChangeEx(Result, '\\', '\', True);
 end;
 
 procedure _WriteBootstrapDataDir(const DataDir: String);
