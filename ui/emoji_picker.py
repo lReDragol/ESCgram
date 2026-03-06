@@ -1,19 +1,50 @@
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List
 
 from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtWidgets import QFrame, QGridLayout, QToolButton, QWidget
 
 
-DEFAULT_EMOJIS: Sequence[str] = [
-    "😀", "😁", "😂", "🤣", "😊", "😉", "😍", "😘",
-    "😎", "🤔", "😴", "😭", "😡", "🤝", "🙏", "👍",
-    "👎", "👏", "🔥", "💯", "🎉", "❤️", "💔", "✨",
-    "🧠", "👀", "🎧", "🎮", "📌", "✅", "❌", "⚠️",
-    "📎", "🖼️", "🎙️", "📞", "🕒", "📍", "🔒", "🔓",
-    "🧩", "🪄", "🫡", "🫠", "🫶", "🥲", "🤌", "🗿",
+_FALLBACK_EMOJIS: Sequence[str] = [
+    "😀", "😁", "😂", "🤣", "🥹", "😊", "😉", "😍", "😘", "😎", "🤔", "🫡",
+    "😴", "😭", "😡", "🤯", "🥳", "😇", "🤗", "🤝", "🙏", "👍", "👎", "👏",
+    "🙌", "👌", "🤌", "✌️", "🤞", "👀", "🧠", "💪", "🔥", "💯", "🎉", "✨",
+    "❤️", "🩵", "💚", "💔", "💥", "⚡", "⭐", "🌚", "🌝", "☕", "🍿", "🍕",
+    "🎮", "🎧", "🎵", "🎬", "📌", "📍", "📎", "🖼️", "📷", "🎙️", "📞", "🕒",
+    "✅", "❌", "⚠️", "🔒", "🔓", "🧩", "🪄", "🫠", "🫶", "🥲", "🤖", "🗿",
+    "🚀", "🌐", "💼", "📚", "📈", "📉", "💸", "🏆", "🥇", "🎁", "🧨", "🎯",
+    "😅", "🤤", "😈", "😬", "🙃", "😐", "😮", "😱", "🤬", "😏", "🤓", "🤠",
 ]
+
+
+def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
+    values: List[str] = []
+    seen: set[str] = set()
+
+    try:
+        import emoji as emoji_lib  # type: ignore
+
+        data = getattr(emoji_lib, "EMOJI_DATA", None)
+        if isinstance(data, dict):
+            for key in data.keys():
+                value = str(key or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                values.append(value)
+    except Exception:
+        values = []
+
+    if not values:
+        values = [str(e) for e in _FALLBACK_EMOJIS if str(e).strip()]
+
+    if isinstance(limit, int) and limit > 0:
+        values = values[: int(limit)]
+    return tuple(values)
+
+
+DEFAULT_EMOJIS: Sequence[str] = load_all_emojis()
 
 
 class EmojiPickerPopup(QFrame):
@@ -54,4 +85,3 @@ class EmojiPickerPopup(QFrame):
     def _select(self, emoji: str) -> None:
         self.emojiSelected.emit(emoji)
         self.hide()
-

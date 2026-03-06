@@ -99,6 +99,7 @@ class _CircleSeekOverlay(QWidget):
         self.margin = 10
         self._base_thickness = 8
         self._thin_scale = 0.7       # FIX: тоньше ~30%
+        self._hit_padding = 11       # wider drag target without changing visual thickness
         self.alpha_bg = 120
         self.alpha_fg = 200
         self._ratio = 0.0
@@ -121,9 +122,11 @@ class _CircleSeekOverlay(QWidget):
     def mousePressEvent(self, e: QMouseEvent) -> None:
         self._press_pos = QPointF(e.position())
         _, R_out, R_in = self._radii()
+        R_in_hit = max(0.0, R_in - float(self._hit_padding))
+        R_out_hit = R_out + float(self._hit_padding)
         c = self._center()
         r = ((e.position().x() - c.x()) ** 2 + (e.position().y() - c.y()) ** 2) ** 0.5
-        if R_in <= r <= R_out:
+        if R_in_hit <= r <= R_out_hit:
             self._dragging = True
             self._seek_to_point(e.position())
         else:
@@ -137,11 +140,13 @@ class _CircleSeekOverlay(QWidget):
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         c = self._center()
         _, R_out, R_in = self._radii()
+        R_in_hit = max(0.0, R_in - float(self._hit_padding))
+        R_out_hit = R_out + float(self._hit_padding)
         r = ((e.position().x() - c.x()) ** 2 + (e.position().y() - c.y()) ** 2) ** 0.5
         moved2 = (e.position().x() - self._press_pos.x()) ** 2 + (e.position().y() - self._press_pos.y()) ** 2
         if not self._dragging and r < R_in and moved2 <= self._click_slop2:
             self._toggle(); e.accept(); return
-        if self._dragging and R_in <= r <= R_out:
+        if self._dragging and R_in_hit <= r <= R_out_hit:
             self._seek_to_point(e.position()); self._dragging = False; e.accept(); return
         self._dragging = False; e.ignore()
     def _toggle(self) -> None:
@@ -195,6 +200,10 @@ class _VideoEventFilter(QObject):
             et = ev.type()
             if et == QEvent.Type.Resize and self._host._circle_overlay:
                 self._host._circle_overlay.setGeometry(self._host.video_w.rect())  # type: ignore[arg-type]
+                self._host._layout_timeline_overlay()
+                return False
+            if et == QEvent.Type.Resize:
+                self._host._layout_timeline_overlay()
                 return False
             if et == QEvent.Type.MouseButtonPress:
                 # Toggle play/pause on click inside video widget.
@@ -227,6 +236,7 @@ class MediaRenderingMixin:
     _seek: Optional[QSlider]
     _slider_dragging: bool
     _circle_overlay: Optional[_CircleSeekOverlay]
+    _timeline_overlay: Optional[QWidget]
 
     _video_sink: Optional[QVideoSink]
     _circle_img_label: Optional[_VideoCircleLabel]
@@ -247,6 +257,24 @@ class MediaRenderingMixin:
     MIN_IMAGE_DIM = 32
     IMAGE_PLACEHOLDER = QSize(320, 220)
     VIDEO_NOTE_SIZE = 300
+
+    def _layout_timeline_overlay(self) -> None:
+        overlay = getattr(self, "_timeline_overlay", None)
+        if overlay is None:
+            return
+        host = getattr(self, "video_w", None)
+        if host is None or not isinstance(host, QWidget) or not host.isVisible():
+            host = getattr(self, "preview", None)
+        if host is None or not isinstance(host, QWidget):
+            return
+        if overlay.parent() is not host:
+            overlay.setParent(host)
+        width = max(80, host.width() - 16)
+        height = max(24, overlay.sizeHint().height() if hasattr(overlay, "sizeHint") else 26)
+        y = max(4, host.height() - height - 6)
+        overlay.setGeometry(8, y, width, height)
+        overlay.raise_()
+        overlay.show()
 
     # -------------------- размеры/масштаб --------------------
     @staticmethod
@@ -471,31 +499,29 @@ class MediaRenderingMixin:
         self._controls_bar = None
         self._time_lbl = None
         self._seek = None
+        self._timeline_overlay = None
         if not circular:
             # Keep timeline controls over the preview surface (Telegram-like),
             # so geometry stays stable and does not jump when opening media.
-            overlay = QWidget(self.preview)
+            overlay = QWidget(cast(QWidget, self))
             overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             overlay.setStyleSheet("background-color: rgba(10, 18, 26, 150); border-radius: 8px;")
             overlay_layout = QHBoxLayout(overlay)
             overlay_layout.setContentsMargins(8, 2, 8, 2)
             overlay_layout.setSpacing(6)
-            self._seek = QSlider(Qt.Orientation.Horizontal, parent=cast(QWidget, self))
+            self._seek = QSlider(Qt.Orientation.Horizontal, parent=overlay)
             self._seek.setRange(0, 0)
             cast(Any, self._seek.sliderPressed).connect(self._on_slider_pressed)
             cast(Any, self._seek.sliderReleased).connect(self._on_slider_released)
             cast(Any, self._seek.sliderMoved).connect(self._on_slider_moved)
             self._seek.setEnabled(False)
-            self._time_lbl = QLabel("0:00 / 0:00", parent=cast(QWidget, self))
+            self._time_lbl = QLabel("0:00 / 0:00", parent=overlay)
             label_css = style_mgr.stylesheet("media.time_label")
             self._time_lbl.setStyleSheet(label_css or "color:#9fa6b1; font-size:11px;")
             overlay_layout.addWidget(self._seek, 1)
             overlay_layout.addWidget(self._time_lbl, 0)
-            holder = QVBoxLayout(self.preview)
-            holder.setContentsMargins(8, 8, 8, 8)
-            holder.setSpacing(0)
-            holder.addWidget(overlay, 0, Qt.AlignmentFlag.AlignTop)
-            holder.addStretch(1)
+            self._timeline_overlay = overlay
+            QTimer.singleShot(0, self._layout_timeline_overlay)
             self._controls_bar = overlay_layout
 
         # FIX: сброс флагов превью
@@ -633,6 +659,7 @@ class MediaRenderingMixin:
             player.setVideoOutput(sink)
         else:
             player.setVideoOutput(cast(QVideoWidget, vw))
+            self._layout_timeline_overlay()
         if player.source().isEmpty():
             player.setSource(QUrl.fromLocalFile(self.file_path))
         if self.preview and self.preview.isVisible():

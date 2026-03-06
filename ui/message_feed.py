@@ -279,12 +279,42 @@ class MessageFeedMixin:
                 pass
 
     def clear_feed(self) -> None:
-        while self.chat_history_layout.count() > 1:
-            item = self.chat_history_layout.takeAt(0)
-            widget = item.widget()
-            self._dispose_widget_tree(widget)
-            if widget:
-                widget.deleteLater()
+        old_wrap = getattr(self, "chat_history_wrap", None)
+        old_layout = getattr(self, "chat_history_layout", None)
+        try:
+            self.chat_scroll.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        # Fast swap: build a fresh container instead of deleting hundreds of rows one-by-one.
+        new_wrap = QWidget()
+        new_layout = QVBoxLayout(new_wrap)
+        if old_layout is not None:
+            try:
+                new_layout.setContentsMargins(old_layout.contentsMargins())
+                new_layout.setSpacing(old_layout.spacing())
+            except Exception:
+                new_layout.setContentsMargins(8, 8, 8, 8)
+                new_layout.setSpacing(10)
+        else:
+            new_layout.setContentsMargins(8, 8, 8, 8)
+            new_layout.setSpacing(10)
+        new_layout.addStretch(1)
+        self.chat_history_wrap = new_wrap
+        self.chat_history_layout = new_layout
+        try:
+            self.chat_scroll.setWidget(new_wrap)
+        except Exception:
+            pass
+        self._dispose_widget_tree(old_wrap)
+        if old_wrap is not None:
+            try:
+                old_wrap.deleteLater()
+            except Exception:
+                pass
+        try:
+            self.chat_scroll.setUpdatesEnabled(True)
+        except Exception:
+            pass
         self._message_widgets.clear()
         self._message_order = []
         self._clear_jump_indicator()
@@ -325,9 +355,18 @@ class MessageFeedMixin:
                 avatar_id = str(user_id or getattr(self, "_my_id", "me"))
                 avatar = self.avatar_cache.user(avatar_id, header or "Вы")
             elif user_id:
-                avatar_kind = "user"
-                avatar_id = str(user_id)
-                avatar = self.avatar_cache.user(avatar_id, header)
+                normalized_sender = str(user_id)
+                # sender_id can be a chat/channel id (negative) when messages are sent
+                # on behalf of a channel (sender_chat) or by anonymous admins.
+                if normalized_sender.startswith("-") and normalized_sender.lstrip("-").isdigit():
+                    avatar_kind = "chat"
+                    avatar_id = normalized_sender
+                    info = self.all_chats.get(avatar_id, {"title": header})
+                    avatar = self.avatar_cache.chat(avatar_id, info)
+                else:
+                    avatar_kind = "user"
+                    avatar_id = normalized_sender
+                    avatar = self.avatar_cache.user(avatar_id, header)
             elif chat_id:
                 avatar_kind = "chat"
                 avatar_id = str(chat_id)

@@ -353,7 +353,7 @@ class ChatSidebarMixin:
 
         self.search = QLineEdit(placeholderText="Поиск (имя, @username, id)…")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._apply_filter)
+        self.search.textChanged.connect(self._on_search_text_changed)
         search_row.addWidget(self.search, 1)
 
         search_container = QWidget()
@@ -565,6 +565,17 @@ class ChatSidebarMixin:
         handler = getattr(self, "on_streamer_mode_setting_changed", None)
         if callable(handler):
             handler(bool(checked))
+
+    def _on_search_text_changed(self, text: str) -> None:
+        handler = getattr(self, "on_sidebar_search_changed", None)
+        if callable(handler):
+            try:
+                handled = bool(handler(str(text or "")))
+            except Exception:
+                handled = False
+            if handled:
+                return
+        self._apply_filter(str(text or ""))
 
     def _on_settings_menu_action(self, action_id: str) -> None:
         handler = getattr(self, "on_sidebar_action_requested", None)

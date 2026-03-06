@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 import json
 import mimetypes
 import os
@@ -60,7 +61,15 @@ from ui.common import HAVE_QTMULTIMEDIA, HAVE_SD, load_history, log, save_histor
 from ui.settings_window import SettingsWindow
 from ui.auto_download import AutoDownloadPolicy
 from ui.config_store import DEFAULT_CONFIG, load_config, save_config
-from ui.dialog_workers import DialogsStreamWorker, HistoryWorker, LastDateWorker, ReleaseCheckWorker, UpdateDownloadWorker
+from ui.dialog_workers import (
+    DialogsStreamWorker,
+    FfmpegInstallWorker,
+    GlobalPeerSearchWorker,
+    HistoryWorker,
+    LastDateWorker,
+    ReleaseCheckWorker,
+    UpdateDownloadWorker,
+)
 from ui.account_workers import AccountProfileWorker
 from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
@@ -69,6 +78,14 @@ from ui.message_feed import MessageFeedMixin
 from ui.message_widgets import DEFAULT_BUBBLE_THEME, ChatItemWidget, ReplyPreviewWidget, TextMessageWidget, set_bubble_theme
 from ui.media_viewer import MediaViewerDialog
 from ui.media_picker import MediaPickerPopup
+from ui.chat_panels import (
+    ChatHeaderBar,
+    ChatInfoDialog,
+    ChatStatisticsDialog,
+    MessageStatisticsDialog,
+    build_header_menu,
+    format_chat_subtitle,
+)
 from ui.send_media_inline_preview import InlineMediaPreviewBar
 from ui.send_media_workers import FfmpegConvertWorker, MediaBatchSendWorker, MediaSendWorker
 from ui.styles import StyleManager, apply_theme
@@ -94,6 +111,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self.server = server
         self.tg = tg_adapter
+        self._prepend_local_ffmpeg_to_path()
 
         # конфиг и фичи
         self._config: Dict[str, Any] = config or load_config()
@@ -148,7 +166,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         # модели/состояния
         self.history: Dict[str, Any] = load_history()
         self._history_limit = 200
-        self._history_initial_limit = 40
+        self._history_initial_limit = 30
         self._history_prefetch_limit = 300
         self._history_chunk_size = 120
         self._history_scroll_threshold = 40
@@ -175,6 +193,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._pending_reply_to: Optional[int] = None
         self._reply_bar: Optional[QFrame] = None
         self._reply_preview_widget: Optional[ReplyPreviewWidget] = None
+        self._chat_header: Optional[ChatHeaderBar] = None
+        self._chat_header_info_cache: Dict[str, Dict[str, Any]] = {}
         self._media_preview_bar: Optional[InlineMediaPreviewBar] = None
         self._pending_media_preview: Optional[Dict[str, Any]] = None
         self._avatar_size = 40
@@ -210,6 +230,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._update_download_worker: Optional[UpdateDownloadWorker] = None
         self._update_in_progress: bool = False
         self._media_viewers: set[QWidget] = set()
+        self._global_search_query: str = ""
+        self._global_search_seq: int = 0
+        self._global_search_thread: Optional[QThread] = None
+        self._global_search_worker: Optional[GlobalPeerSearchWorker] = None
+        self._ffmpeg_install_thread: Optional[QThread] = None
+        self._ffmpeg_install_worker: Optional[FfmpegInstallWorker] = None
 
         # аватары
         self.avatar_cache = AvatarCache(
@@ -243,6 +269,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._history_save_timer.setSingleShot(True)
         self._history_save_timer.timeout.connect(self._flush_history_save)
         self._ts_warmup_done = False
+        self._global_search_timer = QTimer(self)
+        self._global_search_timer.setSingleShot(True)
+        self._global_search_timer.timeout.connect(self._start_global_peer_search)
 
         # сборка UI
         self._init_event_pump()
@@ -758,6 +787,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
+        center_layout.addWidget(self._build_chat_header(), 0)
         center_layout.addWidget(self._build_feed(), 1)
         try:
             self.chat_scroll.viewport().installEventFilter(self)
@@ -791,6 +821,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._shortcut_find_prev.activated.connect(lambda: self.find_in_messages(forward=False))
         self._shortcut_find_close = QShortcut(QKeySequence("Esc"), self)
         self._shortcut_find_close.activated.connect(self.hide_message_search)
+
+    def _build_chat_header(self) -> QWidget:
+        header = ChatHeaderBar(self)
+        header.infoRequested.connect(self._show_current_chat_info)
+        header.menuRequested.connect(self._show_chat_header_menu)
+        self._chat_header = header
+        self._refresh_chat_header()
+        return header
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         try:
@@ -1507,6 +1545,112 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return True
         return False
 
+    def _stop_global_search_worker(self) -> None:
+        worker = getattr(self, "_global_search_worker", None)
+        thread = getattr(self, "_global_search_thread", None)
+        self._global_search_worker = None
+        self._global_search_thread = None
+        if worker is not None and hasattr(worker, "stop"):
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if thread is not None and thread.isRunning():
+            try:
+                thread.quit()
+                thread.wait(220)
+            except Exception:
+                pass
+
+    def on_sidebar_search_changed(self, text: str) -> bool:
+        query = str(text or "")
+        self._apply_filter(query)
+        stripped = query.strip()
+        self._global_search_query = stripped
+        if not stripped or len(stripped) < 2:
+            timer = getattr(self, "_global_search_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+            self._stop_global_search_worker()
+            return True
+        timer = getattr(self, "_global_search_timer", None)
+        if timer is not None:
+            try:
+                timer.start(260)
+            except Exception:
+                self._start_global_peer_search()
+        else:
+            self._start_global_peer_search()
+        return True
+
+    @Slot()
+    def _start_global_peer_search(self) -> None:
+        query = str(getattr(self, "_global_search_query", "") or "").strip()
+        if not query:
+            return
+        if not hasattr(self.tg, "is_authorized_sync") or not self.tg.is_authorized_sync():
+            return
+        self._stop_global_search_worker()
+        self._global_search_seq = int(getattr(self, "_global_search_seq", 0) or 0) + 1
+        seq = self._global_search_seq
+        try:
+            thread = QThread(self)
+            thread.setObjectName("global_peer_search_thread")
+            worker = GlobalPeerSearchWorker(self.server, query=query, limit=36)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.done.connect(lambda rows, s=seq, q=query: self._on_global_peer_search_done(rows, s, q))
+            worker.done.connect(thread.quit)
+            worker.done.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_global_search_worker", None))
+            thread.finished.connect(lambda: setattr(self, "_global_search_thread", None))
+            self._global_search_worker = worker
+            self._global_search_thread = thread
+            thread.start()
+        except Exception:
+            log.exception("Failed to start global peer search worker")
+            self._global_search_worker = None
+            self._global_search_thread = None
+
+    def _on_global_peer_search_done(self, rows: List[Dict[str, Any]], seq: int, query: str) -> None:
+        try:
+            if int(seq) != int(getattr(self, "_global_search_seq", 0) or 0):
+                return
+        except Exception:
+            return
+        current_query = str(getattr(self, "search", None).text() if hasattr(self, "search") else "")
+        if current_query.strip().lower() != str(query or "").strip().lower():
+            return
+        updated = False
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            prev = self._ensure_chat_meta(cid)
+            title = str(row.get("title") or prev.get("title") or cid).strip() or cid
+            ctype = str(row.get("type") or prev.get("type") or "private").strip().lower() or "private"
+            username = str(row.get("username") or prev.get("username") or "").strip()
+            photo_small = row.get("photo_small_id") or prev.get("photo_small_id") or prev.get("photo_small")
+            self.all_chats[cid] = {
+                "title": title,
+                "type": ctype,
+                "last_ts": int(prev.get("last_ts") or 0),
+                "username": username,
+                "photo_small_id": photo_small,
+                "pinned": bool(prev.get("pinned", False)),
+                "unread_count": max(0, int(prev.get("unread_count") or 0)),
+            }
+            updated = True
+        if updated:
+            self._schedule_chat_list_refresh(0)
+        self._apply_filter(current_query)
+
     # ------------------------------------------------------------------ #
     # Chat list interactions
 
@@ -1536,8 +1680,111 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._clear_message_selection()
         self.current_chat_id = chat_id
         self._apply_chat_activity(chat_id, clear_unread=True, refresh_delay_ms=0)
+        self._refresh_chat_header()
         self.update_ai_controls_state()
         self.load_chat_history_async()
+
+    def _current_chat_meta(self) -> Dict[str, Any]:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return {}
+        info = dict(self.all_chats.get(chat_id, {}))
+        cached = self._chat_header_info_cache.get(chat_id)
+        if isinstance(cached, dict):
+            info.update({key: value for key, value in cached.items() if value not in (None, "")})
+        info.setdefault("id", chat_id)
+        info.setdefault("title", info.get("title") or chat_id)
+        return info
+
+    def _refresh_chat_header(self) -> None:
+        header = getattr(self, "_chat_header", None)
+        if not header:
+            return
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            header.set_chat(title="Выберите чат", subtitle="", avatar=None)
+            return
+        info = self._current_chat_meta()
+        title = str(info.get("title") or chat_id)
+        subtitle = format_chat_subtitle(info)
+        avatar = None
+        try:
+            avatar = self.avatar_cache.chat(chat_id, info)
+        except Exception:
+            avatar = None
+        header.set_chat(title=title, subtitle=subtitle, avatar=avatar)
+
+    def _show_current_chat_info(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        info = self._current_chat_meta()
+        if hasattr(self.server, "get_chat_full_info"):
+            try:
+                full = self.server.get_chat_full_info(chat_id)
+            except Exception:
+                full = None
+            if isinstance(full, dict) and full:
+                info.update(full)
+                self._chat_header_info_cache[chat_id] = dict(full)
+                merged = dict(self.all_chats.get(chat_id, {}))
+                merged.update(full)
+                self.all_chats[chat_id] = merged
+                self._refresh_chat_header()
+        avatar = None
+        try:
+            avatar = self.avatar_cache.chat(chat_id, info)
+        except Exception:
+            avatar = None
+        dlg = ChatInfoDialog(info, avatar=avatar, parent=self)
+        dlg.exec()
+
+    def _show_current_chat_statistics(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        stats = self.server.get_chat_statistics(chat_id, limit=max(int(getattr(self, "_history_prefetch_limit", 300) or 300), 300))
+        if not stats:
+            self._toast("Нет данных для статистики")
+            return
+        title = str(self._current_chat_meta().get("title") or chat_id)
+        dlg = ChatStatisticsDialog(title, stats, parent=self)
+        dlg.exec()
+
+    def _show_message_statistics(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        data = self.server.get_message_statistics(chat_id, mid)
+        if not data:
+            self._toast("Статистика недоступна")
+            return
+        dlg = MessageStatisticsDialog(data, parent=self)
+        dlg.exec()
+
+    @Slot(QPoint)
+    def _show_chat_header_menu(self, global_pos: QPoint) -> None:
+        if not self.current_chat_id:
+            return
+        menu = build_header_menu(self)
+        menu.addAction("Открыть профиль").triggered.connect(self._show_current_chat_info)
+        menu.addAction("Статистика чата").triggered.connect(self._show_current_chat_statistics)
+        menu.addSeparator()
+        menu.addAction("Обновить историю").triggered.connect(lambda: self.load_chat_history_async(reset=True))
+        menu.addAction("Пометить прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
+        try:
+            menu.exec(global_pos)
+        finally:
+            try:
+                menu.deleteLater()
+            except Exception:
+                pass
 
     def update_ai_controls_state(self) -> None:
         if not self.current_chat_id:
@@ -2573,6 +2820,60 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "waveform": cached.get("waveform"),
         }
 
+    def _prime_reply_preview_cache(self, messages: List[Dict[str, Any]]) -> None:
+        if not self.current_chat_id or not messages:
+            return
+        missing: List[int] = []
+        seen: set[int] = set()
+        for entry in messages:
+            reply_to_raw = entry.get("reply_to")
+            try:
+                reply_to = int(reply_to_raw) if reply_to_raw is not None else None
+            except Exception:
+                reply_to = None
+            if reply_to is None or reply_to <= 0 or reply_to in self._message_cache or reply_to in seen:
+                continue
+            seen.add(reply_to)
+            missing.append(reply_to)
+        if not missing:
+            return
+        try:
+            fetched = self.server.get_messages_details_for_ui(self.current_chat_id, missing)
+        except Exception:
+            fetched = {}
+        if not isinstance(fetched, dict):
+            return
+        for target_id, details in fetched.items():
+            if not isinstance(details, dict):
+                continue
+            try:
+                msg_id = int(target_id)
+            except Exception:
+                continue
+            cached = {
+                "id": msg_id,
+                "text": details.get("text") or "",
+                "kind": details.get("type") or "text",
+                "sender": details.get("sender") or "",
+                "reply_to": details.get("reply_to"),
+                "is_deleted": bool(details.get("is_deleted")),
+                "forward_info": details.get("forward_info"),
+                "duration": details.get("duration"),
+                "waveform": details.get("waveform"),
+                "media_group_id": details.get("media_group_id"),
+            }
+            self._message_cache[msg_id] = cached
+            reply_parent = details.get("reply_to")
+            if reply_parent:
+                try:
+                    parent = int(reply_parent)
+                except Exception:
+                    parent = None
+                if parent is not None:
+                    bucket = self._reply_index.setdefault(parent, [])
+                    if msg_id not in bucket:
+                        bucket.append(msg_id)
+
     def _update_reply_references(self, target_id: Optional[int]) -> None:
         if target_id is None:
             return
@@ -2627,13 +2928,31 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         order = list(getattr(self, "_message_order", []) or [])
         if not order:
             return None
+        try:
+            last_id = self._message_id_from_widget(order[-1])
+        except Exception:
+            last_id = None
+        if last_id is not None and last_id > 0 and mid > last_id:
+            return None
+        try:
+            first_id = self._message_id_from_widget(order[0])
+        except Exception:
+            first_id = None
+        if first_id is not None and first_id > 0 and mid < first_id:
+            return 0
+        indexed: List[tuple[int, int]] = []
         for idx, widget in enumerate(order):
             existing_id = self._message_id_from_widget(widget)
             if existing_id is None or existing_id <= 0:
                 continue
-            if existing_id > mid:
-                return idx
-        return None
+            indexed.append((int(existing_id), idx))
+        if not indexed:
+            return None
+        numeric_ids = [item[0] for item in indexed]
+        position = bisect_left(numeric_ids, mid)
+        if position >= len(indexed):
+            return None
+        return indexed[position][1]
 
     @staticmethod
     def _widget_text(widget: object) -> str:
@@ -2747,6 +3066,29 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return widget
         return fallback
 
+    @staticmethod
+    def _utf16_len_text(value: str) -> int:
+        total = 0
+        for ch in str(value or ""):
+            total += 2 if ord(ch) > 0xFFFF else 1
+        return total
+
+    def _decode_hidden_display(self, raw_text: str) -> tuple[str, Optional[List[Dict[str, Any]]], bool]:
+        text = str(raw_text or "")
+        hidden_flag = is_zwc_only(text)
+        if not (hidden_flag or contains_zwc(text)):
+            return text, None, False
+        display, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(text)
+        display_text = str(display or "")
+        entities = hidden_entities or None
+        if hidden_flag and not display_text:
+            decoded = decode_zwc(text)
+            if decoded:
+                display_text = str(decoded)
+                entities = [{"type": "hidden", "offset": 0, "length": self._utf16_len_text(display_text)}]
+                has_hidden = True
+        return display_text, entities, bool(has_hidden)
+
     # ------------------------------------------------------------------ #
     # Event pump handlers
 
@@ -2807,14 +3149,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
 
         if contains_zwc(text) or hidden_flag:
-            display, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(text)
+            display, hidden_entities, has_hidden = self._decode_hidden_display(text)
             self.add_text_item(
                 header,
                 display,
                 role=role,
                 chat_id=chat_id,
                 user_id=user_id,
-                entities=hidden_entities or None,
+                entities=hidden_entities,
                 has_hidden=has_hidden,
                 msg_id=local_msg_id,
                 reply_to=reply_to,
@@ -2874,8 +3216,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         display_text = text
         entities = None
         if contains_zwc(text) or hidden_flag:
-            display_text, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(text)
-            entities = hidden_entities or None
+            display_text, entities, has_hidden = self._decode_hidden_display(text)
         else:
             maybe_entities = payload.get("entities")
             if isinstance(maybe_entities, list):
@@ -3250,7 +3591,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self.server,
                 chat_id,
                 limit=self._history_current_limit,
-                batch_size=24,
+                batch_size=32,
                 include_deleted=bool(getattr(self, "_keep_deleted_messages", True)),
             )
             self._hist_worker.moveToThread(self._hist_thread)
@@ -3274,6 +3615,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     @Slot(list)
     def on_history_batch(self, messages: List[Dict[str, Any]]) -> None:
         self._ensure_my_id_for_history()
+        self._prime_reply_preview_cache(messages)
         wrap = getattr(self, "chat_history_wrap", None)
         if wrap:
             try:
@@ -3348,8 +3690,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     caption_entities = entities
                     caption_has_hidden = False
                     if caption_text and (contains_zwc(caption_text) or is_zwc_only(caption_text)):
-                        caption_text, hidden_entities, caption_has_hidden = reveal_zwc_fragments_with_entities(caption_text)
-                        caption_entities = hidden_entities or None
+                        caption_text, caption_entities, caption_has_hidden = self._decode_hidden_display(caption_text)
 
                     if existing is not None:
                         try:
@@ -3399,8 +3740,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     entities_for_display = entities
                     has_hidden = False
                     if display_text and (contains_zwc(display_text) or is_zwc_only(display_text)):
-                        display_text, hidden_entities, has_hidden = reveal_zwc_fragments_with_entities(display_text)
-                        entities_for_display = hidden_entities or None
+                        display_text, entities_for_display, has_hidden = self._decode_hidden_display(display_text)
 
                     if existing is not None:
                         try:
@@ -3573,6 +3913,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             pass
 
         self._refresh_feed_avatars(kind, target_id)
+        if kind == "chat" and target_id == str(self.current_chat_id or ""):
+            self._refresh_chat_header()
         if kind == "user" and target_id and target_id == str(getattr(self, "_active_account_user_id", "") or ""):
             try:
                 self._sync_account_card()
@@ -3649,6 +3991,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 "unread_count": merged_unread,
             }
         self._schedule_chat_list_refresh(60)
+        if active_chat and active_chat in self.all_chats:
+            self._refresh_chat_header()
         if new_ids and not self._ts_warmup_done:
             self._start_last_ts_worker(new_ids[:40])
             self._ts_warmup_done = True
@@ -3701,6 +4045,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._media_popup = MediaPickerPopup(self.tg, self)
             self._media_popup.emojiSelected.connect(self._insert_emoji)
             self._media_popup.stickerSelected.connect(self._send_sticker_file_id)
+            self._media_popup.gifSelected.connect(self._send_saved_gif_file_id)
             self._media_popup.gifPickRequested.connect(self._pick_gif_and_send)
         if self._media_popup.isVisible():
             self._media_popup.hide()
@@ -4266,6 +4611,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             for emoji in ("👍", "❤️", "🔥", "😂", "😢", "😡"):
                 reaction_menu.addAction(emoji).triggered.connect(lambda _, e=emoji, mid=mid: self._set_message_reaction(mid, e))
             menu.addSeparator()
+            menu.addAction("Статистика сообщения").triggered.connect(lambda: self._show_message_statistics(mid))
             menu.addAction("Удалить сообщение").triggered.connect(lambda: self._delete_message(mid))
             menu.addAction("Копировать ссылку на сообщение").triggered.connect(lambda: self._copy_message_link(mid))
             menu.addAction("Переслать").triggered.connect(lambda: self._forward_message(mid))
@@ -4495,44 +4841,91 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         )
         if not path:
             return
+        stable_path = path
         try:
             size = int(os.path.getsize(path))
         except Exception:
             size = 0
 
-        ok = False
-        if hasattr(self.tg, "send_animation_sync"):
-            try:
-                ok = bool(self.tg.send_animation_sync(chat_id=chat_id, animation_path=path))
-            except Exception:
-                ok = False
-        elif hasattr(self.tg, "send_document_sync"):
-            try:
-                ok = bool(self.tg.send_document_sync(chat_id=chat_id, document_path=path))
-            except Exception:
-                ok = False
+        try:
+            cached_path, cached_size = self._cache_outgoing_media("animation", path)
+            if cached_path and os.path.isfile(cached_path):
+                stable_path = cached_path
+                size = int(cached_size or size)
+        except Exception:
+            pass
 
-        if not ok:
-            QMessageBox.warning(self, "GIF", "Не удалось отправить GIF.")
-            return
-
-        self._ensure_my_id_for_history()
-        sender_id = self._my_id or "me"
-        self.add_media_item(
+        caption_text = str(self.user_input.toPlainText() or "").strip()
+        pending_id = self._add_pending_local_media_widget(
             kind="animation",
-            header="Вы",
-            text="",
-            role="me",
-            file_path=path if os.path.isfile(path) else None,
-            file_size=size,
             chat_id=chat_id,
-            user_id=sender_id,
+            media_path=stable_path,
+            file_size=size,
+            caption_text=caption_text,
+            timestamp=int(time.time()),
+        )
+        if caption_text:
+            try:
+                self.user_input.clear()
+            except Exception:
+                pass
+        self._clear_reply_target()
+        self._start_media_batch_send(
+            chat_id=chat_id,
+            items=[
+                {
+                    "kind": "animation",
+                    "path": stable_path,
+                    "size": int(size or 0),
+                    "caption": caption_text,
+                }
+            ],
+            pending_ids=[pending_id],
         )
         try:
             if self._media_popup and self._media_popup.isVisible():
                 self._media_popup.hide()
         except Exception:
             pass
+
+    @Slot(str)
+    def _send_saved_gif_file_id(self, file_id: str) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            self._toast("Сначала выберите чат")
+            return
+        fid = str(file_id or "").strip()
+        if not fid:
+            return
+        reply_to = getattr(self, "_pending_reply_to", None)
+        mid: Optional[int] = None
+        sender = getattr(self.tg, "send_animation_id_with_id_sync", None)
+        if callable(sender):
+            try:
+                mid = sender(chat_id=chat_id, animation_file_id=fid, reply_to=reply_to)
+            except Exception:
+                mid = None
+        if not mid:
+            QMessageBox.warning(self, "GIF", "Не удалось отправить GIF из истории.")
+            return
+        self._ensure_my_id_for_history()
+        sender_id = self._my_id or "me"
+        widget = self.add_media_item(
+            kind="animation",
+            header="Вы",
+            text="",
+            role="me",
+            file_path=None,
+            file_size=0,
+            msg_id=int(mid),
+            chat_id=chat_id,
+            user_id=sender_id,
+        )
+        try:
+            widget._start_download()
+        except Exception:
+            pass
+        self._clear_reply_target()
 
     def send_message(self) -> None:
         raw = self.user_input.toPlainText() or ""
@@ -4944,6 +5337,96 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         except Exception:
             pass
 
+    @staticmethod
+    def _local_ffmpeg_bin_dir() -> str:
+        try:
+            return str(app_paths.telegram_workdir() / "ffmpeg" / "bin")
+        except Exception:
+            return ""
+
+    def _prepend_local_ffmpeg_to_path(self) -> None:
+        bin_dir = self._local_ffmpeg_bin_dir()
+        if not bin_dir or not os.path.isdir(bin_dir):
+            return
+        current = os.environ.get("PATH", "")
+        parts = [p for p in current.split(os.pathsep) if p]
+        norm_target = os.path.normcase(os.path.normpath(bin_dir))
+        for part in parts:
+            if os.path.normcase(os.path.normpath(part)) == norm_target:
+                return
+        os.environ["PATH"] = bin_dir + (os.pathsep + current if current else "")
+
+    def _resolve_ffmpeg_binary(self) -> Optional[str]:
+        exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        bin_dir = self._local_ffmpeg_bin_dir()
+        if bin_dir:
+            candidate = os.path.join(bin_dir, exe)
+            if os.path.isfile(candidate):
+                return candidate
+        return shutil.which("ffmpeg")
+
+    def _resolve_ffprobe_binary(self) -> Optional[str]:
+        exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        bin_dir = self._local_ffmpeg_bin_dir()
+        if bin_dir:
+            candidate = os.path.join(bin_dir, exe)
+            if os.path.isfile(candidate):
+                return candidate
+        return shutil.which("ffprobe")
+
+    def _install_ffmpeg_from_settings(self) -> None:
+        thread = getattr(self, "_ffmpeg_install_thread", None)
+        if thread is not None and thread.isRunning():
+            self._toast("Установка ffmpeg уже выполняется")
+            return
+        target_root = str(app_paths.telegram_workdir())
+        self._toast("Запущена установка ffmpeg…")
+        try:
+            thread = QThread(self)
+            thread.setObjectName("ffmpeg_install_thread")
+            worker = FfmpegInstallWorker(target_root=target_root)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_ffmpeg_install_progress)
+            worker.finished.connect(self._on_ffmpeg_install_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_ffmpeg_install_thread", None))
+            thread.finished.connect(lambda: setattr(self, "_ffmpeg_install_worker", None))
+            self._ffmpeg_install_thread = thread
+            self._ffmpeg_install_worker = worker
+            thread.start()
+        except Exception:
+            log.exception("Failed to start ffmpeg installer")
+            self._ffmpeg_install_thread = None
+            self._ffmpeg_install_worker = None
+            QMessageBox.warning(self, "ffmpeg", "Не удалось запустить установку ffmpeg.")
+
+    @Slot(str, int, int)
+    def _on_ffmpeg_install_progress(self, status: str, done: int, total: int) -> None:
+        if total > 0:
+            try:
+                pct = int(max(0.0, min(1.0, float(done) / float(total))) * 100.0)
+            except Exception:
+                pct = 0
+            self._toast(f"{status} {pct}%")
+            return
+        if status:
+            self._toast(status)
+
+    @Slot(dict)
+    def _on_ffmpeg_install_finished(self, payload: Dict[str, Any]) -> None:
+        ok = bool((payload or {}).get("ok"))
+        path = str((payload or {}).get("path") or "").strip()
+        err = str((payload or {}).get("error") or "").strip()
+        if ok and path:
+            self._prepend_local_ffmpeg_to_path()
+            self._toast("ffmpeg установлен")
+            QMessageBox.information(self, "ffmpeg", f"ffmpeg установлен:\n{path}")
+            return
+        QMessageBox.warning(self, "ffmpeg", f"Не удалось установить ffmpeg.\n{err or 'Неизвестная ошибка.'}")
+
     def _build_voice_ffmpeg_cmd(self, ffmpeg: str, src_path: str, dst_path: str) -> List[str]:
         return [
             ffmpeg,
@@ -5020,21 +5503,21 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._toast("Дождитесь завершения текущей отправки")
             return
 
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = self._resolve_ffmpeg_binary()
         if not ffmpeg:
             if kind == "voice":
                 QMessageBox.warning(
                     self,
                     "Голосовое",
-                    "Не найден ffmpeg в PATH — конвертация в OGG/Opus невозможна.\n"
-                    "Установите полноценный ffmpeg (с поддержкой libopus).",
+                    "Не найден ffmpeg — конвертация в OGG/Opus невозможна.\n"
+                    "Установите ffmpeg в настройках или добавьте его в PATH.",
                 )
             else:
                 QMessageBox.warning(
                     self,
                     "Кружок",
-                    "Не найден ffmpeg в PATH — конвертация в кружок невозможна.\n"
-                    "Установите полноценный ffmpeg (libx264 + aac).",
+                    "Не найден ffmpeg — конвертация в кружок невозможна.\n"
+                    "Установите ffmpeg в настройках или добавьте его в PATH.",
                 )
             return
 
@@ -5477,6 +5960,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "hide_hidden_chats": self.on_hide_hidden_chats_setting_changed,
             "show_my_avatar": self.on_show_my_avatar_setting_changed,
             "keep_deleted_messages": self.on_keep_deleted_messages_setting_changed,
+            "install_ffmpeg": self._install_ffmpeg_from_settings,
         }
         if hasattr(self, "auto_ai_checkbox"):
             callbacks["auto_ai"] = lambda checked: self.auto_ai_checkbox.setChecked(bool(checked))
@@ -5504,7 +5988,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 return False
 
-        for timer_name in ("_timer", "_resort_timer", "_repaint_timer", "_bubble_width_timer", "_send_hold", "_voice_hold", "_history_save_timer"):
+        for timer_name in (
+            "_timer",
+            "_resort_timer",
+            "_repaint_timer",
+            "_bubble_width_timer",
+            "_send_hold",
+            "_voice_hold",
+            "_history_save_timer",
+            "_global_search_timer",
+        ):
             timer = getattr(self, timer_name, None)
             if timer is None:
                 continue
@@ -5582,6 +6075,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self._ts_worker = None
         self._ts_thread = None
+        self._stop_global_search_worker()
 
         update_thread = getattr(self, "_update_thread", None)
         if _thread_is_running(update_thread):
@@ -5602,6 +6096,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self._update_download_worker = None
         self._update_download_thread = None
+
+        ffmpeg_thread = getattr(self, "_ffmpeg_install_thread", None)
+        if _thread_is_running(ffmpeg_thread):
+            try:
+                ffmpeg_thread.quit()
+                ffmpeg_thread.wait(1200)
+            except Exception:
+                pass
+        self._ffmpeg_install_worker = None
+        self._ffmpeg_install_thread = None
 
         profile_thread = getattr(self, "_account_profile_thread", None)
         if _thread_is_running(profile_thread):

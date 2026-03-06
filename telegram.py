@@ -834,7 +834,12 @@ class TelegramAdapter:
             try:
                 text = str(message.text or "")
                 caption = str(message.caption or "")
-                uid = str(message.from_user.id) if message.from_user else "unknown"
+                if getattr(message, "from_user", None):
+                    uid = str(message.from_user.id)
+                elif getattr(message, "sender_chat", None):
+                    uid = str(message.sender_chat.id)
+                else:
+                    uid = "unknown"
                 reply_to_id = self._extract_reply_to_id(message)
                 forward_info = self._extract_forward_info(message)
                 file_name = self._extract_file_name(message)
@@ -921,7 +926,12 @@ class TelegramAdapter:
             try:
                 text = str(message.text or "")
                 caption = str(message.caption or "")
-                uid = str(message.from_user.id) if message.from_user else "unknown"
+                if getattr(message, "from_user", None):
+                    uid = str(message.from_user.id)
+                elif getattr(message, "sender_chat", None):
+                    uid = str(message.sender_chat.id)
+                else:
+                    uid = "unknown"
                 reply_to_id = self._extract_reply_to_id(message)
                 forward_info = self._extract_forward_info(message)
                 file_name = self._extract_file_name(message)
@@ -1021,6 +1031,10 @@ class TelegramAdapter:
                     if not uniq_mids:
                         continue
                     if self._storage:
+                        try:
+                            self._storage.log_deleted_messages(peer_id, uniq_mids, source="telegram_updates")
+                        except Exception:
+                            log.exception("[TG] Failed to snapshot deleted messages %s/%s", peer_id, uniq_mids)
                         try:
                             self._storage.mark_messages_deleted(peer_id, uniq_mids, deleted=True)
                         except Exception:
@@ -1140,6 +1154,207 @@ class TelegramAdapter:
             return list(self._call(_run(), timeout) or [])
         except Exception:
             return []
+
+    def search_public_peers_sync(self, query: str, limit: int = 24, timeout: float = 12.0) -> List[Dict[str, Any]]:
+        if not (self._enabled and self._client and self._loop):
+            return []
+        needle = str(query or "").strip()
+        if not needle:
+            return []
+        try:
+            limit_int = max(1, min(int(limit or 24), 80))
+        except Exception:
+            limit_int = 24
+
+        async def _run() -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            seen: set[int] = set()
+            try:
+                resp = await self._client.invoke(raw_fn.contacts.Search(q=needle, limit=limit_int))
+            except Exception:
+                resp = None
+
+            users = list(getattr(resp, "users", None) or []) if resp is not None else []
+            chats = list(getattr(resp, "chats", None) or []) if resp is not None else []
+
+            for user in users:
+                row = self._user_to_peer_row(user)
+                if not row:
+                    continue
+                try:
+                    pid = int(row.get("id"))
+                except Exception:
+                    continue
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append(
+                    {
+                        "id": str(pid),
+                        "title": str(row.get("title") or pid),
+                        "type": str(row.get("type") or "private"),
+                        "username": str(row.get("username") or ""),
+                        "photo_small_id": row.get("photo_small"),
+                    }
+                )
+                if len(out) >= limit_int:
+                    return out
+
+            for chat in chats:
+                row = self._chat_to_peer_row(chat)
+                if not row:
+                    continue
+                try:
+                    pid = int(row.get("id"))
+                except Exception:
+                    continue
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append(
+                    {
+                        "id": str(pid),
+                        "title": str(row.get("title") or pid),
+                        "type": str(row.get("type") or "group"),
+                        "username": str(row.get("username") or ""),
+                        "photo_small_id": row.get("photo_small"),
+                    }
+                )
+                if len(out) >= limit_int:
+                    return out
+
+            # Fallback for explicit @username / numeric ID.
+            fallback = needle.lstrip("@")
+            if not out and fallback:
+                try:
+                    entity = await self._client.get_chat(fallback)
+                except Exception:
+                    entity = None
+                if entity:
+                    try:
+                        title = (
+                            str(getattr(entity, "title", "") or "").strip()
+                            or " ".join(
+                                [
+                                    str(getattr(entity, "first_name", "") or "").strip(),
+                                    str(getattr(entity, "last_name", "") or "").strip(),
+                                ]
+                            ).strip()
+                            or str(getattr(entity, "username", "") or "").strip()
+                            or str(getattr(entity, "id", "") or "")
+                        )
+                        ctype = getattr(entity, "type", None)
+                        if hasattr(ctype, "name"):
+                            ctype = str(ctype.name or "").lower()
+                        else:
+                            ctype = str(ctype or "").lower()
+                        out.append(
+                            {
+                                "id": str(getattr(entity, "id", "")),
+                                "title": title,
+                                "type": ctype or "private",
+                                "username": str(getattr(entity, "username", "") or "").strip(),
+                                "photo_small_id": getattr(getattr(entity, "photo", None), "small_file_id", None),
+                            }
+                        )
+                    except Exception:
+                        pass
+            return out[:limit_int]
+
+        try:
+            return list(self._call(_run(), timeout) or [])
+        except Exception:
+            return []
+
+    def get_recent_emojis_sync(self, limit: int = 48, timeout: float = 5.0) -> List[str]:
+        if not self._storage:
+            return []
+        my_id: Optional[int] = None
+        try:
+            raw_id = self.get_self_id_sync(timeout=timeout)
+            if raw_id:
+                my_id = int(raw_id)
+        except Exception:
+            my_id = None
+        try:
+            return self._storage.get_recent_emojis(limit=max(1, int(limit)), sender_id=my_id)
+        except Exception:
+            return []
+
+    def get_chat_full_info_sync(self, chat_id: str, timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+        if not (self._enabled and self._client and self._loop):
+            return None
+
+        async def _run() -> Optional[Dict[str, Any]]:
+            chat = await self._client.get_chat(int(chat_id))
+            if not chat:
+                return None
+            try:
+                cid = int(getattr(chat, "id"))
+            except Exception:
+                return None
+            ctype = getattr(chat, "type", None)
+            if hasattr(ctype, "name"):
+                ctype = (ctype.name or "").lower()
+            else:
+                ctype = str(ctype or "").lower()
+            username = str(getattr(chat, "username", "") or "").strip()
+            title = (
+                str(getattr(chat, "title", None) or "").strip()
+                or " ".join(
+                    [
+                        str(getattr(chat, "first_name", "") or "").strip(),
+                        str(getattr(chat, "last_name", "") or "").strip(),
+                    ]
+                ).strip()
+                or username
+                or str(cid)
+            )
+            about = str(
+                getattr(chat, "bio", None)
+                or getattr(chat, "description", None)
+                or getattr(chat, "about", None)
+                or ""
+            ).strip()
+            members = getattr(chat, "members_count", None)
+            try:
+                members_count = int(members) if members is not None else None
+            except Exception:
+                members_count = None
+            photo = getattr(chat, "photo", None)
+            photo_small = getattr(photo, "small_file_id", None) if photo else None
+            photo_big = getattr(photo, "big_file_id", None) if photo else None
+            available_reactions: List[str] = []
+            for item in list(getattr(chat, "available_reactions", None) or []):
+                try:
+                    emoji = str(getattr(item, "emoji", None) or "").strip()
+                except Exception:
+                    emoji = ""
+                if emoji:
+                    available_reactions.append(emoji)
+            return {
+                "id": str(cid),
+                "title": title,
+                "type": ctype or "chat",
+                "username": username,
+                "about": about,
+                "members_count": members_count,
+                "phone": str(getattr(chat, "phone_number", None) or getattr(chat, "phone", None) or ""),
+                "is_verified": bool(getattr(chat, "is_verified", False)),
+                "is_scam": bool(getattr(chat, "is_scam", False)),
+                "is_fake": bool(getattr(chat, "is_fake", False)),
+                "is_restricted": bool(getattr(chat, "is_restricted", False)),
+                "is_premium": bool(getattr(chat, "is_premium", False)),
+                "is_creator": bool(getattr(chat, "is_creator", False)),
+                "photo_small_id": photo_small,
+                "photo_big_id": photo_big,
+                "available_reactions": available_reactions,
+            }
+
+        try:
+            return self._call(_run(), timeout)
+        except Exception:
+            return None
 
     def create_group_sync(self, title: str, users: List[str], timeout: float = 20.0) -> Optional[str]:
         if not (self._enabled and self._client and self._loop):
@@ -1552,12 +1767,13 @@ class TelegramAdapter:
         first = getattr(user, "first_name", "") or ""
         last = getattr(user, "last_name", "") or ""
         title = username or f"{first} {last}".strip() or str(uid)
+        is_bot = bool(getattr(user, "is_bot", False))
         photo = getattr(user, "photo", None)
         photo_small = getattr(photo, "small_file_id", None) if photo else None
         photo_big = getattr(photo, "big_file_id", None) if photo else None
         return {
             "id": uid,
-            "type": "user",
+            "type": "bot" if is_bot else "private",
             "username": username or None,
             "title": title,
             "photo_small": photo_small,
@@ -1632,6 +1848,9 @@ class TelegramAdapter:
         media_group_id = self._extract_media_group_id(message)
         forward_info = self._extract_forward_info(message)
         file_name = self._extract_file_name(message)
+        reactions = self._extract_reactions(message)
+        poll = self._extract_poll(message)
+        views, forwards = self._extract_message_counters(message)
         entities = self._entities_to_dicts(
             getattr(message, "entities", None) if media_type == "text" else getattr(message, "caption_entities", None)
         )
@@ -1652,6 +1871,10 @@ class TelegramAdapter:
             "entities": entities,
             "duration": duration,
             "waveform": waveform,
+            "reactions": reactions,
+            "poll": poll,
+            "views": views,
+            "forwards": forwards,
             "media_group_id": media_group_id,
         }
 
@@ -1775,6 +1998,92 @@ class TelegramAdapter:
         return "text", None, None, None, None, None
 
     @staticmethod
+    def _extract_message_counters(message: "Message") -> Tuple[Optional[int], Optional[int]]:
+        views = getattr(message, "views", None)
+        forwards = getattr(message, "forwards", None)
+        try:
+            views_int = int(views) if views is not None else None
+        except Exception:
+            views_int = None
+        try:
+            forwards_int = int(forwards) if forwards is not None else None
+        except Exception:
+            forwards_int = None
+        return views_int, forwards_int
+
+    def _extract_reactions(self, message: "Message") -> Optional[List[Dict[str, Any]]]:
+        raw = getattr(message, "reactions", None)
+        if not raw:
+            return None
+        items = getattr(raw, "reactions", None)
+        if not items:
+            return None
+        out: List[Dict[str, Any]] = []
+        for reaction in items:
+            try:
+                emoji = str(getattr(reaction, "emoji", None) or "").strip()
+                custom_id = getattr(reaction, "custom_emoji_id", None)
+                count = int(getattr(reaction, "count", 0) or 0)
+                chosen_order = getattr(reaction, "chosen_order", None)
+                payload: Dict[str, Any] = {
+                    "emoji": emoji or None,
+                    "custom_emoji_id": int(custom_id) if custom_id is not None else None,
+                    "count": count,
+                    "chosen_order": int(chosen_order) if chosen_order is not None else None,
+                }
+                payload["title"] = emoji or (f"custom:{payload['custom_emoji_id']}" if payload["custom_emoji_id"] else "")
+                out.append(payload)
+            except Exception:
+                continue
+        return out or None
+
+    def _extract_poll(self, message: "Message") -> Optional[Dict[str, Any]]:
+        poll = getattr(message, "poll", None)
+        if not poll:
+            return None
+        options_out: List[Dict[str, Any]] = []
+        for option in list(getattr(poll, "options", None) or []):
+            try:
+                options_out.append(
+                    {
+                        "text": str(getattr(option, "text", None) or ""),
+                        "voter_count": int(getattr(option, "voter_count", 0) or 0),
+                    }
+                )
+            except Exception:
+                continue
+        explanation_entities = self._entities_to_dicts(getattr(poll, "explanation_entities", None))
+        close_date = getattr(poll, "close_date", None)
+        try:
+            close_date_ts = int(close_date.timestamp()) if close_date else None
+        except Exception:
+            close_date_ts = None
+        try:
+            chosen_option_id = int(getattr(poll, "chosen_option_id", None))
+        except Exception:
+            chosen_option_id = None
+        try:
+            correct_option_id = int(getattr(poll, "correct_option_id", None))
+        except Exception:
+            correct_option_id = None
+        return {
+            "id": str(getattr(poll, "id", None) or ""),
+            "question": str(getattr(poll, "question", None) or ""),
+            "total_voter_count": int(getattr(poll, "total_voter_count", 0) or 0),
+            "is_closed": bool(getattr(poll, "is_closed", False)),
+            "is_anonymous": bool(getattr(poll, "is_anonymous", True)),
+            "type": str(getattr(getattr(poll, "type", None), "name", None) or getattr(poll, "type", None) or ""),
+            "allows_multiple_answers": bool(getattr(poll, "allows_multiple_answers", False)),
+            "chosen_option_id": chosen_option_id,
+            "correct_option_id": correct_option_id,
+            "explanation": str(getattr(poll, "explanation", None) or ""),
+            "explanation_entities": explanation_entities,
+            "open_period": getattr(poll, "open_period", None),
+            "close_date": close_date_ts,
+            "options": options_out,
+        }
+
+    @staticmethod
     def _extract_media_group_id(message: "Message") -> Optional[str]:
         raw = getattr(message, "media_group_id", None)
         if raw is None:
@@ -1809,6 +2118,7 @@ class TelegramAdapter:
                     "bot_command": "bot_command",
                     "phone_number": "url",
                     "blockquote": "blockquote",
+                    "custom_emoji": "custom_emoji",
                 }
                 etype = mapping.get(key)
                 if not etype:
@@ -1827,6 +2137,9 @@ class TelegramAdapter:
                     user_id = getattr(user_obj, "id", None)
                     if user_id:
                         payload["url"] = f"tg://user?id={int(user_id)}"
+                custom_emoji_id = getattr(ent, "custom_emoji_id", None)
+                if etype == "custom_emoji" and custom_emoji_id:
+                    payload["custom_emoji_id"] = int(custom_emoji_id)
                 language = getattr(ent, "language", None)
                 if etype == "pre" and language:
                     payload["language"] = str(language)
@@ -1931,33 +2244,44 @@ class TelegramAdapter:
     ) -> Optional[str]:
         if not (self._client and self._avatar_dir):
             return None
-        target_id = file_id
-        if not target_id:
-            try:
-                target_id = await fetcher()
-            except Exception:
-                target_id = None
-        if not target_id:
-            return None
 
-        digest = hashlib.sha1(f"{target_id}:{size}".encode("utf-8", "ignore")).hexdigest()
-        dest = self._avatar_dir / f"{prefix}_{digest}.jpg"
-        if dest.exists():
-            return str(dest)
+        async def _try_download(target_id: str) -> Optional[str]:
+            digest = hashlib.sha1(f"{target_id}:{size}".encode("utf-8", "ignore")).hexdigest()
+            dest = self._avatar_dir / f"{prefix}_{digest}.jpg"
+            if dest.exists():
+                return str(dest)
+
+            try:
+                result_path = await self._client.download_media(target_id, file_name=str(dest))
+                if not result_path:
+                    return None
+                if isinstance(result_path, str) and result_path != str(dest):
+                    return str(Path(result_path))
+                return str(dest)
+            except Exception as exc:
+                log.debug("[TG] avatar download failed (%s): %s", prefix, exc)
+                if dest.exists():
+                    with contextlib.suppress(Exception):
+                        dest.unlink()
+                return None
+
+        # ChatPhoto/UserProfilePhoto file_id is only valid while the photo doesn't change.
+        # Also, access hashes can become invalid across sessions/accounts. If a cached file_id
+        # fails, fall back to resolving a fresh one by entity id.
+        target_id = str(file_id or "").strip()
+        if target_id:
+            path = await _try_download(target_id)
+            if path:
+                return path
 
         try:
-            result_path = await self._client.download_media(target_id, file_name=str(dest))
-            if not result_path:
-                return None
-            if result_path != str(dest):
-                dest = Path(result_path)
-            return str(dest)
-        except Exception as exc:
-            log.debug("[TG] avatar download failed (%s): %s", prefix, exc)
-            if dest.exists():
-                with contextlib.suppress(Exception):
-                    dest.unlink()
+            fresh_id = await fetcher()
+        except Exception:
+            fresh_id = None
+        fresh_norm = str(fresh_id or "").strip()
+        if not fresh_norm or fresh_norm == target_id:
             return None
+        return await _try_download(fresh_norm)
 
     async def _ensure_chat_avatar(self, chat_id: str, *, file_id: Optional[str], size: str) -> Optional[str]:
         if not self._client:
@@ -2626,6 +2950,62 @@ class TelegramAdapter:
         """Отправить стикер по file_id (из наборов/недавних)."""
         return bool(self.send_sticker_id_with_id_sync(chat_id, sticker_file_id, reply_to=reply_to, timeout=timeout))
 
+    def send_animation_id_with_id_sync(
+        self,
+        chat_id: str,
+        animation_file_id: str,
+        *,
+        caption: str | None = None,
+        reply_to: int | None = None,
+        timeout: float = 30.0,
+    ) -> Optional[int]:
+        """Отправить GIF/анимацию по file_id и вернуть message_id."""
+        if not (self._enabled and self._client and self._loop):
+            return None
+        fid = str(animation_file_id or "").strip()
+        if not fid:
+            return None
+
+        async def _send() -> Optional[int]:
+            try:
+                kwargs: Dict[str, Any] = {}
+                if caption:
+                    kwargs["caption"] = caption
+                if reply_to is not None:
+                    kwargs["reply_to_message_id"] = int(reply_to)
+                msg_obj = await self._client.send_animation(int(chat_id), fid, **kwargs)
+                mid = int(getattr(msg_obj, "id", 0) or 0) if msg_obj is not None else 0
+                if mid:
+                    self._remember_local_outgoing(mid)
+                    return mid
+                return None
+            except Exception:
+                return None
+
+        try:
+            return self._call(_send(), timeout)
+        except Exception:
+            return None
+
+    def send_animation_id_sync(
+        self,
+        chat_id: str,
+        animation_file_id: str,
+        *,
+        caption: str | None = None,
+        reply_to: int | None = None,
+        timeout: float = 30.0,
+    ) -> bool:
+        return bool(
+            self.send_animation_id_with_id_sync(
+                chat_id=chat_id,
+                animation_file_id=animation_file_id,
+                caption=caption,
+                reply_to=reply_to,
+                timeout=timeout,
+            )
+        )
+
     def send_animation_sync(
             self,
             chat_id: str,
@@ -2739,6 +3119,74 @@ class TelegramAdapter:
                             "doc_id": did,
                             "emoji": emoticons.get(did, ""),
                             "mime": mime,
+                        }
+                    )
+                except Exception:
+                    continue
+            return out
+
+        try:
+            return list(self._call(_run(), timeout) or [])
+        except Exception:
+            return []
+
+    def get_saved_gifs_sync(self, limit: int = 32, timeout: float = 15.0) -> List[Dict[str, Any]]:
+        """История сохранённых GIF/анимаций (raw GetSavedGifs)."""
+        if not (self._enabled and self._client and self._loop):
+            return []
+        try:
+            limit_int = max(1, min(int(limit or 32), 80))
+        except Exception:
+            limit_int = 32
+
+        async def _run() -> List[Dict[str, Any]]:
+            try:
+                res = await self._client.invoke(raw_fn.messages.GetSavedGifs(hash=0))
+            except Exception:
+                return []
+            if isinstance(res, raw_types.messages.SavedGifsNotModified):
+                return []
+            docs = list(getattr(res, "gifs", None) or [])
+            try:
+                from pyrogram.file_id import FileId, FileType
+            except Exception:
+                return []
+            out: List[Dict[str, Any]] = []
+            for doc in docs:
+                if len(out) >= limit_int:
+                    break
+                try:
+                    did = int(getattr(doc, "id", 0) or 0)
+                    if did <= 0:
+                        continue
+                    fid = FileId(
+                        file_type=FileType.ANIMATION,
+                        dc_id=int(getattr(doc, "dc_id", 0) or 0),
+                        media_id=did,
+                        access_hash=int(getattr(doc, "access_hash", 0) or 0),
+                        file_reference=bytes(getattr(doc, "file_reference", b"") or b""),
+                    ).encode()
+                    mime = str(getattr(doc, "mime_type", "") or "")
+                    size = int(getattr(doc, "size", 0) or 0)
+                    width = 0
+                    height = 0
+                    for attr in list(getattr(doc, "attributes", None) or []):
+                        try:
+                            w_val = int(getattr(attr, "w", 0) or 0)
+                            h_val = int(getattr(attr, "h", 0) or 0)
+                        except Exception:
+                            continue
+                        if w_val > 0 and h_val > 0:
+                            width, height = w_val, h_val
+                            break
+                    out.append(
+                        {
+                            "file_id": fid,
+                            "doc_id": did,
+                            "mime": mime,
+                            "size": size,
+                            "width": width,
+                            "height": height,
                         }
                     )
                 except Exception:
@@ -2945,6 +3393,9 @@ class TelegramAdapter:
             out: List[Dict[str, Any]] = []
             async for m in self._client.get_chat_history(int(chat_id), limit=limit):
                 media_type, _media_id, file_size, _mime, duration, waveform = self._extract_media_meta(m)
+                reactions = self._extract_reactions(m)
+                poll = self._extract_poll(m)
+                views, forwards = self._extract_message_counters(m)
                 item = {
                     "id": m.id,
                     "date": int(m.date.timestamp()) if m.date else None,
@@ -2965,6 +3416,10 @@ class TelegramAdapter:
                     "is_deleted": False,
                     "duration": int(duration) if duration else None,
                     "waveform": waveform,
+                    "reactions": reactions,
+                    "poll": poll,
+                    "views": views,
+                    "forwards": forwards,
                     "media_group_id": self._extract_media_group_id(m),
                 }
 

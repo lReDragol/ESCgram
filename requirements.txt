@@ -3,6 +3,7 @@ PySide6>=6.6
 requests>=2.31
 cryptography>=41
 Pillow>=10.0
+emoji>=2.12
 
 # Telegram (optional but recommended)
 pyrogram>=2.0.106

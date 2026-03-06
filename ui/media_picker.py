@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QPoint, Qt, QSignalBlocker, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon, QPixmap
@@ -21,13 +21,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui.emoji_picker import DEFAULT_EMOJIS
-from ui.sticker_workers import RecentStickersWorker, StickerSetItemsWorker, StickerSetsWorker, StickerThumbWorker
+from ui.emoji_picker import DEFAULT_EMOJIS, load_all_emojis
+from ui.sticker_workers import (
+    RecentStickersWorker,
+    SavedGifsWorker,
+    StickerSetItemsWorker,
+    StickerSetsWorker,
+    StickerThumbWorker,
+)
 
 
 class MediaPickerPopup(QFrame):
     emojiSelected = Signal(str)
     stickerSelected = Signal(str)
+    gifSelected = Signal(str)
     gifPickRequested = Signal()
 
     def __init__(self, tg_adapter: Any, parent: Optional[QWidget] = None) -> None:
@@ -55,10 +62,15 @@ class MediaPickerPopup(QFrame):
         self._items_worker: Optional[StickerSetItemsWorker] = None
         self._thumb_worker: Optional[StickerThumbWorker] = None
         self._thumb_tasks: List[tuple[str, str]] = []
+        self._gifs_thread: Optional[QThread] = None
+        self._gifs_worker: Optional[SavedGifsWorker] = None
 
         self._recent_stickers: List[Dict[str, Any]] = []
         self._current_stickers: List[Dict[str, Any]] = []
         self._sticker_buttons: Dict[str, QToolButton] = {}
+        self._recent_emojis: List[str] = []
+        self._emoji_catalog: Sequence[str] = tuple(load_all_emojis())
+        self._recent_gifs: List[Dict[str, Any]] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -78,6 +90,8 @@ class MediaPickerPopup(QFrame):
         super().showEvent(event)
         # Resume any pending thumbnail downloads when the popup becomes visible.
         QTimer.singleShot(0, self._start_next_thumb_batch)
+        QTimer.singleShot(0, self._refresh_recent_emojis)
+        QTimer.singleShot(0, self._refresh_saved_gifs_async)
 
     # ------------------------------------------------------------------ #
     # Popup positioning
@@ -95,18 +109,100 @@ class MediaPickerPopup(QFrame):
 
     def _build_emoji_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QGridLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-        cols = 9
-        for idx, emoji in enumerate(DEFAULT_EMOJIS):
-            btn = QToolButton(tab)
-            btn.setText(str(emoji))
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, e=str(emoji): self._select_emoji(e))
-            layout.addWidget(btn, idx // cols, idx % cols)
-        layout.setRowStretch((len(DEFAULT_EMOJIS) // cols) + 1, 1)
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        self._emoji_status = QLabel("Недавние эмодзи из Telegram")
+        self._emoji_status.setStyleSheet("color:#8fa8c5;font-size:11px;")
+        root.addWidget(self._emoji_status, 0)
+
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget(scroll)
+        self._emoji_grid = QGridLayout(container)
+        self._emoji_grid.setContentsMargins(0, 0, 0, 0)
+        self._emoji_grid.setSpacing(4)
+        scroll.setWidget(container)
+        root.addWidget(scroll, 1)
+        self._populate_emoji_grid()
         return tab
+
+    def _refresh_recent_emojis(self) -> None:
+        tg = self.tg
+        if not tg or not hasattr(tg, "get_recent_emojis_sync"):
+            self._recent_emojis = []
+            self._populate_emoji_grid()
+            return
+        try:
+            recent = list(tg.get_recent_emojis_sync(limit=36) or [])
+        except Exception:
+            recent = []
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for emoji in recent:
+            value = str(emoji or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            cleaned.append(value)
+        self._recent_emojis = cleaned
+        self._populate_emoji_grid()
+
+    def _populate_emoji_grid(self) -> None:
+        grid = getattr(self, "_emoji_grid", None)
+        if grid is None:
+            return
+        while grid.count():
+            item = grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        merged: List[str] = []
+        source = list(self._emoji_catalog) if self._emoji_catalog else list(DEFAULT_EMOJIS)
+        for emoji in list(self._recent_emojis) + source:
+            value = str(emoji or "").strip()
+            if not value or value in merged:
+                continue
+            merged.append(value)
+
+        cols = 9
+        row = 0
+        if self._recent_emojis:
+            recent_lbl = QLabel("Недавние")
+            recent_lbl.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
+            grid.addWidget(recent_lbl, row, 0, 1, cols)
+            row += 1
+            for idx, emoji in enumerate(self._recent_emojis):
+                btn = self._make_emoji_button(emoji)
+                grid.addWidget(btn, row + (idx // cols), idx % cols)
+            row += (len(self._recent_emojis) + cols - 1) // cols
+            all_lbl = QLabel("Все эмодзи")
+            all_lbl.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
+            grid.addWidget(all_lbl, row, 0, 1, cols)
+            row += 1
+
+        start_index = len(self._recent_emojis)
+        for idx, emoji in enumerate(merged[start_index:]):
+            btn = self._make_emoji_button(emoji)
+            grid.addWidget(btn, row + (idx // cols), idx % cols)
+        grid.setRowStretch(row + ((max(0, len(merged) - start_index) + cols - 1) // cols) + 1, 1)
+        status = getattr(self, "_emoji_status", None)
+        if status is not None:
+            if self._recent_emojis:
+                status.setText(f"Недавние из Telegram: {len(self._recent_emojis)}")
+            else:
+                status.setText("Недавние эмодзи пока не найдены, показан полный набор")
+
+    def _make_emoji_button(self, emoji: str) -> QToolButton:
+        btn = QToolButton(self)
+        btn.setText(str(emoji))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, e=str(emoji): self._select_emoji(e))
+        return btn
 
     def _select_emoji(self, emoji: str) -> None:
         self.emojiSelected.emit(str(emoji))
@@ -459,11 +555,86 @@ class MediaPickerPopup(QFrame):
         root = QVBoxLayout(tab)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(10)
-        hint = QLabel("GIF пока отправляется как файл с диска.")
-        hint.setStyleSheet("color:#9fa6b1;font-size:11px;")
-        root.addWidget(hint)
+        self.gif_status = QLabel("Загрузка истории GIF…")
+        self.gif_status.setStyleSheet("color:#9fa6b1;font-size:11px;")
+        root.addWidget(self.gif_status)
+        self.gif_scroll = QScrollArea()
+        self.gif_scroll.setWidgetResizable(True)
+        self.gif_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gif_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        gif_container = QWidget()
+        self._gif_grid = QGridLayout(gif_container)
+        self._gif_grid.setContentsMargins(0, 0, 0, 0)
+        self._gif_grid.setSpacing(6)
+        self.gif_scroll.setWidget(gif_container)
+        root.addWidget(self.gif_scroll, 1)
         btn = QPushButton("Выбрать GIF…")
         btn.clicked.connect(lambda: self.gifPickRequested.emit())
         root.addWidget(btn, 0, Qt.AlignmentFlag.AlignLeft)
-        root.addStretch(1)
+        self._populate_gif_grid([])
         return tab
+
+    def _refresh_saved_gifs_async(self) -> None:
+        if not (self.tg and hasattr(self.tg, "is_authorized_sync") and self.tg.is_authorized_sync()):
+            self._recent_gifs = []
+            self._populate_gif_grid([])
+            if hasattr(self, "gif_status"):
+                self.gif_status.setText("Telegram недоступен или нет авторизации")
+            return
+        thread = getattr(self, "_gifs_thread", None)
+        if thread is not None and thread.isRunning():
+            return
+        if hasattr(self, "gif_status"):
+            self.gif_status.setText("Загружаю историю GIF…")
+        thread = QThread(self)
+        worker = SavedGifsWorker(self.tg, limit=30)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_saved_gifs_loaded)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._gifs_thread = thread
+        self._gifs_worker = worker
+        thread.start()
+
+    def _on_saved_gifs_loaded(self, rows: list) -> None:
+        self._gifs_worker = None
+        try:
+            self._recent_gifs = [dict(r) for r in list(rows or []) if isinstance(r, dict)]
+        except Exception:
+            self._recent_gifs = []
+        self._populate_gif_grid(self._recent_gifs)
+        if hasattr(self, "gif_status"):
+            if self._recent_gifs:
+                self.gif_status.setText(f"Недавние GIF: {len(self._recent_gifs)}")
+            else:
+                self.gif_status.setText("История GIF пуста — можно отправить файл с диска")
+
+    def _populate_gif_grid(self, rows: List[Dict[str, Any]]) -> None:
+        grid = getattr(self, "_gif_grid", None)
+        if grid is None:
+            return
+        while grid.count():
+            item = grid.takeAt(0)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widget.deleteLater()
+        cols = 3
+        for idx, row in enumerate(list(rows or [])):
+            file_id = str(row.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            size = int(row.get("size") or 0)
+            size_kb = max(0, size // 1024)
+            label = "GIF"
+            if size_kb > 0:
+                label = f"GIF\n{size_kb} KB"
+            btn = QToolButton(self)
+            btn.setText(label)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip("Отправить из истории")
+            btn.setFixedSize(84, 54)
+            btn.clicked.connect(lambda _=False, fid=file_id: self.gifSelected.emit(str(fid)))
+            grid.addWidget(btn, idx // cols, idx % cols)
+        grid.setRowStretch((len(rows) // cols) + 1, 1)

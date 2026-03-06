@@ -93,7 +93,7 @@ class SettingsWindow(QDialog):
         self,
         *,
         state: Dict[str, bool],
-        callbacks: Dict[str, Callable[[bool], None]],
+        callbacks: Dict[str, Callable[..., Any]],
         ai_state: Optional[Dict[str, Any]] = None,
         ai_callbacks: Optional[Dict[str, Callable[[Dict[str, Any]], None]]] = None,
         parent=None,
@@ -165,7 +165,7 @@ class SettingsWindow(QDialog):
         except Exception:
             return False
 
-    def _build_general_tab(self, state: Dict[str, bool], callbacks: Dict[str, Callable[[bool], None]]) -> QWidget:
+    def _build_general_tab(self, state: Dict[str, bool], callbacks: Dict[str, Callable[..., Any]]) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -222,6 +222,23 @@ class SettingsWindow(QDialog):
         )
         gen_form.addRow("Сохранять удалённые сообщения:", self.chk_keep_deleted)
         layout.addWidget(general)
+
+        media_box = QGroupBox("Медиа-инструменты")
+        media_layout = QVBoxLayout(media_box)
+        ffmpeg_hint = QLabel(
+            "ffmpeg нужен для конвертации голосовых и кружков. "
+            "Кнопка установит его в папку данных Telegram."
+        )
+        ffmpeg_hint.setWordWrap(True)
+        media_layout.addWidget(ffmpeg_hint)
+        self.btn_install_ffmpeg = QPushButton("Установить ffmpeg")
+        ffmpeg_cb = callbacks.get("install_ffmpeg")
+        if callable(ffmpeg_cb):
+            self.btn_install_ffmpeg.clicked.connect(lambda: ffmpeg_cb())
+        else:
+            self.btn_install_ffmpeg.setEnabled(False)
+        media_layout.addWidget(self.btn_install_ffmpeg, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(media_box)
 
         theme_box = QGroupBox("Тема оформления")
         theme_layout = QVBoxLayout(theme_box)

@@ -9,6 +9,7 @@ import shutil
 from html import escape
 from typing import Optional, Dict, Any, Callable, List, Sequence, Tuple
 from weakref import WeakSet
+from utils import app_paths
 
 from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot
 from PySide6.QtGui import QDesktopServices, QPainter, QColor, QMouseEvent, QPainterPath, QPen
@@ -37,6 +38,17 @@ if HAVE_QTMULTIMEDIA:
     from PySide6.QtMultimedia import QMediaPlayer
 else:  # pragma: no cover
     QMediaPlayer = object  # type: ignore[assignment]
+
+
+def _resolve_ffmpeg_binary() -> Optional[str]:
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    try:
+        local = app_paths.telegram_workdir() / "ffmpeg" / "bin" / exe
+        if local.is_file():
+            return str(local)
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
 
 import string
 
@@ -1713,7 +1725,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             return
 
         # Decode to WAV in background via ffmpeg.
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = _resolve_ffmpeg_binary()
         if not ffmpeg:
             self._set_voice_status("ffmpeg не найден — воспроизведение голосовых недоступно.")
             return

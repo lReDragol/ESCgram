@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import threading
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -27,6 +29,14 @@ DEFAULT_DB_PATH = os.getenv("DRAGO_DB_PATH", os.path.join(DEFAULT_DB_DIR, "drago
 # Рекомендованные параметры кеша (≈64 MiB) и mmap (≈256 MiB) — безопасные дефолты для desktop
 CACHE_PAGES_KIB = 64 * 1024    # PRAGMA cache_size = -65536  (отрицательное -> KiB)
 MMAP_SIZE_BYTES = 256 * 1024 * 1024
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "]",
+    re.UNICODE,
+)
 
 
 @dataclass
@@ -212,8 +222,24 @@ class Storage:
               entities     TEXT,
               duration     INTEGER,
               waveform     TEXT,
+              reactions    TEXT,
+              poll         TEXT,
+              views        INTEGER,
+              forwards     INTEGER,
               media_group_id TEXT,
               PRIMARY KEY (peer_id, id)
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS deleted_message_events (
+              peer_id        INTEGER NOT NULL,
+              message_id     INTEGER NOT NULL,
+              deleted_at     INTEGER NOT NULL,
+              snapshot_text  TEXT,
+              media_type     TEXT,
+              sender_id      INTEGER,
+              source         TEXT,
+              PRIMARY KEY (peer_id, message_id)
             );
             """,
             # files: медиа-кэш по file_id (в т.ч. avatar/media пути)
@@ -244,6 +270,7 @@ class Storage:
             """,
             "CREATE INDEX IF NOT EXISTS idx_messages_peer_date ON messages(peer_id, date DESC);",
             "CREATE INDEX IF NOT EXISTS idx_messages_peer_id   ON messages(peer_id, id DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_deleted_events_peer_date ON deleted_message_events(peer_id, deleted_at DESC);",
             "CREATE INDEX IF NOT EXISTS idx_ai_history_chat_id ON ai_history(chat_id, id DESC);",
         ]
         with self._lock:
@@ -271,6 +298,22 @@ class Storage:
                 pass
             try:
                 self._exec("ALTER TABLE messages ADD COLUMN waveform TEXT")
+            except Exception:
+                pass
+            try:
+                self._exec("ALTER TABLE messages ADD COLUMN reactions TEXT")
+            except Exception:
+                pass
+            try:
+                self._exec("ALTER TABLE messages ADD COLUMN poll TEXT")
+            except Exception:
+                pass
+            try:
+                self._exec("ALTER TABLE messages ADD COLUMN views INTEGER")
+            except Exception:
+                pass
+            try:
+                self._exec("ALTER TABLE messages ADD COLUMN forwards INTEGER")
             except Exception:
                 pass
             try:
@@ -433,6 +476,40 @@ class Storage:
             except Exception:
                 duration_int = None
 
+            reactions_raw = m.get("reactions")
+            if isinstance(reactions_raw, str):
+                reactions_serialized = reactions_raw
+            elif reactions_raw is not None:
+                try:
+                    reactions_serialized = json.dumps(reactions_raw, ensure_ascii=False)
+                except Exception:
+                    reactions_serialized = None
+            else:
+                reactions_serialized = None
+
+            poll_raw = m.get("poll")
+            if isinstance(poll_raw, str):
+                poll_serialized = poll_raw
+            elif poll_raw is not None:
+                try:
+                    poll_serialized = json.dumps(poll_raw, ensure_ascii=False)
+                except Exception:
+                    poll_serialized = None
+            else:
+                poll_serialized = None
+
+            views_val = m.get("views")
+            try:
+                views_int = int(views_val) if views_val is not None else None
+            except Exception:
+                views_int = None
+
+            forwards_val = m.get("forwards")
+            try:
+                forwards_int = int(forwards_val) if forwards_val is not None else None
+            except Exception:
+                forwards_int = None
+
             m_rows.append((
                 int(peer_id),
                 mid,
@@ -448,6 +525,10 @@ class Storage:
                 entities_serialized,
                 duration_int,
                 waveform_serialized,
+                reactions_serialized,
+                poll_serialized,
+                views_int,
+                forwards_int,
                 (str(m.get("media_group_id") or "").strip() or None),
             ))
 
@@ -468,8 +549,8 @@ class Storage:
         if m_rows:
             self._execmany(
                 """
-                INSERT INTO messages(peer_id,id,date,from_id,reply_to,message,media_type,media_id,is_deleted,forward_info,file_name,entities,duration,waveform,media_group_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO messages(peer_id,id,date,from_id,reply_to,message,media_type,media_id,is_deleted,forward_info,file_name,entities,duration,waveform,reactions,poll,views,forwards,media_group_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(peer_id,id) DO UPDATE SET
                   date=excluded.date,
                   from_id=COALESCE(excluded.from_id, messages.from_id),
@@ -486,6 +567,10 @@ class Storage:
                   entities=COALESCE(excluded.entities, messages.entities),
                   duration=COALESCE(excluded.duration, messages.duration),
                   waveform=COALESCE(excluded.waveform, messages.waveform),
+                  reactions=COALESCE(excluded.reactions, messages.reactions),
+                  poll=COALESCE(excluded.poll, messages.poll),
+                  views=COALESCE(excluded.views, messages.views),
+                  forwards=COALESCE(excluded.forwards, messages.forwards),
                   media_group_id=COALESCE(excluded.media_group_id, messages.media_group_id)
                 """,
                 m_rows,
@@ -543,6 +628,62 @@ class Storage:
             return
         self._execmany(
             "UPDATE messages SET is_deleted=? WHERE peer_id=? AND id=?",
+            rows,
+        )
+
+    def log_deleted_messages(
+        self,
+        peer_id: int,
+        message_ids: Iterable[int],
+        *,
+        deleted_at: Optional[int] = None,
+        source: str = "telegram",
+    ) -> None:
+        deleted_ts = int(deleted_at or self._now())
+        mids: List[int] = []
+        seen: set[int] = set()
+        for mid in message_ids:
+            try:
+                val = int(mid)
+            except Exception:
+                continue
+            if val <= 0 or val in seen:
+                continue
+            seen.add(val)
+            mids.append(val)
+        if not mids:
+            return
+        snapshots = self.get_messages_by_ids(int(peer_id), mids)
+        rows: List[Tuple[Any, ...]] = []
+        for mid in mids:
+            item = snapshots.get(mid, {})
+            rows.append(
+                (
+                    int(peer_id),
+                    mid,
+                    deleted_ts,
+                    str(item.get("text") or ""),
+                    str(item.get("type") or "text"),
+                    int(item.get("from_id")) if item.get("from_id") is not None else None,
+                    str(source or "telegram"),
+                )
+            )
+        if not rows:
+            return
+        self._execmany(
+            """
+            INSERT INTO deleted_message_events(peer_id,message_id,deleted_at,snapshot_text,media_type,sender_id,source)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(peer_id,message_id) DO UPDATE SET
+              deleted_at=excluded.deleted_at,
+              snapshot_text=CASE
+                WHEN excluded.snapshot_text <> '' THEN excluded.snapshot_text
+                ELSE deleted_message_events.snapshot_text
+              END,
+              media_type=COALESCE(excluded.media_type, deleted_message_events.media_type),
+              sender_id=COALESCE(excluded.sender_id, deleted_message_events.sender_id),
+              source=COALESCE(excluded.source, deleted_message_events.source)
+            """,
             rows,
         )
 
@@ -606,6 +747,10 @@ class Storage:
               COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
               m.duration,
               m.waveform,
+              m.reactions,
+              m.poll,
+              m.views,
+              m.forwards,
               m.media_group_id
             FROM messages m
             LEFT JOIN files f
@@ -645,6 +790,22 @@ class Storage:
                     waveform = None
             else:
                 waveform = None
+            reactions_raw = r[17]
+            if reactions_raw:
+                try:
+                    reactions = json.loads(reactions_raw)
+                except Exception:
+                    reactions = None
+            else:
+                reactions = None
+            poll_raw = r[18]
+            if poll_raw:
+                try:
+                    poll = json.loads(poll_raw)
+                except Exception:
+                    poll = None
+            else:
+                poll = None
             out.append({
                 "id": int(r[0]),
                 "date": int(r[1]),
@@ -665,7 +826,11 @@ class Storage:
                 "thumb_path": None,
                 "duration": r[15],
                 "waveform": waveform,
-                "media_group_id": r[17],
+                "reactions": reactions,
+                "poll": poll,
+                "views": r[19],
+                "forwards": r[20],
+                "media_group_id": r[21],
             })
         return out
 
@@ -685,6 +850,10 @@ class Storage:
               COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
               m.duration,
               m.waveform,
+              m.reactions,
+              m.poll,
+              m.views,
+              m.forwards,
               m.media_group_id
             FROM messages m
             LEFT JOIN peers p
@@ -721,6 +890,22 @@ class Storage:
                 waveform = None
         else:
             waveform = None
+        reactions_raw = r[12]
+        if reactions_raw:
+            try:
+                reactions = json.loads(reactions_raw)
+            except Exception:
+                reactions = None
+        else:
+            reactions = None
+        poll_raw = r[13]
+        if poll_raw:
+            try:
+                poll = json.loads(poll_raw)
+            except Exception:
+                poll = None
+        else:
+            poll = None
         return {
             "id": int(r[0]),
             "from_id": r[1],
@@ -734,8 +919,121 @@ class Storage:
             "sender": r[9] or (str(r[1]) if r[1] is not None else ""),
             "duration": r[10],
             "waveform": waveform,
-            "media_group_id": r[12],
+            "reactions": reactions,
+            "poll": poll,
+            "views": r[14],
+            "forwards": r[15],
+            "media_group_id": r[16],
         }
+
+    def get_messages_by_ids(self, peer_id: int, message_ids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
+        mids: List[int] = []
+        seen: set[int] = set()
+        for mid in message_ids:
+            try:
+                val = int(mid)
+            except Exception:
+                continue
+            if val <= 0 or val in seen:
+                continue
+            seen.add(val)
+            mids.append(val)
+        if not mids:
+            return {}
+        placeholders = ",".join(["?"] * len(mids))
+        rows = self._query(
+            f"""
+            SELECT
+              m.id,
+              m.from_id,
+              m.reply_to,
+              m.message,
+              m.media_type,
+              m.is_deleted,
+              m.forward_info,
+              m.file_name,
+              m.entities,
+              COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
+              m.duration,
+              m.waveform,
+              m.reactions,
+              m.poll,
+              m.views,
+              m.forwards,
+              m.media_group_id
+            FROM messages m
+            LEFT JOIN peers p
+              ON p.id = m.from_id
+            WHERE m.peer_id = ? AND m.id IN ({placeholders})
+            """,
+            (int(peer_id), *mids),
+        )
+        out: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            try:
+                mid = int(row[0])
+            except Exception:
+                continue
+            fwd_raw = row[6]
+            if fwd_raw:
+                try:
+                    forward_info = json.loads(fwd_raw)
+                except Exception:
+                    forward_info = {"sender": fwd_raw}
+            else:
+                forward_info = None
+            entities_raw = row[8]
+            if entities_raw:
+                try:
+                    entities = json.loads(entities_raw)
+                except Exception:
+                    entities = None
+            else:
+                entities = None
+            waveform_raw = row[11]
+            if waveform_raw:
+                try:
+                    waveform = json.loads(waveform_raw)
+                except Exception:
+                    waveform = None
+            else:
+                waveform = None
+            reactions_raw = row[12]
+            if reactions_raw:
+                try:
+                    reactions = json.loads(reactions_raw)
+                except Exception:
+                    reactions = None
+            else:
+                reactions = None
+            poll_raw = row[13]
+            if poll_raw:
+                try:
+                    poll = json.loads(poll_raw)
+                except Exception:
+                    poll = None
+            else:
+                poll = None
+            out[mid] = {
+                "id": mid,
+                "from_id": row[1],
+                "reply_to": row[2],
+                "text": row[3] or "",
+                "type": row[4] or "text",
+                "is_deleted": bool(row[5]),
+                "forward_info": forward_info,
+                "file_name": row[7],
+                "entities": entities,
+                "sender": row[9] or (str(row[1]) if row[1] is not None else ""),
+                "duration": row[10],
+                "waveform": waveform,
+                "reactions": reactions,
+                "poll": poll,
+                "views": row[14],
+                "forwards": row[15],
+                "media_group_id": row[16],
+            }
+        return out
 
     def find_peers_for_message_ids(self, message_ids: Iterable[int]) -> Dict[int, List[int]]:
         mids: List[int] = []
@@ -770,6 +1068,128 @@ class Storage:
                 continue
             out.setdefault(pid, []).append(mid)
         return out
+
+    def get_recent_emojis(self, *, limit: int = 48, sender_id: Optional[int] = None) -> List[str]:
+        params: List[Any] = []
+        sender_sql = ""
+        if sender_id is not None:
+            sender_sql = "AND COALESCE(from_id, 0) = ?"
+            params.append(int(sender_id))
+        params.append(int(max(limit * 40, 200)))
+        rows = self._query(
+            f"""
+            SELECT message
+            FROM messages
+            WHERE COALESCE(TRIM(message), '') <> '' {sender_sql}
+            ORDER BY date DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for (message_text,) in rows:
+            for match in EMOJI_RE.finditer(str(message_text or "")):
+                emoji = match.group(0)
+                if emoji in seen:
+                    continue
+                seen.add(emoji)
+                ordered.append(emoji)
+                if len(ordered) >= int(limit):
+                    return ordered
+        return ordered
+
+    def get_chat_statistics(self, peer_id: int, *, limit: int = 500) -> Dict[str, Any]:
+        rows = self._query(
+            """
+            SELECT
+              id,
+              media_type,
+              is_deleted,
+              reactions,
+              poll,
+              COALESCE(views, 0),
+              COALESCE(forwards, 0)
+            FROM messages
+            WHERE peer_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(limit, 1))),
+        )
+        total_messages = len(rows)
+        media_messages = 0
+        deleted_messages = 0
+        total_views = 0
+        total_forwards = 0
+        total_reactions = 0
+        reaction_counter: Counter[str] = Counter()
+        polls: List[Dict[str, Any]] = []
+        for _, media_type, is_deleted, reactions_raw, poll_raw, views, forwards in rows:
+            if str(media_type or "text") != "text":
+                media_messages += 1
+            if bool(is_deleted):
+                deleted_messages += 1
+            total_views += int(views or 0)
+            total_forwards += int(forwards or 0)
+            if reactions_raw:
+                try:
+                    reactions = json.loads(reactions_raw)
+                except Exception:
+                    reactions = []
+                if isinstance(reactions, list):
+                    for item in reactions:
+                        if not isinstance(item, dict):
+                            continue
+                        symbol = str(item.get("emoji") or item.get("title") or item.get("custom_emoji_id") or "").strip()
+                        count = int(item.get("count") or 0)
+                        if not symbol or count <= 0:
+                            continue
+                        reaction_counter[symbol] += count
+                        total_reactions += count
+            if poll_raw:
+                try:
+                    poll = json.loads(poll_raw)
+                except Exception:
+                    poll = None
+                if isinstance(poll, dict):
+                    polls.append(poll)
+        return {
+            "total_messages": total_messages,
+            "media_messages": media_messages,
+            "deleted_messages": deleted_messages,
+            "total_views": total_views,
+            "total_forwards": total_forwards,
+            "total_reactions": total_reactions,
+            "top_reactions": [{"emoji": key, "count": value} for key, value in reaction_counter.most_common(8)],
+            "polls": polls[:10],
+        }
+
+    def get_message_statistics(self, peer_id: int, message_id: int) -> Dict[str, Any]:
+        item = self.get_message_by_id(int(peer_id), int(message_id)) or {}
+        deleted_rows = self._query(
+            """
+            SELECT deleted_at, snapshot_text, media_type, sender_id, source
+            FROM deleted_message_events
+            WHERE peer_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (int(peer_id), int(message_id)),
+        )
+        deleted_snapshot = None
+        if deleted_rows:
+            row = deleted_rows[0]
+            deleted_snapshot = {
+                "deleted_at": int(row[0] or 0),
+                "snapshot_text": str(row[1] or ""),
+                "media_type": str(row[2] or "text"),
+                "sender_id": row[3],
+                "source": str(row[4] or ""),
+            }
+        return {
+            "message": item,
+            "deleted_snapshot": deleted_snapshot,
+        }
 
     # --------------------------- AI history ---------------------------
 

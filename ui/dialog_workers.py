@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import threading
 import re
+import tarfile
+import tempfile
+import zipfile
 from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -76,9 +79,9 @@ class HistoryWorker(QObject):
         self.include_deleted = bool(include_deleted)
         self._stop = False
         try:
-            self.remote_timeout = float(os.getenv("DRAGO_HISTORY_REMOTE_TIMEOUT", "25.0") or 25.0)
+            self.remote_timeout = float(os.getenv("DRAGO_HISTORY_REMOTE_TIMEOUT", "8.0") or 8.0)
         except Exception:
-            self.remote_timeout = 25.0
+            self.remote_timeout = 8.0
 
     def stop(self):
         self._stop = True
@@ -356,4 +359,180 @@ class UpdateDownloadWorker(QObject):
             payload["ok"] = True
         except Exception as exc:
             payload["error"] = str(exc)
+        self.finished.emit(payload)
+
+
+class GlobalPeerSearchWorker(QObject):
+    done = Signal(list)
+
+    def __init__(self, server, *, query: str, limit: int = 24):
+        super().__init__()
+        self.server = server
+        self.query = str(query or "").strip()
+        self.limit = max(1, int(limit or 24))
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    @Slot()
+    def run(self) -> None:
+        if self._stop or not self.query:
+            self.done.emit([])
+            return
+        rows: List[Dict[str, Any]] = []
+        try:
+            finder = getattr(self.server, "search_public_peers", None)
+            if callable(finder):
+                rows = list(finder(self.query, limit=self.limit) or [])
+        except Exception:
+            rows = []
+        if self._stop:
+            self.done.emit([])
+            return
+        self.done.emit(rows)
+
+
+class FfmpegInstallWorker(QObject):
+    progress = Signal(str, int, int)  # status, done, total
+    finished = Signal(dict)
+
+    def __init__(self, *, target_root: str):
+        super().__init__()
+        self.target_root = str(target_root or "").strip()
+
+    @staticmethod
+    def _clamp_int32(value: int) -> int:
+        try:
+            val = int(value)
+        except Exception:
+            val = 0
+        if val < 0:
+            return 0
+        if val > 2_000_000_000:
+            return 2_000_000_000
+        return val
+
+    @staticmethod
+    def _source_url() -> str:
+        if os.name == "nt":
+            # Stable Windows build with ffmpeg.exe + ffprobe.exe.
+            return "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        # Static Linux build.
+        return "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+
+    @staticmethod
+    def _is_exec(path: str) -> bool:
+        base = os.path.basename(path).lower()
+        if os.name == "nt":
+            return base == "ffmpeg.exe"
+        return base == "ffmpeg"
+
+    @staticmethod
+    def _is_probe(path: str) -> bool:
+        base = os.path.basename(path).lower()
+        if os.name == "nt":
+            return base == "ffprobe.exe"
+        return base == "ffprobe"
+
+    @staticmethod
+    def _chmod_exec(path: str) -> None:
+        if os.name == "nt":
+            return
+        try:
+            mode = os.stat(path).st_mode
+            os.chmod(path, mode | 0o111)
+        except Exception:
+            pass
+
+    @Slot()
+    def run(self) -> None:
+        payload: Dict[str, Any] = {"ok": False, "path": "", "error": ""}
+        target_root = self.target_root
+        if not target_root:
+            payload["error"] = "Не задана папка установки ffmpeg."
+            self.finished.emit(payload)
+            return
+
+        install_bin = os.path.join(target_root, "ffmpeg", "bin")
+        os.makedirs(install_bin, exist_ok=True)
+        tmp_root = tempfile.mkdtemp(prefix="escgram_ffmpeg_")
+        archive_path = os.path.join(tmp_root, "ffmpeg_pkg")
+        extract_dir = os.path.join(tmp_root, "extract")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        try:
+            import requests
+
+            url = self._source_url()
+            self.progress.emit("Скачиваю ffmpeg…", 0, 0)
+            with requests.get(url, stream=True, timeout=(5.0, 60.0)) as resp:
+                resp.raise_for_status()
+                total = self._clamp_int32(int(resp.headers.get("Content-Length") or 0))
+                with open(archive_path, "wb") as fh:
+                    done = 0
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        done += len(chunk)
+                        self.progress.emit(
+                            "Скачиваю ffmpeg…",
+                            self._clamp_int32(done),
+                            total,
+                        )
+
+            self.progress.emit("Распаковываю ffmpeg…", 0, 0)
+            lower = archive_path.lower()
+            if lower.endswith(".zip") or os.name == "nt":
+                try:
+                    with zipfile.ZipFile(archive_path, "r") as zf:
+                        zf.extractall(extract_dir)
+                except zipfile.BadZipFile:
+                    # Some servers provide no extension in URL; still valid ZIP.
+                    with zipfile.ZipFile(archive_path, "r") as zf:
+                        zf.extractall(extract_dir)
+            else:
+                with tarfile.open(archive_path, "r:*") as tf:
+                    tf.extractall(extract_dir)
+
+            ffmpeg_src = ""
+            ffprobe_src = ""
+            for root, _dirs, files in os.walk(extract_dir):
+                for name in files:
+                    full = os.path.join(root, name)
+                    if not ffmpeg_src and self._is_exec(full):
+                        ffmpeg_src = full
+                    elif not ffprobe_src and self._is_probe(full):
+                        ffprobe_src = full
+                if ffmpeg_src and ffprobe_src:
+                    break
+
+            if not ffmpeg_src:
+                raise RuntimeError("В скачанном архиве не найден исполняемый файл ffmpeg.")
+
+            ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+            ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            ffmpeg_dst = os.path.join(install_bin, ffmpeg_name)
+            ffprobe_dst = os.path.join(install_bin, ffprobe_name)
+
+            import shutil
+
+            shutil.copy2(ffmpeg_src, ffmpeg_dst)
+            self._chmod_exec(ffmpeg_dst)
+            if ffprobe_src:
+                shutil.copy2(ffprobe_src, ffprobe_dst)
+                self._chmod_exec(ffprobe_dst)
+
+            payload["ok"] = True
+            payload["path"] = ffmpeg_dst
+        except Exception as exc:
+            payload["error"] = str(exc)
+        finally:
+            try:
+                import shutil
+
+                shutil.rmtree(tmp_root, ignore_errors=True)
+            except Exception:
+                pass
         self.finished.emit(payload)

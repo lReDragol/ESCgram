@@ -46,6 +46,32 @@ class RecentStickersWorker(QObject):
             self.done.emit([])
 
 
+class SavedGifsWorker(QObject):
+    done = Signal(list)   # List[dict]
+    error = Signal(str)
+
+    def __init__(self, source: Any, *, limit: int = 24):
+        super().__init__()
+        self.source = source
+        self.limit = max(1, int(limit or 24))
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            rows = []
+            getter = getattr(self.source, "get_saved_gifs", None)
+            if callable(getter):
+                rows = getter(limit=self.limit) or []
+            else:
+                getter = getattr(self.source, "get_saved_gifs_sync", None)
+                if callable(getter):
+                    rows = getter(limit=self.limit) or []
+            self.done.emit(list(rows))
+        except Exception as exc:
+            self.error.emit(str(exc))
+            self.done.emit([])
+
+
 class StickerSetItemsWorker(QObject):
     done = Signal(list)   # List[dict]
     error = Signal(str)

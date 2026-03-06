@@ -234,6 +234,10 @@ class ServerCore:
                                 "forward_info",
                                 "media_group_id",
                                 "entities",
+                                "reactions",
+                                "poll",
+                                "views",
+                                "forwards",
                             ):
                                 if merged_item.get(key) in (None, "", 0):
                                     merged_item[key] = cached_entry.get(key)
@@ -315,6 +319,102 @@ class ServerCore:
         except Exception:
             log.exception("[SERVER] Failed to load message %s/%s from storage", chat_id, message_id)
             return None
+
+    def get_messages_details_for_ui(self, chat_id: str, message_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not self._storage:
+            return {}
+        try:
+            peer_id = int(chat_id)
+        except Exception:
+            return {}
+        try:
+            return self._storage.get_messages_by_ids(peer_id, message_ids)
+        except Exception:
+            log.exception("[SERVER] Failed to load messages %s/%s from storage", chat_id, message_ids)
+            return {}
+
+    def get_recent_emojis(self, limit: int = 48) -> List[str]:
+        if not self._tg_adapter:
+            return []
+        getter = getattr(self._tg_adapter, "get_recent_emojis_sync", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter(limit=limit) or [])
+        except Exception:
+            return []
+
+    def search_public_peers(self, query: str, limit: int = 24) -> List[Dict[str, Any]]:
+        if not self._tg_adapter:
+            return []
+        getter = getattr(self._tg_adapter, "search_public_peers_sync", None)
+        if not callable(getter):
+            return []
+        try:
+            rows = list(getter(query=query, limit=limit) or [])
+        except Exception:
+            return []
+        cleaned: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            cleaned.append(
+                {
+                    "id": cid,
+                    "title": str(row.get("title") or cid),
+                    "type": str(row.get("type") or "private"),
+                    "username": str(row.get("username") or ""),
+                    "photo_small_id": row.get("photo_small_id"),
+                    "last_ts": int(row.get("last_ts") or 0),
+                    "unread_count": int(row.get("unread_count") or 0),
+                    "pinned": bool(row.get("pinned", False)),
+                }
+            )
+        return cleaned
+
+    def get_saved_gifs(self, limit: int = 32) -> List[Dict[str, Any]]:
+        if not self._tg_adapter:
+            return []
+        getter = getattr(self._tg_adapter, "get_saved_gifs_sync", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter(limit=limit) or [])
+        except Exception:
+            return []
+
+    def get_chat_full_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if not self._tg_adapter:
+            return None
+        getter = getattr(self._tg_adapter, "get_chat_full_info_sync", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(chat_id=chat_id)
+        except Exception:
+            log.exception("[SERVER] Failed to load chat profile for %s", chat_id)
+            return None
+
+    def get_chat_statistics(self, chat_id: str, *, limit: int = 500) -> Dict[str, Any]:
+        if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
+            return {}
+        try:
+            return self._storage.get_chat_statistics(int(chat_id), limit=limit)
+        except Exception:
+            log.exception("[SERVER] Failed to load chat statistics for %s", chat_id)
+            return {}
+
+    def get_message_statistics(self, chat_id: str, message_id: int) -> Dict[str, Any]:
+        if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
+            return {}
+        try:
+            return self._storage.get_message_statistics(int(chat_id), int(message_id))
+        except Exception:
+            log.exception("[SERVER] Failed to load message statistics for %s/%s", chat_id, message_id)
+            return {}
 
     def start_media_download(self, chat_id: str, message_id: int) -> Optional[str]:
         if not self._tg_adapter:

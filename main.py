@@ -14,6 +14,21 @@ from gui_chat import run_gui
 
 SERVICE_TOKEN = os.getenv("DRAGO_SERVICE_TOKEN", "dev-service-token")
 
+def _prepend_local_ffmpeg_to_path() -> None:
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    try:
+        bin_dir = app_paths.telegram_workdir() / "ffmpeg" / "bin"
+    except Exception:
+        return
+    if not (bin_dir / exe_name).is_file():
+        return
+    current = os.environ.get("PATH", "")
+    norm_target = os.path.normcase(os.path.normpath(str(bin_dir)))
+    for part in [p for p in current.split(os.pathsep) if p]:
+        if os.path.normcase(os.path.normpath(part)) == norm_target:
+            return
+    os.environ["PATH"] = str(bin_dir) + (os.pathsep + current if current else "")
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", default=None)
@@ -29,6 +44,7 @@ def main():
             app_paths.save_bootstrap(data_dir=str(app_paths.get_data_dir()))
         except Exception:
             pass
+    _prepend_local_ffmpeg_to_path()
 
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
     server = ServerCore(service_token=SERVICE_TOKEN)
