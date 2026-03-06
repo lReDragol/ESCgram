@@ -11,6 +11,8 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
+import webbrowser
 from typing import Any, Dict, List, Optional, Iterable
 
 from utils import app_paths
@@ -129,6 +131,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._hide_hidden_chats = bool(features_cfg.get("hide_hidden_chats", True))
         self._show_my_avatar_enabled = bool(features_cfg.get("show_my_avatar", True))
         self._keep_deleted_messages = bool(features_cfg.get("keep_deleted_messages", True))
+        try:
+            volume_raw = int(features_cfg.get("media_volume", 100) or 100)
+        except Exception:
+            volume_raw = 100
+        self._media_volume_percent = max(0, min(100, volume_raw))
+        self._apply_media_volume_env()
         self._auto_download_policy = AutoDownloadPolicy.from_config(self._config.get("auto_download"))
         self._theme_mode = str(theme_cfg.get("mode") or "night")
         self._night_mode_enabled = (self._theme_mode == "night")
@@ -203,6 +211,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._avatar_size = 40
         self._pending_account_revert: Optional[str] = None
         self._media_popup: Optional[MediaPickerPopup] = None
+        self._settings_window: Optional[SettingsWindow] = None
         self._active_account_user_id: str = ""
         self._account_profile_thread: Optional[QThread] = None
         self._media_job_active: bool = False
@@ -374,6 +383,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         features_cfg.setdefault("hide_hidden_chats", True)
         features_cfg.setdefault("show_my_avatar", True)
         features_cfg.setdefault("keep_deleted_messages", True)
+        features_cfg.setdefault("media_volume", 100)
 
         ai_cfg = self._config.setdefault("ai", {})
         defaults = DEFAULT_CONFIG.get("ai", {}) if isinstance(DEFAULT_CONFIG.get("ai"), dict) else {}
@@ -441,6 +451,45 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             features_cfg[key] = previous
             log.exception("Failed to persist feature flag %s", key)
             return False
+
+    def _apply_media_volume_env(self) -> None:
+        try:
+            value = int(getattr(self, "_media_volume_percent", 100) or 100)
+        except Exception:
+            value = 100
+        value = max(0, min(100, value))
+        os.environ["DRAGO_MEDIA_VOLUME"] = str(value)
+
+    @staticmethod
+    def _volume_ratio(percent: int) -> float:
+        try:
+            value = int(percent)
+        except Exception:
+            value = 100
+        value = max(0, min(100, value))
+        return float(value) / 100.0
+
+    def _apply_media_volume_to_active_players(self) -> None:
+        ratio = self._volume_ratio(int(getattr(self, "_media_volume_percent", 100)))
+        for widget in list(getattr(self, "_message_widgets", {}).values()):
+            if widget is None:
+                continue
+            for attr in ("_audio_output", "_audio"):
+                output = getattr(widget, attr, None)
+                if output is None:
+                    continue
+                try:
+                    output.setVolume(ratio)
+                except Exception:
+                    continue
+        preview = getattr(self, "_media_preview_bar", None)
+        if preview is not None:
+            output = getattr(preview, "_audio", None)
+            if output is not None:
+                try:
+                    output.setVolume(ratio)
+                except Exception:
+                    pass
 
     def _apply_config_theme(self) -> None:
         self._apply_theme_variant(self._theme_mode)
@@ -588,6 +637,26 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _set_night_mode(self, enabled: bool) -> None:
         target = "night" if enabled else "day"
+        pending = str(getattr(self, "_pending_theme_mode", "") or "")
+        if target == self._theme_mode and pending != target:
+            return
+        self._pending_theme_mode = target
+        timer = getattr(self, "_theme_apply_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_pending_theme_mode)
+            self._theme_apply_timer = timer
+        try:
+            timer.start(45)
+        except Exception:
+            self._apply_pending_theme_mode()
+
+    def _apply_pending_theme_mode(self) -> None:
+        target = str(getattr(self, "_pending_theme_mode", "") or "").strip()
+        if not target:
+            return
+        self._pending_theme_mode = ""
         if target == self._theme_mode:
             return
         self._apply_theme_variant(target)
@@ -1132,6 +1201,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input = QTextEdit()
         self.user_input.setMinimumHeight(self._input_min_height)
         self.user_input.setMaximumHeight(self._input_max_height)
+        self.user_input.setStyleSheet(
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
+        )
         self.user_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.user_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
@@ -1982,8 +2054,29 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._keep_deleted_messages = previous
             self._toast("Не удалось сохранить настройку удалённых сообщений")
             return
-        if self.current_chat_id:
-            self.load_chat_history_async()
+            if self.current_chat_id:
+                self.load_chat_history_async()
+
+    def on_media_volume_setting_changed(self, value: int) -> None:
+        try:
+            new_value = int(value)
+        except Exception:
+            new_value = int(getattr(self, "_media_volume_percent", 100) or 100)
+        new_value = max(0, min(100, new_value))
+        previous = int(getattr(self, "_media_volume_percent", 100) or 100)
+        if new_value == previous:
+            return
+        self._media_volume_percent = new_value
+        self._apply_media_volume_env()
+        self._apply_media_volume_to_active_players()
+        features_cfg = self._config.setdefault("features", {})
+        features_cfg["media_volume"] = int(new_value)
+        try:
+            save_config(self._config)
+        except Exception:
+            self._media_volume_percent = previous
+            self._apply_media_volume_env()
+            self._apply_media_volume_to_active_players()
 
     def _on_ai_settings_changed(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -2230,6 +2323,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "  mkdir \"%DATA_DIR%\" >nul 2>&1\r\n"
             "  robocopy \"%BACKUP_DIR%\" \"%DATA_DIR%\" /E /NFL /NDL /NJH /NJS /NC /NS >nul\r\n"
             "  rmdir /S /Q \"%BACKUP_DIR%\" >nul 2>&1\r\n"
+            ")\r\n"
+            "if exist \"%SystemRoot%\\System32\\ie4uinit.exe\" (\r\n"
+            "  \"%SystemRoot%\\System32\\ie4uinit.exe\" -ClearIconCache >nul 2>&1\r\n"
+            "  \"%SystemRoot%\\System32\\ie4uinit.exe\" -show >nul 2>&1\r\n"
             ")\r\n"
             f"start \"\" \"{quoted_exe}\" --data-dir \"{quoted_data}\"\r\n"
             "del \"%~f0\"\r\n"
@@ -3539,6 +3636,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 continue
             cached = self._message_cache.get(key)
+            was_deleted = bool(cached.get("is_deleted")) if isinstance(cached, dict) else False
             if isinstance(cached, dict):
                 cached["is_deleted"] = True
             elif keep_deleted:
@@ -3567,6 +3665,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 if key in bucket:
                     self._reply_index[parent_id] = [x for x in bucket if x != key]
             if chat_id == current:
+                if keep_deleted and was_deleted:
+                    self._message_cache.pop(key, None)
+                    self._remove_message_widget(key)
+                    continue
                 if keep_deleted:
                     widget = self._message_widgets.get(key)
                     if widget is not None and hasattr(widget, "set_deleted"):
@@ -4265,6 +4367,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         cached = self._message_cache.get(mid) or {}
         was_deleted = bool(cached.get("is_deleted"))
+        if was_deleted:
+            self._purge_messages_locally(chat_id, [mid], purge_storage=True)
+            self._toast("Удалённое сообщение удалено из чата")
+            return
         try:
             ok_send = bool(self.server.delete_messages(chat_id=chat_id, message_ids=[mid]))
         except Exception:
@@ -4272,10 +4378,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if ok_send:
             self._on_gui_messages_deleted(chat_id, [mid])
             self._toast("Сообщение удалено")
-            return
-        if was_deleted:
-            self._purge_messages_locally(chat_id, [mid], purge_storage=True)
-            self._toast("Сообщение окончательно удалено")
             return
         self._toast("Не удалось удалить сообщение")
 
@@ -4291,6 +4393,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         mids = [mid for mid in mids_all if mid > 0]
         if local_mids:
             self._purge_messages_locally(chat_id, local_mids, purge_storage=False)
+        deleteds = [mid for mid in mids if bool((self._message_cache.get(mid) or {}).get("is_deleted"))]
+        if deleteds:
+            self._purge_messages_locally(chat_id, deleteds, purge_storage=True)
+            mids = [mid for mid in mids if mid not in deleteds]
         try:
             ok_send = bool(self.server.delete_messages(chat_id=chat_id, message_ids=mids)) if mids else True
         except Exception:
@@ -4300,12 +4406,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self._on_gui_messages_deleted(chat_id, mids)
             self._clear_message_selection()
             self._toast("Выбранные сообщения удалены")
-            return
-        deleteds = [mid for mid in mids if bool((self._message_cache.get(mid) or {}).get("is_deleted"))]
-        if deleteds:
-            self._purge_messages_locally(chat_id, deleteds, purge_storage=True)
-            self._clear_message_selection()
-            self._toast("Удалённые сообщения окончательно удалены")
             return
         self._toast("Не удалось удалить выбранные сообщения")
 
@@ -4357,7 +4457,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             mid = int(msg_id)
         except Exception:
             return
-        if mid <= 0:
+        if mid == 0:
             return
         already = mid in self._selected_message_ids
         if selected:
@@ -4386,7 +4486,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             mid = int(msg_id)
         except Exception:
             return
-        if mid <= 0:
+        if mid == 0:
             return
         if mid in self._selected_message_ids:
             self._set_message_selection_state(mid, False, notify=notify)
@@ -4717,7 +4817,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             copy_link.setEnabled(False)
             forward = menu.addAction("Переслать")
             forward.setEnabled(False)
-            menu.addAction("Выделить (доступно после синхронизации)").setEnabled(False)
+            if local_mid in self._selected_message_ids:
+                menu.addAction("Снять выделение").triggered.connect(lambda mid=local_mid: self._toggle_message_selection(mid))
+            else:
+                menu.addAction("Выделить").triggered.connect(lambda mid=local_mid: self._toggle_message_selection(mid))
 
         if self._selected_message_ids:
             menu.addSeparator()
@@ -5241,9 +5344,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выбрать аудио для голосового",
+            "Выбрать аудио/видео для голосового",
             "",
-            "Audio files (*.mp3 *.wav *.m4a *.flac *.ogg *.oga);;All files (*.*)",
+            "Audio/Video files (*.mp3 *.wav *.m4a *.flac *.ogg *.oga *.mp4 *.m4v *.mov *.webm *.mkv *.avi);;All files (*.*)",
         )
         if path:
             self._convert_and_send_as_voice(path)
@@ -5262,14 +5365,28 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._convert_and_send_as_video_note(path)
 
     def _toast(self, text: str) -> None:
+        message = str(text or "").strip()
+        if not message:
+            return
+        lower = message.lower()
+        suppressed = (
+            "сообщение удалено",
+            "удалённое сообщение удалено",
+            "выбранные сообщения удалены",
+            "файлы отправлены",
+            "голосовое отправлено",
+            "кружок отправлен",
+        )
+        if any(phrase in lower for phrase in suppressed):
+            return
         if not bool(getattr(self, "_runtime_toasts_enabled", False)):
             return
         layout = getattr(self, "chat_history_layout", None)
         if layout is None:
-            log.warning("Toast requested before chat history init: %s", text)
-            QMessageBox.information(self, "ESCgram", text)
+            log.warning("Toast requested before chat history init: %s", message)
+            QMessageBox.information(self, "ESCgram", message)
             return
-        info = QLabel(text)
+        info = QLabel(message)
         info.setStyleSheet("color:#9bb6d6; font-size:12px; padding:4px 10px;")
         info.setWordWrap(True)
 
@@ -5462,13 +5579,28 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 return candidate
         return shutil.which("ffprobe")
 
+    def _active_settings_window(self) -> Optional[SettingsWindow]:
+        dlg = getattr(self, "_settings_window", None)
+        if dlg is None:
+            return None
+        try:
+            if not _qt_is_valid(dlg):
+                return None
+        except Exception:
+            return None
+        return dlg
+
     def _install_ffmpeg_from_settings(self) -> None:
         thread = getattr(self, "_ffmpeg_install_thread", None)
         if thread is not None and thread.isRunning():
-            self._toast("Установка ffmpeg уже выполняется")
+            dlg = self._active_settings_window()
+            if dlg and hasattr(dlg, "set_ffmpeg_install_finished"):
+                dlg.set_ffmpeg_install_finished(ok=False, message="Установка ffmpeg уже выполняется")
             return
         target_root = str(app_paths.telegram_workdir())
-        self._toast("Запущена установка ffmpeg…")
+        dlg = self._active_settings_window()
+        if dlg and hasattr(dlg, "set_ffmpeg_install_progress"):
+            dlg.set_ffmpeg_install_progress("Запущена установка ffmpeg…", 0, 0)
         try:
             thread = QThread(self)
             thread.setObjectName("ffmpeg_install_thread")
@@ -5493,38 +5625,40 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     @Slot(str, int, int)
     def _on_ffmpeg_install_progress(self, status: str, done: int, total: int) -> None:
-        if total > 0:
-            try:
-                pct = int(max(0.0, min(1.0, float(done) / float(total))) * 100.0)
-            except Exception:
-                pct = 0
-            self._toast(f"{status} {pct}%")
-            return
-        if status:
-            self._toast(status)
+        dlg = self._active_settings_window()
+        if dlg and hasattr(dlg, "set_ffmpeg_install_progress"):
+            dlg.set_ffmpeg_install_progress(str(status or ""), int(done or 0), int(total or 0))
 
     @Slot(dict)
     def _on_ffmpeg_install_finished(self, payload: Dict[str, Any]) -> None:
         ok = bool((payload or {}).get("ok"))
         path = str((payload or {}).get("path") or "").strip()
         err = str((payload or {}).get("error") or "").strip()
+        dlg = self._active_settings_window()
         if ok and path:
             self._prepend_local_ffmpeg_to_path()
-            self._toast("ffmpeg установлен")
+            if dlg and hasattr(dlg, "set_ffmpeg_install_finished"):
+                dlg.set_ffmpeg_install_finished(ok=True, message=f"ffmpeg установлен: {path}")
             QMessageBox.information(self, "ffmpeg", f"ffmpeg установлен:\n{path}")
             return
+        if dlg and hasattr(dlg, "set_ffmpeg_install_finished"):
+            dlg.set_ffmpeg_install_finished(ok=False, message=f"Не удалось установить ffmpeg. {err}")
         QMessageBox.warning(self, "ffmpeg", f"Не удалось установить ffmpeg.\n{err or 'Неизвестная ошибка.'}")
 
     def _install_voice_dependencies_from_settings(self) -> None:
         thread = getattr(self, "_voice_deps_thread", None)
         if thread is not None and thread.isRunning():
-            self._toast("Установка зависимостей уже выполняется")
+            dlg = self._active_settings_window()
+            if dlg and hasattr(dlg, "set_voice_deps_install_finished"):
+                dlg.set_voice_deps_install_finished(ok=False, message="Установка зависимостей уже выполняется")
             return
-        self._toast("Запущена установка зависимостей голосовых…")
+        dlg = self._active_settings_window()
+        if dlg and hasattr(dlg, "set_voice_deps_install_progress"):
+            dlg.set_voice_deps_install_progress("Запущена установка зависимостей голосовых…")
         try:
             thread = QThread(self)
             thread.setObjectName("voice_deps_install_thread")
-            worker = VoiceDepsInstallWorker()
+            worker = VoiceDepsInstallWorker(target_dir=str(app_paths.telegram_workdir() / "pydeps"))
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.progress.connect(self._on_voice_deps_install_progress)
@@ -5545,21 +5679,32 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     @Slot(str)
     def _on_voice_deps_install_progress(self, text: str) -> None:
-        if text:
-            self._toast(str(text))
+        dlg = self._active_settings_window()
+        if dlg and hasattr(dlg, "set_voice_deps_install_progress"):
+            dlg.set_voice_deps_install_progress(str(text or ""))
 
     @Slot(dict)
     def _on_voice_deps_install_finished(self, payload: Dict[str, Any]) -> None:
         ok = bool((payload or {}).get("ok"))
         err = str((payload or {}).get("error") or "").strip()
         out = str((payload or {}).get("output") or "").strip()
+        target_dir = str((payload or {}).get("target_dir") or "").strip()
+        dlg = self._active_settings_window()
         if ok:
+            if target_dir and target_dir not in sys.path:
+                try:
+                    sys.path.insert(0, target_dir)
+                except Exception:
+                    pass
             message = "Зависимости для голосовых установлены."
             if out:
                 message = message + "\n\n" + out[-1200:]
+            if dlg and hasattr(dlg, "set_voice_deps_install_finished"):
+                dlg.set_voice_deps_install_finished(ok=True, message=message)
             QMessageBox.information(self, "Голосовые", message)
-            self._toast("Зависимости голосовых установлены")
             return
+        if dlg and hasattr(dlg, "set_voice_deps_install_finished"):
+            dlg.set_voice_deps_install_finished(ok=False, message=f"Не удалось установить зависимости. {err}")
         QMessageBox.warning(self, "Голосовые", f"Не удалось установить зависимости.\n{err or 'Неизвестная ошибка.'}")
 
     def _build_voice_ffmpeg_cmd(self, ffmpeg: str, src_path: str, dst_path: str) -> List[str]:
@@ -6084,6 +6229,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "hide_hidden_chats": getattr(self, "_hide_hidden_chats", True),
             "show_my_avatar": getattr(self, "_show_my_avatar_enabled", True),
             "keep_deleted_messages": getattr(self, "_keep_deleted_messages", True),
+            "media_volume": int(getattr(self, "_media_volume_percent", 100) or 100),
             "auto_ai": bool(self.auto_ai_checkbox.isChecked()) if hasattr(self, "auto_ai_checkbox") else False,
         }
         callbacks = {
@@ -6095,8 +6241,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "hide_hidden_chats": self.on_hide_hidden_chats_setting_changed,
             "show_my_avatar": self.on_show_my_avatar_setting_changed,
             "keep_deleted_messages": self.on_keep_deleted_messages_setting_changed,
+            "media_volume": self.on_media_volume_setting_changed,
             "install_ffmpeg": self._install_ffmpeg_from_settings,
             "install_voice_deps": self._install_voice_dependencies_from_settings,
+            "send_bug_report": self._send_bug_report_from_settings,
         }
         if hasattr(self, "auto_ai_checkbox"):
             callbacks["auto_ai"] = lambda checked: self.auto_ai_checkbox.setChecked(bool(checked))
@@ -6108,7 +6256,98 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             ai_callbacks={"on_change": self._on_ai_settings_changed},
             parent=self,
         )
-        dlg.exec()
+        self._settings_window = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._settings_window = None
+
+    @staticmethod
+    def _read_log_tail(path: str, *, max_lines: int = 260, max_chars: int = 40000) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+        except Exception:
+            return ""
+        tail = "".join(lines[-max_lines:])
+        if len(tail) > max_chars:
+            tail = tail[-max_chars:]
+        return tail.strip()
+
+    def _collect_bug_report_logs(self) -> str:
+        logs_root = app_paths.logs_dir()
+        try:
+            entries = sorted(
+                [str(p) for p in logs_root.glob("*.log") if p.is_file()],
+                key=lambda p: os.path.getmtime(p),
+                reverse=True,
+            )
+        except Exception:
+            entries = []
+        parts: List[str] = []
+        for path in entries[:3]:
+            tail = self._read_log_tail(path)
+            if not tail:
+                continue
+            name = os.path.basename(path)
+            parts.append(f"### {name}\n```text\n{tail}\n```")
+        return "\n\n".join(parts)
+
+    def _send_bug_report_from_settings(self, comment: str) -> tuple[bool, str]:
+        repo = str(getattr(self, "_update_repo", "") or get_update_repo()).strip()
+        if "/" not in repo:
+            return False, "Не задан GitHub-репозиторий для баг-репорта."
+        comment_text = str(comment or "").strip()
+        if not comment_text:
+            comment_text = "Без описания (отправлено из формы баг-репорта)."
+        version = str(getattr(self, "_app_version", "") or get_app_version())
+        logs_block = self._collect_bug_report_logs()
+        title = f"[BUG] ESCgram {version} - {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        body = (
+            "### Описание\n"
+            f"{comment_text}\n\n"
+            "### Окружение\n"
+            f"- Версия: `{version}`\n"
+            f"- OS: `{sys.platform}`\n"
+            f"- Python: `{sys.version.split()[0]}`\n\n"
+            "### Логи\n"
+            f"{logs_block or 'Логи не найдены.'}\n"
+        )
+
+        token = str(os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+        if token:
+            try:
+                import requests
+
+                api = f"https://api.github.com/repos/{repo}/issues"
+                resp = requests.post(
+                    api,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    json={"title": title[:200], "body": body[:64000]},
+                    timeout=(5.0, 18.0),
+                )
+                if 200 <= int(resp.status_code) < 300:
+                    data = resp.json() if resp.content else {}
+                    url = str(data.get("html_url") or "").strip()
+                    if url:
+                        return True, f"Баг-репорт отправлен: {url}"
+                    return True, "Баг-репорт отправлен."
+            except Exception:
+                log.exception("Failed to submit bug report via GitHub API")
+
+        try:
+            issue_url = (
+                f"https://github.com/{repo}/issues/new"
+                f"?title={urllib.parse.quote(title[:180])}"
+                f"&body={urllib.parse.quote(body[:7000])}"
+            )
+            webbrowser.open(issue_url)
+            return True, "Открыта форма issue на GitHub. Проверьте и отправьте репорт в браузере."
+        except Exception:
+            return False, "Не удалось открыть GitHub для отправки баг-репорта."
 
     def _shutdown_background_workers(self) -> None:
         def _thread_is_running(thread: object) -> bool:

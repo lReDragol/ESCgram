@@ -41,6 +41,22 @@ def _fmt_time(ms: int) -> str:
     return f"{m:d}:{s:02d}"
 
 
+def _media_volume_ratio(default: float = 1.0) -> float:
+    raw = str(os.getenv("DRAGO_MEDIA_VOLUME", "") or "").strip()
+    if not raw:
+        return max(0.0, min(1.0, float(default)))
+    try:
+        if "." in raw:
+            val = float(raw)
+            if val <= 1.0:
+                return max(0.0, min(1.0, val))
+            return max(0.0, min(1.0, val / 100.0))
+        val_i = int(raw)
+        return max(0.0, min(1.0, float(val_i) / 100.0))
+    except Exception:
+        return max(0.0, min(1.0, float(default)))
+
+
 # FIX: ограничитель параллельных превью-игроков
 class _ThumbLimiter:
     active: int = 0
@@ -99,7 +115,7 @@ class _CircleSeekOverlay(QWidget):
         self.margin = 10
         self._base_thickness = 8
         self._thin_scale = 0.7       # FIX: тоньше ~30%
-        self._hit_padding = 11       # wider drag target without changing visual thickness
+        self._hit_padding = 14       # wider drag target without changing visual thickness
         self.alpha_bg = 120
         self.alpha_fg = 200
         self._ratio = 0.0
@@ -254,7 +270,7 @@ class MediaRenderingMixin:
     FRAME_PORTRAIT  = QSize(360, 520)
     MAX_IMAGE_LANDSCAPE = QSize(450, 350)
     MAX_IMAGE_PORTRAIT  = QSize(350, 450)
-    MIN_IMAGE_DIM = 32
+    MIN_IMAGE_DIM = 250
     IMAGE_PLACEHOLDER = QSize(320, 220)
     VIDEO_NOTE_SIZE = 300
 
@@ -267,12 +283,19 @@ class MediaRenderingMixin:
             host = getattr(self, "preview", None)
         if host is None or not isinstance(host, QWidget):
             return
-        if overlay.parent() is not host:
-            overlay.setParent(host)
+        owner = cast(QWidget, self)
+        if overlay.parent() is not owner:
+            overlay.setParent(owner)
         width = max(80, host.width() - 16)
         height = max(24, overlay.sizeHint().height() if hasattr(overlay, "sizeHint") else 26)
-        y = max(4, host.height() - height - 6)
-        overlay.setGeometry(8, y, width, height)
+        try:
+            host_top_left = host.mapTo(owner, host.rect().topLeft())
+            x = int(host_top_left.x()) + 8
+            y = int(host_top_left.y()) + max(4, host.height() - height - 6)
+        except Exception:
+            x = 8
+            y = max(4, host.height() - height - 6)
+        overlay.setGeometry(x, y, width, height)
         overlay.raise_()
         overlay.show()
 
@@ -567,7 +590,7 @@ class MediaRenderingMixin:
             self.player = QMediaPlayer(parent=cast(QWidget, self))
             self._audio_output = QAudioOutput(parent=cast(QWidget, self))
             try:
-                self._audio_output.setVolume(1.0)
+                self._audio_output.setVolume(_media_volume_ratio())
             except Exception:
                 pass
             self.player.setAudioOutput(self._audio_output)
@@ -659,7 +682,7 @@ class MediaRenderingMixin:
             player.setVideoOutput(sink)
         else:
             player.setVideoOutput(cast(QVideoWidget, vw))
-            self._layout_timeline_overlay()
+            QTimer.singleShot(0, self._layout_timeline_overlay)
         if player.source().isEmpty():
             player.setSource(QUrl.fromLocalFile(self.file_path))
         if self.preview and self.preview.isVisible():

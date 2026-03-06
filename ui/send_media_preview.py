@@ -36,6 +36,22 @@ def _fmt_time(ms: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _media_volume_ratio(default: float = 1.0) -> float:
+    raw = str(os.getenv("DRAGO_MEDIA_VOLUME", "") or "").strip()
+    if not raw:
+        return max(0.0, min(1.0, float(default)))
+    try:
+        if "." in raw:
+            val = float(raw)
+            if val <= 1.0:
+                return max(0.0, min(1.0, val))
+            return max(0.0, min(1.0, val / 100.0))
+        val_i = int(raw)
+        return max(0.0, min(1.0, float(val_i) / 100.0))
+    except Exception:
+        return max(0.0, min(1.0, float(default)))
+
+
 class _BasePreviewDialog(QDialog):
     def __init__(self, file_path: str, title: str, header: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -114,7 +130,7 @@ class _BasePreviewDialog(QDialog):
             return
 
         self._audio = QAudioOutput(self)
-        self._audio.setVolume(1.0)
+        self._audio.setVolume(_media_volume_ratio())
         self._player = QMediaPlayer(self)
         self._player.setAudioOutput(self._audio)
 

@@ -103,14 +103,11 @@ class ChatHeaderBar(QFrame):
         click_layout.addLayout(text_col, 1)
         layout.addWidget(self._click_area, 1)
 
-        self.btn_info = QPushButton("Профиль", self)
         self.btn_more = QPushButton("⋯", self)
         self.btn_more.setFixedWidth(42)
-        layout.addWidget(self.btn_info, 0)
         layout.addWidget(self.btn_more, 0)
 
         self._click_area.clicked.connect(self.infoRequested.emit)
-        self.btn_info.clicked.connect(self.infoRequested.emit)
         self.btn_more.clicked.connect(self._emit_menu_requested)
 
     def set_chat(self, *, title: str, subtitle: str = "", avatar: Optional[QPixmap] = None) -> None:

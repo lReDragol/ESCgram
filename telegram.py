@@ -1335,6 +1335,38 @@ class TelegramAdapter:
                 or getattr(chat, "about", None)
                 or ""
             ).strip()
+            is_verified = bool(getattr(chat, "is_verified", False))
+            is_scam = bool(getattr(chat, "is_scam", False))
+            is_fake = bool(getattr(chat, "is_fake", False))
+            is_restricted = bool(getattr(chat, "is_restricted", False))
+            is_premium = bool(getattr(chat, "is_premium", False))
+            is_creator = bool(getattr(chat, "is_creator", False))
+            phone_value = str(getattr(chat, "phone_number", None) or getattr(chat, "phone", None) or "")
+
+            # For private chats/bots get explicit user flags (verified/premium/type).
+            if ctype in {"private", "user", "bot"}:
+                try:
+                    user = await self._client.get_users(int(cid))
+                except Exception:
+                    user = None
+                if user:
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    user_username = str(getattr(user, "username", "") or "").strip()
+                    user_title = (f"{first} {last}".strip() or user_username or title).strip()
+                    if user_title:
+                        title = user_title
+                    if user_username:
+                        username = user_username
+                    phone_value = str(getattr(user, "phone_number", None) or getattr(user, "phone", None) or phone_value or "")
+                    is_verified = bool(getattr(user, "is_verified", is_verified))
+                    is_scam = bool(getattr(user, "is_scam", is_scam))
+                    is_fake = bool(getattr(user, "is_fake", is_fake))
+                    is_restricted = bool(getattr(user, "is_restricted", is_restricted))
+                    is_premium = bool(getattr(user, "is_premium", is_premium))
+                    is_creator = bool(getattr(user, "is_self", False) or is_creator)
+                    ctype = "bot" if bool(getattr(user, "is_bot", False)) else "private"
+
             members = getattr(chat, "members_count", None)
             try:
                 members_count = int(members) if members is not None else None
@@ -1358,13 +1390,13 @@ class TelegramAdapter:
                 "username": username,
                 "about": about,
                 "members_count": members_count,
-                "phone": str(getattr(chat, "phone_number", None) or getattr(chat, "phone", None) or ""),
-                "is_verified": bool(getattr(chat, "is_verified", False)),
-                "is_scam": bool(getattr(chat, "is_scam", False)),
-                "is_fake": bool(getattr(chat, "is_fake", False)),
-                "is_restricted": bool(getattr(chat, "is_restricted", False)),
-                "is_premium": bool(getattr(chat, "is_premium", False)),
-                "is_creator": bool(getattr(chat, "is_creator", False)),
+                "phone": phone_value,
+                "is_verified": is_verified,
+                "is_scam": is_scam,
+                "is_fake": is_fake,
+                "is_restricted": is_restricted,
+                "is_premium": is_premium,
+                "is_creator": is_creator,
                 "photo_small_id": photo_small,
                 "photo_big_id": photo_big,
                 "available_reactions": available_reactions,

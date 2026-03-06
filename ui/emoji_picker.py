@@ -21,6 +21,7 @@ _FALLBACK_EMOJIS: Sequence[str] = [
 def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
     values: List[str] = []
     seen: set[str] = set()
+    max_items = int(limit) if isinstance(limit, int) and int(limit) > 0 else None
 
     try:
         import emoji as emoji_lib  # type: ignore
@@ -33,14 +34,16 @@ def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
                     continue
                 seen.add(value)
                 values.append(value)
+                if max_items is not None and len(values) >= max_items:
+                    break
     except Exception:
         values = []
 
     if not values:
         values = [str(e) for e in _FALLBACK_EMOJIS if str(e).strip()]
 
-    if isinstance(limit, int) and limit > 0:
-        values = values[: int(limit)]
+    if max_items is not None:
+        values = values[:max_items]
     return tuple(values)
 
 

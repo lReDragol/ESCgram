@@ -101,6 +101,7 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
         self.resize(560, 460)
+        self._callbacks = callbacks or {}
         self._ai_state = ai_state or {}
         self._ai_callbacks = ai_callbacks or {}
         self._ai_pull_thread: Optional[QThread] = None
@@ -117,6 +118,7 @@ class SettingsWindow(QDialog):
         StyleManager.instance().bind_stylesheet(tabs, "settings.tabs")
         tabs.addTab(self._build_general_tab(state, callbacks), "Общее")
         tabs.addTab(self._build_ai_tab(self._ai_state, self._ai_callbacks), "AI")
+        tabs.addTab(self._build_bug_report_tab(), "Баг-репорт")
         placeholder = QWidget()
         ph_layout = QVBoxLayout(placeholder)
         ph_layout.setContentsMargins(12, 12, 12, 12)
@@ -221,6 +223,28 @@ class SettingsWindow(QDialog):
             callback=callbacks.get("keep_deleted_messages"),
         )
         gen_form.addRow("Сохранять удалённые сообщения:", self.chk_keep_deleted)
+
+        volume_row = QHBoxLayout()
+        self.media_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.media_volume_slider.setRange(0, 100)
+        try:
+            volume_value = int(state.get("media_volume", 100) or 100)
+        except Exception:
+            volume_value = 100
+        volume_value = max(0, min(100, volume_value))
+        self.media_volume_slider.setValue(volume_value)
+        self.media_volume_label = QLabel(f"{volume_value}%")
+        volume_row.addWidget(self.media_volume_slider, 1)
+        volume_row.addWidget(self.media_volume_label, 0)
+        cb_volume = callbacks.get("media_volume")
+        if callable(cb_volume):
+            def _on_volume_changed(value: int) -> None:
+                self.media_volume_label.setText(f"{int(value)}%")
+                cb_volume(int(value))
+            self.media_volume_slider.valueChanged.connect(_on_volume_changed)
+        else:
+            self.media_volume_slider.setEnabled(False)
+        gen_form.addRow("Громкость медиа:", volume_row)
         layout.addWidget(general)
 
         media_box = QGroupBox("Медиа-инструменты")
@@ -234,17 +258,33 @@ class SettingsWindow(QDialog):
         self.btn_install_ffmpeg = QPushButton("Установить ffmpeg")
         ffmpeg_cb = callbacks.get("install_ffmpeg")
         if callable(ffmpeg_cb):
-            self.btn_install_ffmpeg.clicked.connect(lambda: ffmpeg_cb())
+            self.btn_install_ffmpeg.clicked.connect(lambda: self._trigger_ffmpeg_install(ffmpeg_cb))
         else:
             self.btn_install_ffmpeg.setEnabled(False)
         media_layout.addWidget(self.btn_install_ffmpeg, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.ffmpeg_status = QLabel("")
+        self.ffmpeg_status.setWordWrap(True)
+        media_layout.addWidget(self.ffmpeg_status)
+        self.ffmpeg_progress = QProgressBar()
+        self.ffmpeg_progress.setRange(0, 100)
+        self.ffmpeg_progress.setValue(0)
+        self.ffmpeg_progress.hide()
+        media_layout.addWidget(self.ffmpeg_progress)
+
         self.btn_install_voice_deps = QPushButton("Установить зависимости голосовых")
         voice_deps_cb = callbacks.get("install_voice_deps")
         if callable(voice_deps_cb):
-            self.btn_install_voice_deps.clicked.connect(lambda: voice_deps_cb())
+            self.btn_install_voice_deps.clicked.connect(lambda: self._trigger_voice_deps_install(voice_deps_cb))
         else:
             self.btn_install_voice_deps.setEnabled(False)
         media_layout.addWidget(self.btn_install_voice_deps, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.voice_deps_status = QLabel("")
+        self.voice_deps_status.setWordWrap(True)
+        media_layout.addWidget(self.voice_deps_status)
+        self.voice_deps_progress = QProgressBar()
+        self.voice_deps_progress.setRange(0, 0)
+        self.voice_deps_progress.hide()
+        media_layout.addWidget(self.voice_deps_progress)
         layout.addWidget(media_box)
 
         theme_box = QGroupBox("Тема оформления")
@@ -280,6 +320,65 @@ class SettingsWindow(QDialog):
         layout.addStretch(1)
         return tab
 
+    def _trigger_ffmpeg_install(self, callback: Callable[[], Any]) -> None:
+        try:
+            self.ffmpeg_status.setText("Запуск установки ffmpeg…")
+            self.ffmpeg_progress.setRange(0, 0)
+            self.ffmpeg_progress.show()
+        except Exception:
+            pass
+        callback()
+
+    def _trigger_voice_deps_install(self, callback: Callable[[], Any]) -> None:
+        try:
+            self.voice_deps_status.setText("Запуск установки зависимостей голосовых…")
+            self.voice_deps_progress.setRange(0, 0)
+            self.voice_deps_progress.show()
+        except Exception:
+            pass
+        callback()
+
+    def set_ffmpeg_install_progress(self, status: str, done: int, total: int) -> None:
+        if not hasattr(self, "ffmpeg_progress"):
+            return
+        text = str(status or "").strip()
+        if text:
+            self.ffmpeg_status.setText(text)
+        if int(total or 0) > 0:
+            self.ffmpeg_progress.setRange(0, 100)
+            try:
+                pct = int(max(0.0, min(1.0, float(done) / float(total))) * 100.0)
+            except Exception:
+                pct = 0
+            self.ffmpeg_progress.setValue(pct)
+        else:
+            self.ffmpeg_progress.setRange(0, 0)
+        self.ffmpeg_progress.show()
+
+    def set_ffmpeg_install_finished(self, *, ok: bool, message: str) -> None:
+        if not hasattr(self, "ffmpeg_progress"):
+            return
+        self.ffmpeg_progress.hide()
+        self.ffmpeg_progress.setRange(0, 100)
+        self.ffmpeg_progress.setValue(0)
+        self.ffmpeg_status.setText(str(message or ("ffmpeg установлен" if ok else "Установка ffmpeg завершилась с ошибкой")))
+
+    def set_voice_deps_install_progress(self, text: str) -> None:
+        if not hasattr(self, "voice_deps_progress"):
+            return
+        status = str(text or "").strip()
+        if status:
+            self.voice_deps_status.setText(status)
+        self.voice_deps_progress.setRange(0, 0)
+        self.voice_deps_progress.show()
+
+    def set_voice_deps_install_finished(self, *, ok: bool, message: str) -> None:
+        if not hasattr(self, "voice_deps_progress"):
+            return
+        self.voice_deps_progress.hide()
+        self.voice_deps_progress.setRange(0, 0)
+        self.voice_deps_status.setText(str(message or ("Зависимости голосовых установлены" if ok else "Не удалось установить зависимости голосовых")))
+
     @staticmethod
     def _make_checkbox(text: str, *, checked: bool, callback: Optional[Callable[[bool], None]]) -> QCheckBox:
         cb = QCheckBox(text)
@@ -289,6 +388,68 @@ class SettingsWindow(QDialog):
         else:
             cb.setEnabled(False)
         return cb
+
+    def _build_bug_report_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        hint = QLabel("Опишите проблему. К отчёту автоматически добавятся последние строки логов.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.bug_report_edit = QPlainTextEdit()
+        self.bug_report_edit.setPlaceholderText("Шаги воспроизведения, что ожидалось и что произошло…")
+        self.bug_report_edit.setMinimumHeight(180)
+        layout.addWidget(self.bug_report_edit, 1)
+
+        self.bug_report_status = QLabel("")
+        self.bug_report_status.setWordWrap(True)
+        layout.addWidget(self.bug_report_status)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_send_bug_report = QPushButton("Отправить на GitHub")
+        self.btn_send_bug_report.clicked.connect(self._send_bug_report)
+        btn_row.addWidget(self.btn_send_bug_report)
+        layout.addLayout(btn_row)
+        return tab
+
+    def _send_bug_report(self) -> None:
+        callback = self._callbacks.get("send_bug_report") if isinstance(self._callbacks, dict) else None
+        if not callable(callback):
+            self.bug_report_status.setText("Отправка баг-репорта недоступна в этой сборке.")
+            return
+        comment = ""
+        if hasattr(self, "bug_report_edit"):
+            try:
+                comment = str(self.bug_report_edit.toPlainText() or "").strip()
+            except Exception:
+                comment = ""
+        self.btn_send_bug_report.setEnabled(False)
+        self.bug_report_status.setText("Отправка баг-репорта…")
+        ok = False
+        message = ""
+        try:
+            result = callback(comment)
+            if isinstance(result, tuple) and len(result) >= 2:
+                ok = bool(result[0])
+                message = str(result[1] or "")
+            else:
+                ok = bool(result)
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        self.btn_send_bug_report.setEnabled(True)
+        if ok:
+            self.bug_report_status.setText(message or "Баг-репорт отправлен.")
+            try:
+                self.bug_report_edit.clear()
+            except Exception:
+                pass
+        else:
+            self.bug_report_status.setText(message or "Не удалось отправить баг-репорт.")
 
 
     def _build_ai_tab(self, state: Dict[str, Any], callbacks: Dict[str, Callable[[Dict[str, Any]], None]]) -> QWidget:

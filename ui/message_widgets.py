@@ -69,7 +69,12 @@ def _bubble_radius() -> int:
 
 # ---------------------------- темы пузырей -----------------------------
 
-ACCENT_LINK_COLOR = _STYLE_MGR.value("message_widgets.link_color", "#59b7ff")
+_raw_link_color = str(_STYLE_MGR.value("message_widgets.link_color", "#59b7ff") or "#59b7ff")
+_parsed_link_color = QColor(_raw_link_color)
+if not _parsed_link_color.isValid() or _parsed_link_color.hsvSaturation() < 45:
+    ACCENT_LINK_COLOR = "#59b7ff"
+else:
+    ACCENT_LINK_COLOR = _parsed_link_color.name()
 
 DEFAULT_BUBBLE_THEME_FALLBACK = {
     "me": {"bg": "#2b5278", "border": "#3a71a1", "text": "#f4f7ff", "link": ACCENT_LINK_COLOR},
@@ -254,12 +259,22 @@ def _normalize_entity_spans(text: str, entities: Sequence[Dict[str, Any]]) -> Li
 
         url = ent.get("url")
         language = ent.get("language")
+        user_id = ent.get("user_id")
 
         if etype == "mention":
             snippet = text[start:end].lstrip("@")
             if snippet:
                 etype = "text_link"
                 url = f"https://t.me/{snippet}"
+
+        if etype == "text_mention":
+            try:
+                uid = int(user_id or 0)
+            except Exception:
+                uid = 0
+            if uid > 0:
+                etype = "text_link"
+                url = f"tg://user?id={uid}"
 
         if etype in {"url", "email"}:
             snippet = text[start:end]
@@ -439,6 +454,9 @@ class RichTextLabel(QLabel):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         self.setOpenExternalLinks(False)
         self.setTextFormat(Qt.TextFormat.RichText)
+        self.setStyleSheet(
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
+        )
         self._raw_text = ""
         self._entities: Optional[List[Dict[str, Any]]] = None
         self._spoilers_revealed = False

@@ -91,7 +91,7 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 12.0
+        can_retry = (time.time() - failed_at) >= 3.0
         if can_retry:
             # Even if photo id is missing in dialog payload, Telegram can often resolve it by chat id.
             self._schedule_download(
@@ -127,7 +127,7 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 12.0
+        can_retry = (time.time() - failed_at) >= 3.0
         if (cache_key not in self._paths or not path) and can_retry:
             self._schedule_download(
                 cache_key=cache_key,

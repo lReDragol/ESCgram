@@ -840,6 +840,17 @@ class ServerCore:
             self._storage.mark_messages_deleted(int(chat_id), mids, deleted=True)
         except Exception:
             log.exception("[SERVER] Failed to mark messages deleted locally for %s/%s", chat_id, mids)
+            return
+        try:
+            self.events.put(
+                {
+                    "type": "gui_messages_deleted",
+                    "chat_id": str(chat_id),
+                    "message_ids": [int(mid) for mid in mids],
+                }
+            )
+        except Exception:
+            pass
 
     def purge_local_messages(self, chat_id: str, message_ids: List[int]) -> bool:
         if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):

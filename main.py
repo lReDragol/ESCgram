@@ -6,12 +6,9 @@ import signal
 import argparse
 from typing import Optional
 
-from server import ServerCore
 from utils.error_guard import guard_module
 from utils.logging_setup import configure_logging
 from utils import app_paths
-from telegram import TelegramAdapter
-from gui_chat import run_gui
 from PySide6.QtCore import QLockFile
 
 SERVICE_TOKEN = os.getenv("DRAGO_SERVICE_TOKEN", "dev-service-token")
@@ -47,6 +44,18 @@ def _prepend_local_ffmpeg_to_path() -> None:
             return
     os.environ["PATH"] = str(bin_dir) + (os.pathsep + current if current else "")
 
+
+def _prepend_local_pydeps_to_sys_path() -> None:
+    try:
+        deps_dir = app_paths.telegram_workdir() / "pydeps"
+    except Exception:
+        return
+    if not deps_dir.is_dir():
+        return
+    candidate = str(deps_dir)
+    if candidate not in sys.path:
+        sys.path.insert(0, candidate)
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", default=None)
@@ -63,10 +72,15 @@ def main():
         except Exception:
             pass
     _prepend_local_ffmpeg_to_path()
+    _prepend_local_pydeps_to_sys_path()
     instance_lock = _acquire_single_instance_lock()
     if instance_lock is None:
         print("ESCgram уже запущен. Вторая копия не будет открыта.")
         return
+
+    from server import ServerCore
+    from telegram import TelegramAdapter
+    from gui_chat import run_gui
 
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
     server = ServerCore(service_token=SERVICE_TOKEN)

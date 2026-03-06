@@ -113,6 +113,24 @@ def parse_tg_style_markup(text: str) -> Tuple[str, List[Dict[str, object]]]:
             i += 1
             continue
 
+        # Inline markdown link: [text](https://example.com)
+        # Keep this before other marker handling so brackets are not treated as plain text.
+        if ch == "[":
+            close_bracket = text.find("]", i + 1)
+            if close_bracket > i + 1 and (close_bracket + 1) < len(text) and text[close_bracket + 1] == "(":
+                close_paren = text.find(")", close_bracket + 2)
+                if close_paren > close_bracket + 2:
+                    label = text[i + 1 : close_bracket]
+                    url = text[close_bracket + 2 : close_paren].strip()
+                    # Basic URL guard: do not create broken entities for empty/non-link payloads.
+                    if label and url and not any(c.isspace() for c in url):
+                        start = len(out_chars)
+                        out_chars.extend(list(label))
+                        end = len(out_chars)
+                        spans.append(("text_link", start, end, url))
+                        i = close_paren + 1
+                        continue
+
         # Spoiler (||...||)
         if text.startswith("||", i):
             if stack["spoiler"]:
@@ -224,9 +242,10 @@ def parse_tg_style_markup(text: str) -> Tuple[str, List[Dict[str, object]]]:
                 "length": int(offsets[end] - offsets[start]),
             }
         )
+        if etype == "text_link" and isinstance(extra, str) and extra:
+            entities[-1]["url"] = extra
         if etype == "pre" and isinstance(extra, str) and extra:
             entities[-1]["language"] = extra
 
     entities.sort(key=lambda e: (int(e.get("offset") or 0), -int(e.get("length") or 0)))
     return plain, entities
-

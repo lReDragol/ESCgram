@@ -29,6 +29,7 @@ from ui.sticker_workers import (
     StickerSetsWorker,
     StickerThumbWorker,
 )
+from utils import app_paths
 
 
 class MediaPickerPopup(QFrame):
@@ -62,6 +63,10 @@ class MediaPickerPopup(QFrame):
         self._items_worker: Optional[StickerSetItemsWorker] = None
         self._thumb_worker: Optional[StickerThumbWorker] = None
         self._thumb_tasks: List[tuple[str, str]] = []
+        self._gif_thumb_thread: Optional[QThread] = None
+        self._gif_thumb_worker: Optional[StickerThumbWorker] = None
+        self._gif_thumb_tasks: List[tuple[str, str]] = []
+        self._gif_buttons: Dict[str, QToolButton] = {}
         self._gifs_thread: Optional[QThread] = None
         self._gifs_worker: Optional[SavedGifsWorker] = None
 
@@ -69,7 +74,12 @@ class MediaPickerPopup(QFrame):
         self._current_stickers: List[Dict[str, Any]] = []
         self._sticker_buttons: Dict[str, QToolButton] = {}
         self._recent_emojis: List[str] = []
-        self._emoji_catalog: Sequence[str] = tuple(load_all_emojis())
+        # Rendering thousands of emoji buttons blocks UI; keep it responsive with a curated window.
+        try:
+            emoji_limit = max(240, min(1200, int(os.getenv("DRAGO_EMOJI_PICKER_LIMIT", "640") or 640)))
+        except Exception:
+            emoji_limit = 640
+        self._emoji_catalog: Sequence[str] = tuple(load_all_emojis(limit=emoji_limit))
         self._recent_gifs: List[Dict[str, Any]] = []
 
         root = QVBoxLayout(self)
@@ -90,8 +100,14 @@ class MediaPickerPopup(QFrame):
         super().showEvent(event)
         # Resume any pending thumbnail downloads when the popup becomes visible.
         QTimer.singleShot(0, self._start_next_thumb_batch)
+        QTimer.singleShot(0, self._start_next_gif_thumb_batch)
         QTimer.singleShot(0, self._refresh_recent_emojis)
         QTimer.singleShot(0, self._refresh_saved_gifs_async)
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        super().hideEvent(event)
+        self._cancel_thumb_worker()
+        self._cancel_gif_thumb_worker()
 
     # ------------------------------------------------------------------ #
     # Popup positioning
@@ -195,11 +211,16 @@ class MediaPickerPopup(QFrame):
             if self._recent_emojis:
                 status.setText(f"Недавние из Telegram: {len(self._recent_emojis)}")
             else:
-                status.setText("Недавние эмодзи пока не найдены, показан полный набор")
+                total = len(merged)
+                shown = max(0, len(merged[start_index:]))
+                status.setText(f"Недавние не найдены, показано эмодзи: {shown}/{total}")
 
     def _make_emoji_button(self, emoji: str) -> QToolButton:
         btn = QToolButton(self)
         btn.setText(str(emoji))
+        btn.setStyleSheet(
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;font-size:18px;"
+        )
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(lambda _=False, e=str(emoji): self._select_emoji(e))
         return btn
@@ -462,7 +483,7 @@ class MediaPickerPopup(QFrame):
         self.stickerSelected.emit(str(file_id))
 
     def _thumb_cache_path(self, file_id: str) -> str:
-        root = Path("media") / "stickers_cache"
+        root = Path(app_paths.media_dir()) / "stickers_cache"
         root.mkdir(parents=True, exist_ok=True)
         digest = hashlib.blake2b(file_id.encode("utf-8", "ignore"), digest_size=16).hexdigest()
         return str(root / f"{digest}.webp")
@@ -533,6 +554,97 @@ class MediaPickerPopup(QFrame):
                 thread.wait(200)
             except Exception:
                 pass
+
+    def _gif_cache_path(self, file_id: str) -> str:
+        root = Path(app_paths.media_dir()) / "gifs_cache"
+        root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.blake2b(file_id.encode("utf-8", "ignore"), digest_size=16).hexdigest()
+        return str(root / f"{digest}.gif")
+
+    def _start_gif_thumb_downloads(self, rows: List[Dict[str, Any]]) -> None:
+        if not (self.tg and hasattr(self.tg, "download_file_id_sync")):
+            return
+        tasks: List[tuple[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fid = str(row.get("file_id") or "").strip()
+            if not fid:
+                continue
+            try:
+                size = int(row.get("size") or 0)
+            except Exception:
+                size = 0
+            # Avoid blocking on very large GIF files in the picker.
+            if size > 8 * 1024 * 1024:
+                continue
+            tasks.append((fid, self._gif_cache_path(fid)))
+        if not tasks:
+            return
+        # Prefer freshest rows first and cap queue to keep UI responsive.
+        self._gif_thumb_tasks = list(tasks[:24])
+        self._start_next_gif_thumb_batch()
+
+    def _cancel_gif_thumb_worker(self) -> None:
+        worker = getattr(self, "_gif_thumb_worker", None)
+        thread = getattr(self, "_gif_thumb_thread", None)
+        self._gif_thumb_worker = None
+        self._gif_thumb_thread = None
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if thread is not None and thread.isRunning():
+            try:
+                thread.quit()
+                thread.wait(200)
+            except Exception:
+                pass
+
+    def _start_next_gif_thumb_batch(self) -> None:
+        if not self._gif_thumb_tasks:
+            return
+        if not self.isVisible():
+            return
+        thread = getattr(self, "_gif_thumb_thread", None)
+        if thread is not None and thread.isRunning():
+            return
+        batch = self._gif_thumb_tasks[:12]
+        self._gif_thumb_tasks = self._gif_thumb_tasks[12:]
+
+        thread = QThread(self)
+        worker = StickerThumbWorker(self.tg, batch)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.thumb_ready.connect(self._on_gif_thumb_ready)
+        worker.finished.connect(self._on_gif_thumb_batch_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._gif_thumb_thread = thread
+        self._gif_thumb_worker = worker
+        thread.start()
+
+    def _on_gif_thumb_batch_finished(self) -> None:
+        self._gif_thumb_worker = None
+        if not self._gif_thumb_tasks:
+            return
+        QTimer.singleShot(0, self._start_next_gif_thumb_batch)
+
+    def _on_gif_thumb_ready(self, file_id: str, path: str) -> None:
+        btn_map = getattr(self, "_gif_buttons", {})
+        btn = btn_map.get(str(file_id)) if isinstance(btn_map, dict) else None
+        if not isinstance(btn, QToolButton):
+            return
+        if not path or not os.path.isfile(path):
+            return
+        pix = QPixmap(path)
+        if pix.isNull():
+            return
+        scaled = pix.scaled(btn.iconSize(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        btn.setIcon(QIcon(scaled))
+        btn.setText("")
 
     def _on_thumb_ready(self, file_id: str, path: str) -> None:
         btn = self._sticker_buttons.get(str(file_id))
@@ -615,6 +727,9 @@ class MediaPickerPopup(QFrame):
         grid = getattr(self, "_gif_grid", None)
         if grid is None:
             return
+        self._cancel_gif_thumb_worker()
+        self._gif_thumb_tasks = []
+        self._gif_buttons = {}
         while grid.count():
             item = grid.takeAt(0)
             widget = item.widget() if item else None
@@ -635,6 +750,9 @@ class MediaPickerPopup(QFrame):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip("Отправить из истории")
             btn.setFixedSize(84, 54)
+            btn.setIconSize(btn.size())
             btn.clicked.connect(lambda _=False, fid=file_id: self.gifSelected.emit(str(fid)))
             grid.addWidget(btn, idx // cols, idx % cols)
+            self._gif_buttons[str(file_id)] = btn
         grid.setRowStretch((len(rows) // cols) + 1, 1)
+        self._start_gif_thumb_downloads(rows)

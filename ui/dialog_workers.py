@@ -11,6 +11,7 @@ import subprocess
 from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
+from utils import app_paths
 
 
 class DialogsStreamWorker(QObject):
@@ -544,9 +545,16 @@ class VoiceDepsInstallWorker(QObject):
     progress = Signal(str)
     finished = Signal(dict)
 
-    def __init__(self, *, packages: Optional[List[str]] = None):
+    def __init__(self, *, packages: Optional[List[str]] = None, target_dir: Optional[str] = None):
         super().__init__()
         self.packages = list(packages or ["sounddevice", "soundfile"])
+        if target_dir:
+            self.target_dir = str(target_dir)
+        else:
+            try:
+                self.target_dir = str(app_paths.telegram_workdir() / "pydeps")
+            except Exception:
+                self.target_dir = "pydeps"
 
     @Slot()
     def run(self) -> None:
@@ -557,8 +565,28 @@ class VoiceDepsInstallWorker(QObject):
             self.finished.emit(payload)
             return
 
-        cmd = [sys.executable, "-m", "pip", "install", "-U", *self.packages]
-        self.progress.emit("Устанавливаю Python-зависимости для голосовых…")
+        target = str(self.target_dir or "").strip()
+        if not target:
+            payload["error"] = "Не задана папка установки зависимостей."
+            self.finished.emit(payload)
+            return
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception:
+            pass
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-U",
+            "--target",
+            target,
+            "--no-warn-script-location",
+            *self.packages,
+        ]
+        self.progress.emit(f"Устанавливаю зависимости голосовых в: {target}")
         try:
             proc = subprocess.run(
                 cmd,
@@ -574,6 +602,7 @@ class VoiceDepsInstallWorker(QObject):
             payload["output"] = out[-4000:] if out else ""
             if int(proc.returncode) == 0:
                 payload["ok"] = True
+                payload["target_dir"] = target
             else:
                 payload["error"] = f"pip завершился с кодом {proc.returncode}"
         except subprocess.TimeoutExpired:
