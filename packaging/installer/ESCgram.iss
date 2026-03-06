@@ -54,37 +54,10 @@ begin
 end;
 
 function _ReadBootstrapDataDir: String;
-var
-  BootstrapPath: String;
-  Content: String;
-  KeyPos: Integer;
-  ColonPos: Integer;
-  QuoteStart: Integer;
-  QuoteEnd: Integer;
 begin
+  // Keep installer parser simple and robust across Inno compiler variants.
+  // Data dir for upgrades is passed explicitly via /DATADIR by auto-update flow.
   Result := '';
-  BootstrapPath := ExpandConstant('{userappdata}\\DragoGUI\\bootstrap.json');
-  if not FileExists(BootstrapPath) then
-    Exit;
-  Content := '';
-  LoadStringFromFile(BootstrapPath, Content);
-  if Trim(Content) = '' then
-    Exit;
-
-  KeyPos := Pos('"data_dir"', Content);
-  if KeyPos <= 0 then
-    Exit;
-  ColonPos := _FindCharFrom(Content, ':', KeyPos + 10);
-  if ColonPos <= 0 then
-    Exit;
-  QuoteStart := _FindCharFrom(Content, '"', ColonPos + 1);
-  if QuoteStart <= 0 then
-    Exit;
-  QuoteEnd := _FindCharFrom(Content, '"', QuoteStart + 1);
-  if QuoteEnd <= QuoteStart then
-    Exit;
-
-  Result := Copy(Content, QuoteStart + 1, QuoteEnd - QuoteStart - 1);
 end;
 
 procedure _WriteBootstrapDataDir(const DataDir: String);
