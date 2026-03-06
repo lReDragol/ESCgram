@@ -221,6 +221,7 @@ class Storage:
               forward_info TEXT,
               file_name    TEXT,
               entities     TEXT,
+              reply_markup TEXT,
               duration     INTEGER,
               waveform     TEXT,
               reactions    TEXT,
@@ -291,6 +292,10 @@ class Storage:
                 pass
             try:
                 self._exec("ALTER TABLE messages ADD COLUMN entities TEXT")
+            except Exception:
+                pass
+            try:
+                self._exec("ALTER TABLE messages ADD COLUMN reply_markup TEXT")
             except Exception:
                 pass
             try:
@@ -471,6 +476,17 @@ class Storage:
             else:
                 entities_serialized = None
 
+            reply_markup_raw = m.get("reply_markup")
+            if isinstance(reply_markup_raw, str):
+                reply_markup_serialized = reply_markup_raw
+            elif reply_markup_raw is not None:
+                try:
+                    reply_markup_serialized = json.dumps(reply_markup_raw, ensure_ascii=False)
+                except Exception:
+                    reply_markup_serialized = None
+            else:
+                reply_markup_serialized = None
+
             duration_val = m.get("duration")
             try:
                 duration_int = int(duration_val) if duration_val is not None else None
@@ -524,6 +540,7 @@ class Storage:
                 forward_serialized,
                 m.get("file_name"),
                 entities_serialized,
+                reply_markup_serialized,
                 duration_int,
                 waveform_serialized,
                 reactions_serialized,
@@ -550,8 +567,8 @@ class Storage:
         if m_rows:
             self._execmany(
                 """
-                INSERT INTO messages(peer_id,id,date,from_id,reply_to,message,media_type,media_id,is_deleted,forward_info,file_name,entities,duration,waveform,reactions,poll,views,forwards,media_group_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO messages(peer_id,id,date,from_id,reply_to,message,media_type,media_id,is_deleted,forward_info,file_name,entities,reply_markup,duration,waveform,reactions,poll,views,forwards,media_group_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(peer_id,id) DO UPDATE SET
                   date=excluded.date,
                   from_id=COALESCE(excluded.from_id, messages.from_id),
@@ -566,6 +583,7 @@ class Storage:
                   forward_info=COALESCE(excluded.forward_info, messages.forward_info),
                   file_name=COALESCE(excluded.file_name, messages.file_name),
                   entities=COALESCE(excluded.entities, messages.entities),
+                  reply_markup=COALESCE(excluded.reply_markup, messages.reply_markup),
                   duration=COALESCE(excluded.duration, messages.duration),
                   waveform=COALESCE(excluded.waveform, messages.waveform),
                   reactions=COALESCE(excluded.reactions, messages.reactions),
@@ -742,6 +760,7 @@ class Storage:
               m.forward_info,
               m.file_name,
               m.entities,
+              m.reply_markup,
               f.path,
               f.size,
               f.mime,
@@ -783,7 +802,15 @@ class Storage:
                     entities = None
             else:
                 entities = None
-            waveform_raw = r[16]
+            reply_markup_raw = r[11]
+            if reply_markup_raw:
+                try:
+                    reply_markup = json.loads(reply_markup_raw)
+                except Exception:
+                    reply_markup = None
+            else:
+                reply_markup = None
+            waveform_raw = r[17]
             if waveform_raw:
                 try:
                     waveform = json.loads(waveform_raw)
@@ -791,7 +818,7 @@ class Storage:
                     waveform = None
             else:
                 waveform = None
-            reactions_raw = r[17]
+            reactions_raw = r[18]
             if reactions_raw:
                 try:
                     reactions = json.loads(reactions_raw)
@@ -799,7 +826,7 @@ class Storage:
                     reactions = None
             else:
                 reactions = None
-            poll_raw = r[18]
+            poll_raw = r[19]
             if poll_raw:
                 try:
                     poll = json.loads(poll_raw)
@@ -820,18 +847,19 @@ class Storage:
                 "forward_info": forward_info,
                 "file_name": r[9],
                 "entities": entities,
-                "file_path": r[11],
-                "file_size": r[12],
-                "mime": r[13],
-                "sender": r[14] or (str(sender_id) if sender_id is not None else ""),
+                "reply_markup": reply_markup,
+                "file_path": r[12],
+                "file_size": r[13],
+                "mime": r[14],
+                "sender": r[15] or (str(sender_id) if sender_id is not None else ""),
                 "thumb_path": None,
-                "duration": r[15],
+                "duration": r[16],
                 "waveform": waveform,
                 "reactions": reactions,
                 "poll": poll,
-                "views": r[19],
-                "forwards": r[20],
-                "media_group_id": r[21],
+                "views": r[20],
+                "forwards": r[21],
+                "media_group_id": r[22],
             })
         return out
 
@@ -848,6 +876,7 @@ class Storage:
               m.forward_info,
               m.file_name,
               m.entities,
+              m.reply_markup,
               COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
               m.duration,
               m.waveform,
@@ -883,7 +912,15 @@ class Storage:
                 entities = None
         else:
             entities = None
-        waveform_raw = r[11]
+        reply_markup_raw = r[9]
+        if reply_markup_raw:
+            try:
+                reply_markup = json.loads(reply_markup_raw)
+            except Exception:
+                reply_markup = None
+        else:
+            reply_markup = None
+        waveform_raw = r[12]
         if waveform_raw:
             try:
                 waveform = json.loads(waveform_raw)
@@ -891,7 +928,7 @@ class Storage:
                 waveform = None
         else:
             waveform = None
-        reactions_raw = r[12]
+        reactions_raw = r[13]
         if reactions_raw:
             try:
                 reactions = json.loads(reactions_raw)
@@ -899,7 +936,7 @@ class Storage:
                 reactions = None
         else:
             reactions = None
-        poll_raw = r[13]
+        poll_raw = r[14]
         if poll_raw:
             try:
                 poll = json.loads(poll_raw)
@@ -917,14 +954,15 @@ class Storage:
             "forward_info": forward_info,
             "file_name": r[7],
             "entities": entities,
-            "sender": r[9] or (str(r[1]) if r[1] is not None else ""),
-            "duration": r[10],
+            "reply_markup": reply_markup,
+            "sender": r[10] or (str(r[1]) if r[1] is not None else ""),
+            "duration": r[11],
             "waveform": waveform,
             "reactions": reactions,
             "poll": poll,
-            "views": r[14],
-            "forwards": r[15],
-            "media_group_id": r[16],
+            "views": r[15],
+            "forwards": r[16],
+            "media_group_id": r[17],
         }
 
     def get_messages_by_ids(self, peer_id: int, message_ids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
@@ -958,6 +996,7 @@ class Storage:
                   m.forward_info,
                   m.file_name,
                   m.entities,
+                  m.reply_markup,
                   COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
                   m.duration,
                   m.waveform,
@@ -995,7 +1034,15 @@ class Storage:
                             entities = None
                     else:
                         entities = None
-                    waveform_raw = row[11]
+                    reply_markup_raw = row[9]
+                    if reply_markup_raw:
+                        try:
+                            reply_markup = json.loads(reply_markup_raw)
+                        except Exception:
+                            reply_markup = None
+                    else:
+                        reply_markup = None
+                    waveform_raw = row[12]
                     if waveform_raw:
                         try:
                             waveform = json.loads(waveform_raw)
@@ -1003,7 +1050,7 @@ class Storage:
                             waveform = None
                     else:
                         waveform = None
-                    reactions_raw = row[12]
+                    reactions_raw = row[13]
                     if reactions_raw:
                         try:
                             reactions = json.loads(reactions_raw)
@@ -1011,7 +1058,7 @@ class Storage:
                             reactions = None
                     else:
                         reactions = None
-                    poll_raw = row[13]
+                    poll_raw = row[14]
                     if poll_raw:
                         try:
                             poll = json.loads(poll_raw)
@@ -1029,14 +1076,15 @@ class Storage:
                         "forward_info": forward_info,
                         "file_name": row[7],
                         "entities": entities,
-                        "sender": row[9] or (str(row[1]) if row[1] is not None else ""),
-                        "duration": row[10],
+                        "reply_markup": reply_markup,
+                        "sender": row[10] or (str(row[1]) if row[1] is not None else ""),
+                        "duration": row[11],
                         "waveform": waveform,
                         "reactions": reactions,
                         "poll": poll,
-                        "views": row[14],
-                        "forwards": row[15],
-                        "media_group_id": row[16],
+                        "views": row[15],
+                        "forwards": row[16],
+                        "media_group_id": row[17],
                     }
                 except Exception:
                     continue

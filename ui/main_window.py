@@ -80,7 +80,14 @@ from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
 from utils.logging_setup import configure_logging
 from ui.message_feed import MessageFeedMixin
-from ui.message_widgets import DEFAULT_BUBBLE_THEME, ChatItemWidget, ReplyPreviewWidget, TextMessageWidget, set_bubble_theme
+from ui.message_widgets import (
+    DEFAULT_BUBBLE_THEME,
+    ChatItemWidget,
+    MessageReplyMarkupWidget,
+    ReplyPreviewWidget,
+    TextMessageWidget,
+    set_bubble_theme,
+)
 from ui.media_viewer import MediaViewerDialog
 from ui.media_picker import MediaPickerPopup
 from ui.chat_panels import (
@@ -207,6 +214,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._chat_header: Optional[ChatHeaderBar] = None
         self._chat_header_info_cache: Dict[str, Dict[str, Any]] = {}
         self._media_preview_bar: Optional[InlineMediaPreviewBar] = None
+        self._bot_keyboard_bar: Optional[MessageReplyMarkupWidget] = None
+        self._bot_reply_markup_by_chat: Dict[str, Optional[Dict[str, Any]]] = {}
         self._pending_media_preview: Optional[Dict[str, Any]] = None
         self._avatar_size = 40
         self._pending_account_revert: Optional[str] = None
@@ -218,6 +227,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._media_convert_thread: Optional[QThread] = None
         self._media_convert_worker: Optional[FfmpegConvertWorker] = None
         self._media_send_thread: Optional[QThread] = None
+        self._chat_details_host: Optional[QFrame] = None
+        self._chat_details_header_label: Optional[QLabel] = None
+        self._chat_details_container: Optional[QWidget] = None
+        self._chat_details_layout: Optional[QVBoxLayout] = None
         self._media_send_worker: Optional[MediaSendWorker] = None
         self._media_batch_thread: Optional[QThread] = None
         self._media_batch_worker: Optional[MediaBatchSendWorker] = None
@@ -866,8 +879,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
-        center_layout.addWidget(self._build_chat_header(), 0)
-        center_layout.addWidget(self._build_feed(), 1)
+
+        center_body = QWidget(center)
+        center_body_layout = QHBoxLayout(center_body)
+        center_body_layout.setContentsMargins(0, 0, 0, 0)
+        center_body_layout.setSpacing(0)
+
+        chat_area = QWidget(center_body)
+        chat_area_layout = QVBoxLayout(chat_area)
+        chat_area_layout.setContentsMargins(0, 0, 0, 0)
+        chat_area_layout.setSpacing(0)
+        chat_area_layout.addWidget(self._build_chat_header(), 0)
+        chat_area_layout.addWidget(self._build_feed(), 1)
         try:
             self.chat_scroll.viewport().installEventFilter(self)
         except Exception:
@@ -880,8 +903,13 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         bottom_layout.setSpacing(6)
         bottom_layout.addWidget(self._build_reply_bar(), 0)
         bottom_layout.addWidget(self._build_media_preview_bar(), 0)
+        bottom_layout.addWidget(self._build_bot_keyboard_bar(), 0)
         bottom_layout.addLayout(self._build_bottom_row())
-        center_layout.addWidget(bottom_wrap, 0)
+        chat_area_layout.addWidget(bottom_wrap, 0)
+
+        center_body_layout.addWidget(chat_area, 1)
+        center_body_layout.addWidget(self._build_chat_details_host(), 0)
+        center_layout.addWidget(center_body, 1)
 
         splitter.addWidget(center)
         splitter.setStretchFactor(1, 1)
@@ -1091,6 +1119,99 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         bar.hide()
         self._media_preview_bar = bar
         return bar
+
+    def _build_bot_keyboard_bar(self) -> QWidget:
+        bar = MessageReplyMarkupWidget("reply", self)
+        bar.buttonActivated.connect(self._handle_reply_markup_action)
+        bar.hide()
+        self._bot_keyboard_bar = bar
+        return bar
+
+    def _build_chat_details_host(self) -> QWidget:
+        host = QFrame(self)
+        host.setObjectName("chatDetailsHost")
+        host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        host.setFixedWidth(438)
+        host.setStyleSheet(
+            "QFrame#chatDetailsHost{background-color:#102033;border-left:1px solid rgba(255,255,255,0.06);}"
+            "QPushButton{background-color:rgba(255,255,255,0.05);color:#dfe7f5;border:none;border-radius:14px;padding:6px 10px;}"
+            "QPushButton:hover{background-color:rgba(255,255,255,0.11);}"
+            "QLabel#chatDetailsHeader{color:#f4f7ff;font-size:16px;font-weight:700;}"
+        )
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QFrame(host)
+        header.setObjectName("chatDetailsHeaderBar")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 10)
+        header_layout.setSpacing(8)
+        btn_back = QPushButton("←", header)
+        btn_back.setFixedWidth(40)
+        btn_back.clicked.connect(self._close_chat_details)
+        header_layout.addWidget(btn_back, 0)
+        title = QLabel("Профиль", header)
+        title.setObjectName("chatDetailsHeader")
+        header_layout.addWidget(title, 1)
+        btn_close = QPushButton("✕", header)
+        btn_close.setFixedWidth(40)
+        btn_close.clicked.connect(self._close_chat_details)
+        header_layout.addWidget(btn_close, 0)
+        layout.addWidget(header, 0)
+
+        container = QWidget(host)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        layout.addWidget(container, 1)
+
+        host.hide()
+        self._chat_details_host = host
+        self._chat_details_header_label = title
+        self._chat_details_container = container
+        self._chat_details_layout = container_layout
+        return host
+
+    def _set_chat_details_widget(self, title: str, widget: Optional[QWidget]) -> None:
+        header = getattr(self, "_chat_details_header_label", None)
+        if header is not None:
+            header.setText(str(title or "Профиль"))
+        layout = getattr(self, "_chat_details_layout", None)
+        host = getattr(self, "_chat_details_host", None)
+        if layout is None or host is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            child = item.widget()
+            if child is not None:
+                child.setParent(None)
+                child.deleteLater()
+        if widget is None:
+            host.hide()
+            return
+        widget.setParent(host)
+        widget.setWindowFlags(Qt.WindowType.Widget)
+        layout.addWidget(widget, 1)
+        widget.show()
+        host.show()
+        host.raise_()
+
+    def _close_chat_details(self) -> None:
+        self._set_chat_details_widget("", None)
+
+    def _update_bot_keyboard_bar(self) -> None:
+        bar = getattr(self, "_bot_keyboard_bar", None)
+        if bar is None:
+            return
+        chat_id = str(self.current_chat_id or "")
+        markup = self._bot_reply_markup_by_chat.get(chat_id) if chat_id else None
+        if isinstance(markup, dict) and str(markup.get("type") or "").strip().lower() == "reply":
+            bar.set_markup(markup)
+            bar.show()
+            return
+        bar.clear_buttons()
+        bar.hide()
 
     def _show_inline_media_preview(
         self,
@@ -1505,6 +1626,71 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 widget.on_media_activate = self._on_media_widget_activate
             except Exception:
                 pass
+        for signal_name, handler in (
+            ("commandActivated", self._handle_message_command),
+            ("replyMarkupButtonActivated", self._handle_reply_markup_action),
+        ):
+            signal = getattr(widget, signal_name, None)
+            if signal is None:
+                continue
+            try:
+                signal.connect(handler)
+            except Exception:
+                pass
+
+    @Slot(str)
+    def _handle_message_command(self, command: str) -> None:
+        chat_id = str(self.current_chat_id or "")
+        text = str(command or "").strip()
+        if not chat_id or not text:
+            return
+        self.server.gui_send_message(chat_id=chat_id, user_id="me", text=text)
+
+    @Slot(dict)
+    def _handle_reply_markup_action(self, payload: Dict[str, Any]) -> None:
+        action = dict(payload or {})
+        url = str(action.get("url") or action.get("web_app_url") or "").strip()
+        if url:
+            try:
+                QDesktopServices.openUrl(QUrl(url))
+            except Exception:
+                pass
+            return
+        switch_query = str(action.get("switch_inline_query_current_chat") or action.get("switch_inline_query") or "").strip()
+        if switch_query:
+            try:
+                self.user_input.insertPlainText(switch_query)
+                self.user_input.setFocus()
+            except Exception:
+                pass
+            return
+        chat_id = str(action.get("chat_id") or self.current_chat_id or "").strip()
+        if not chat_id:
+            return
+        if "callback_data" in action:
+            result = self.server.press_inline_button(
+                chat_id,
+                int(action.get("message_id") or 0),
+                int(action.get("row") or 0),
+                int(action.get("col") or 0),
+            )
+            if bool(result.get("ok")):
+                text = str(result.get("text") or "").strip()
+                if text:
+                    self._toast(text)
+            else:
+                err = str(result.get("error") or "").strip()
+                if err:
+                    self._toast(err)
+            return
+        text = str(action.get("text") or "").strip()
+        if text:
+            self.server.gui_send_message(chat_id=chat_id, user_id="me", text=text)
+            markup = self._bot_reply_markup_by_chat.get(chat_id)
+            if isinstance(markup, dict) and bool(markup.get("one_time_keyboard")):
+                self._bot_reply_markup_by_chat[chat_id] = None
+                if chat_id == str(self.current_chat_id or ""):
+                    self._update_bot_keyboard_bar()
 
     def _on_media_widget_activate(self, payload: Dict[str, Any]) -> bool:
         kind = str(payload.get("kind") or "").strip().lower()
@@ -1761,8 +1947,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._reply_index.clear()
         self._clear_message_selection()
         self.current_chat_id = chat_id
+        self._close_chat_details()
         self._apply_chat_activity(chat_id, clear_unread=True, refresh_delay_ms=0)
         self._refresh_chat_header()
+        self._update_bot_keyboard_bar()
         self.update_ai_controls_state()
         self.load_chat_history_async()
 
@@ -1835,8 +2023,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "mark_read": lambda: self._mark_current_chat_read(local=False),
             "leave_chat": self._leave_current_chat_from_profile,
         }
-        dlg = ChatInfoDialog(info, avatar=avatar, sections=sections, callbacks=callbacks, parent=self)
-        dlg.exec()
+        panel = ChatInfoDialog(info, avatar=avatar, sections=sections, callbacks=callbacks, parent=self, embedded=True)
+        self._set_chat_details_widget("Профиль", panel)
 
     def _leave_current_chat_from_profile(self) -> None:
         chat_id = str(self.current_chat_id or "")
@@ -1863,6 +2051,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QMessageBox.warning(self, "Покинуть чат", "Не удалось покинуть чат.")
             return
         self._toast("Чат покинут")
+        self._close_chat_details()
         self.all_chats.pop(chat_id, None)
         self.current_chat_id = None
         self.clear_feed()
@@ -1879,8 +2068,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._toast("Нет данных для статистики")
             return
         title = str(self._current_chat_meta().get("title") or chat_id)
-        dlg = ChatStatisticsDialog(title, stats, parent=self)
-        dlg.exec()
+        panel = ChatStatisticsDialog(title, stats, parent=self, embedded=True)
+        self._set_chat_details_widget("Статистика", panel)
 
     def _show_message_statistics(self, message_id: int) -> None:
         chat_id = str(self.current_chat_id or "")
@@ -1896,8 +2085,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not data:
             self._toast("Статистика недоступна")
             return
-        dlg = MessageStatisticsDialog(data, parent=self)
-        dlg.exec()
+        panel = MessageStatisticsDialog(data, parent=self, embedded=True)
+        self._set_chat_details_widget("Статистика сообщения", panel)
 
     @Slot(QPoint)
     def _show_chat_header_menu(self, global_pos: QPoint) -> None:
@@ -2506,18 +2695,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 meta = None
         if not isinstance(meta, dict):
             meta = {}
-        title = str(meta.get("full_name") or meta.get("title") or "Профиль")
-        username = str(meta.get("username") or "")
-        phone = str(meta.get("phone") or "")
-        uid = str(meta.get("user_id") or "")
-        lines = [title]
-        if username:
-            lines.append(f"@{username}")
-        if phone:
-            lines.append(f"Телефон: {phone}")
-        if uid:
-            lines.append(f"ID: {uid}")
-        QMessageBox.information(self, "Профиль", "\n".join(lines))
+        info = {
+            "id": str(meta.get("user_id") or meta.get("id") or ""),
+            "title": str(meta.get("full_name") or meta.get("title") or "Профиль"),
+            "username": str(meta.get("username") or ""),
+            "phone": str(meta.get("phone") or ""),
+            "type": "user",
+            "is_premium": bool(meta.get("is_premium", False)),
+            "is_verified": bool(meta.get("is_verified", False)),
+            "about": str(meta.get("bio") or meta.get("about") or ""),
+        }
+        panel = ChatInfoDialog(info, avatar=self._account_avatar_pixmap(meta), sections={}, callbacks={}, parent=self, embedded=True)
+        self._set_chat_details_widget("Мой профиль", panel)
 
     def _pick_from_list(self, title: str, label: str, items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not items:
@@ -3413,6 +3602,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             reply_to = None
 
         forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
+        reply_markup = payload.get("reply_markup") if isinstance(payload.get("reply_markup"), dict) else None
+        if reply_markup:
+            self._bot_reply_markup_by_chat[chat_id] = reply_markup
+            if chat_id == str(self.current_chat_id or ""):
+                self._update_bot_keyboard_bar()
 
         existing = self._message_widgets.get(msg_id) if msg_id else None
         if existing is None and mine and msg_id > 0:
@@ -3433,6 +3627,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     existing.set_reply_preview(self._build_reply_preview(reply_to))
                 if hasattr(existing, "set_forward_info"):
                     existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                if hasattr(existing, "set_reply_markup"):
+                    existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
             except Exception:
                 pass
         else:
@@ -3451,6 +3647,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 reply_preview=reply_preview,
                 is_deleted=is_deleted,
                 forward_info=forward_info,
+                reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                 timestamp=timestamp,
                 insert_at=insert_at,
             )
@@ -3517,6 +3714,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         header = "Вы" if mine else str(payload.get("sender") or self.server.get_user_display_name(user_id) or user_id or "Неизвестно")
         forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
         text_entities = payload.get("entities") if isinstance(payload.get("entities"), list) else None
+        reply_markup = payload.get("reply_markup") if isinstance(payload.get("reply_markup"), dict) else None
+        if reply_markup:
+            self._bot_reply_markup_by_chat[chat_id] = reply_markup
+            if chat_id == str(self.current_chat_id or ""):
+                self._update_bot_keyboard_bar()
         duration_raw = payload.get("duration")
         try:
             duration_ms = int(duration_raw) * 1000 if duration_raw else None
@@ -3561,6 +3763,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     existing.set_reply_preview(reply_preview)
                 if hasattr(existing, "set_forward_info"):
                     existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                if hasattr(existing, "set_reply_markup"):
+                    existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
                 if hasattr(existing, "set_caption"):
                     existing.set_caption(text, entities=text_entities)
                 elif hasattr(existing, "set_message_text"):
@@ -3589,6 +3793,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 is_deleted=is_deleted,
                 voice_waveform=self._voice_waveform_enabled,
                 forward_info=forward_info,
+                reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                 duration_ms=duration_ms,
                 waveform=waveform,
                 media_group_id=media_group_id,
@@ -3759,6 +3964,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._clear_message_selection()
             self._clear_reply_target()
             self.hide_message_search()
+            self._bot_reply_markup_by_chat[str(chat_id)] = None
+            self._update_bot_keyboard_bar()
             self._message_cache.clear()
             self._reply_index.clear()
             self._history_load_requested_by_scroll = False
@@ -3845,6 +4052,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     reply_to = None
                 is_deleted = bool(entry.get("is_deleted", False))
                 forward_info = entry.get("forward_info")
+                reply_markup = entry.get("reply_markup") if isinstance(entry.get("reply_markup"), dict) else None
+                if reply_markup and self.current_chat_id:
+                    self._bot_reply_markup_by_chat[str(self.current_chat_id)] = reply_markup
                 duration_raw = entry.get("duration")
                 try:
                     duration_ms = int(duration_raw) * 1000 if duration_raw else None
@@ -3889,6 +4099,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                                 existing.set_reply_preview(reply_preview)
                             if hasattr(existing, "set_forward_info"):
                                 existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                            if hasattr(existing, "set_reply_markup"):
+                                existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
                             if hasattr(existing, "set_caption"):
                                 existing.set_caption(caption_text, entities=caption_entities)
                             if hasattr(existing, "set_has_hidden"):
@@ -3919,6 +4131,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                             is_deleted=is_deleted,
                             voice_waveform=self._voice_waveform_enabled,
                             forward_info=forward_info if isinstance(forward_info, dict) else None,
+                            reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                             duration_ms=duration_ms,
                             waveform=waveform,
                             media_group_id=media_group_id,
@@ -3942,6 +4155,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                                 existing.set_reply_preview(reply_preview)
                             if hasattr(existing, "set_forward_info"):
                                 existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
+                            if hasattr(existing, "set_reply_markup"):
+                                existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
                             if hasattr(existing, "set_has_hidden"):
                                 existing.set_has_hidden(bool(has_hidden))
                         except Exception:
@@ -3961,6 +4176,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                             reply_preview=reply_preview,
                             is_deleted=is_deleted,
                             forward_info=forward_info if isinstance(forward_info, dict) else None,
+                            reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                             insert_at=insert_at,
                         )
                 if not self._loading_history:
@@ -3992,6 +4208,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     wrap.setUpdatesEnabled(True)
                 except Exception:
                     pass
+        self._update_bot_keyboard_bar()
 
     @Slot()
     def on_history_finished(self) -> None:
@@ -4063,43 +4280,41 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not target_id:
             return
         if kind in {"chat", "user"}:
-            for idx in range(self.chat_list.count()):
-                item = self.chat_list.item(idx)
-                if not item:
-                    continue
-                cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
-                if not cid:
-                    continue
+            candidate_ids = {target_id}
+            if kind == "chat":
+                try:
+                    candidate_ids.update(set(getattr(self, "_chat_id_aliases")(target_id)))
+                except Exception:
+                    pass
+            for cid in list(getattr(self, "_chat_items_by_id", {}).keys()):
                 try:
                     aliases = set(getattr(self, "_chat_id_aliases")(cid))
                 except Exception:
                     aliases = {cid}
-                if target_id not in aliases and target_id != cid:
+                if not (candidate_ids & aliases):
                     continue
-                info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+                item = self._chat_items_by_id.get(cid)
+                if not item:
+                    continue
+                item_info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+                info = dict(self.all_chats.get(cid, {}))
+                if isinstance(item_info, dict):
+                    info.update(dict(item_info))
+                title = str(info.get("title_display") or info.get("title") or cid)
+                payload = getattr(self, "_chat_list_avatar_payload", None)
+                if not callable(payload):
+                    continue
                 try:
-                    title = str((info or {}).get("title_display") or (info or {}).get("title") or cid)
-                    payload = getattr(self, "_chat_list_avatar_payload", None)
-                    if callable(payload):
-                        pixmap, avatar_key = payload(cid, dict(info or {}), title)
-                    else:
-                        pixmap, avatar_key = None, None
-                    if pixmap is None:
-                        continue
-                    item.setIcon(QIcon())
-                    row_widget = self.chat_list.itemWidget(item)
-                    if row_widget and hasattr(row_widget, "set_avatar_cached"):
-                        row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
-                    elif row_widget and hasattr(row_widget, "set_avatar"):
-                        row_widget.set_avatar(pixmap)
+                    pixmap, avatar_key = payload(cid, info, title)
                 except Exception:
-                    pass
-        try:
-            refresh_list = getattr(self, "_refresh_visible_chat_avatars", None)
-            if callable(refresh_list):
-                refresh_list()
-        except Exception:
-            pass
+                    pixmap, avatar_key = None, None
+                if pixmap is None:
+                    continue
+                row_widget = getattr(self, "_chat_row_widgets_by_id", {}).get(cid)
+                if row_widget and hasattr(row_widget, "set_avatar_cached"):
+                    row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+                elif row_widget and hasattr(row_widget, "set_avatar"):
+                    row_widget.set_avatar(pixmap)
 
         self._refresh_feed_avatars(kind, target_id)
         if kind == "chat" and target_id == str(self.current_chat_id or ""):
@@ -6170,6 +6385,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.current_chat_id = None
         self.chat_list.clear()
         self._chat_items_by_id = {}
+        self._bot_reply_markup_by_chat.clear()
+        self._update_bot_keyboard_bar()
+        self._close_chat_details()
         self.clear_feed()
         self._message_widgets.clear()
         self._message_cache.clear()

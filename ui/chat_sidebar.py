@@ -212,6 +212,7 @@ class ChatListRowWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._avatar_size = max(28, int(avatar_size or 40))
         self._avatar_cache_key: Optional[tuple] = None
+        self._avatar_pixmap_key: Optional[int] = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(6, 4, 6, 4)
@@ -253,7 +254,12 @@ class ChatListRowWidget(QWidget):
         if pixmap is None or pixmap.isNull():
             self._avatar.setPixmap(QPixmap())
             self._avatar_cache_key = None
+            self._avatar_pixmap_key = None
             return
+        try:
+            self._avatar_pixmap_key = int(pixmap.cacheKey())
+        except Exception:
+            self._avatar_pixmap_key = None
         scaled = pixmap.scaled(
             self._avatar_size,
             self._avatar_size,
@@ -264,7 +270,13 @@ class ChatListRowWidget(QWidget):
 
     def set_avatar_cached(self, pixmap: Optional[QPixmap], *, cache_key: Optional[tuple] = None) -> None:
         key = cache_key if cache_key is not None else ("none",)
-        if self._avatar_cache_key == key:
+        pixmap_key = None
+        if pixmap is not None and not pixmap.isNull():
+            try:
+                pixmap_key = int(pixmap.cacheKey())
+            except Exception:
+                pixmap_key = None
+        if self._avatar_cache_key == key and self._avatar_pixmap_key == pixmap_key:
             return
         self._avatar_cache_key = key
         self.set_avatar(pixmap)
@@ -783,6 +795,7 @@ class ChatSidebarMixin:
                         str(info.get("username") or ""),
                         indicator,
                         int(is_hidden),
+                        str(info.get("photo_small_id") or info.get("photo_small") or ""),
                     )
                 )
                 visible_rows.append(
@@ -886,16 +899,26 @@ class ChatSidebarMixin:
             self.chat_list.setUpdatesEnabled(True)
 
     def _refresh_visible_chat_avatars(self) -> None:
+        viewport = self.chat_list.viewport()
+        visible_rect = viewport.rect() if viewport is not None else None
         count = int(self.chat_list.count() or 0)
         for idx in range(count):
             item = self.chat_list.item(idx)
             if item is None:
                 continue
+            if visible_rect is not None:
+                try:
+                    if not self.chat_list.visualItemRect(item).intersects(visible_rect):
+                        continue
+                except Exception:
+                    pass
             cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
             if not cid:
                 continue
-            info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
-            info_dict = dict(info) if isinstance(info, dict) else {}
+            info_dict = dict(self.all_chats.get(cid, {}))
+            raw_item_info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+            if isinstance(raw_item_info, dict):
+                info_dict.update(dict(raw_item_info))
             title = str(info_dict.get("title_display") or info_dict.get("title") or cid)
             pixmap, avatar_key = self._chat_list_avatar_payload(cid, info_dict, title)
             if pixmap is None:

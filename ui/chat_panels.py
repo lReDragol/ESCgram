@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -149,12 +150,14 @@ class ChatInfoDialog(QDialog):
         avatar: Optional[QPixmap] = None,
         sections: Optional[Dict[str, Any]] = None,
         callbacks: Optional[Dict[str, Any]] = None,
+        embedded: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._info = dict(info or {})
         self._sections = dict(sections or {})
         self._callbacks = dict(callbacks or {})
+        self._embedded = bool(embedded)
 
         self.setWindowTitle("Профиль чата")
         self.resize(680, 680)
@@ -193,18 +196,28 @@ class ChatInfoDialog(QDialog):
         root.addLayout(header)
 
         tabs = QTabWidget(self)
-        tabs.addTab(self._build_overview_tab(), "Обзор")
+        tabs.addTab(self._wrap_scroll(self._build_overview_tab()), "Обзор")
         tabs.addTab(self._build_media_tab(), "Медиа")
         tabs.addTab(self._build_files_tab(), "Файлы")
         tabs.addTab(self._build_links_tab(), "Ссылки")
-        tabs.addTab(self._build_members_tab(), "Участники")
-        tabs.addTab(self._build_actions_tab(), "Действия")
+        tabs.addTab(self._wrap_scroll(self._build_members_tab()), "Участники")
+        tabs.addTab(self._wrap_scroll(self._build_actions_tab()), "Действия")
         root.addWidget(tabs, 1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        root.addWidget(buttons)
+        if not self._embedded:
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+            buttons.rejected.connect(self.reject)
+            buttons.accepted.connect(self.accept)
+            root.addWidget(buttons)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
 
     @staticmethod
     def _format_ts(ts: Any) -> str:
@@ -267,7 +280,7 @@ class ChatInfoDialog(QDialog):
         if about:
             about_label = QLabel(about)
             about_label.setWordWrap(True)
-            about_label.setStyleSheet("background-color:rgba(255,255,255,0.04);border-radius:10px;padding:10px 12px;color:#c7d4e7;")
+            about_label.setStyleSheet("padding:2px 0 10px 0;color:#c7d4e7;")
             layout.addWidget(about_label)
 
         details = QGridLayout()
@@ -325,9 +338,9 @@ class ChatInfoDialog(QDialog):
         layout.setSpacing(8)
         for row in rows:
             card = QFrame(container)
-            card.setStyleSheet("QFrame{background:rgba(255,255,255,0.04);border-radius:10px;}")
+            card.setStyleSheet("QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}")
             card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(10, 9, 10, 9)
+            card_layout.setContentsMargins(0, 6, 0, 10)
             card_layout.setSpacing(6)
 
             if mode == "links":
@@ -415,9 +428,9 @@ class ChatInfoDialog(QDialog):
         layout.setSpacing(8)
         for row in members:
             line = QFrame(tab)
-            line.setStyleSheet("QFrame{background:rgba(255,255,255,0.04);border-radius:9px;}")
+            line.setStyleSheet("QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}")
             line_layout = QHBoxLayout(line)
-            line_layout.setContentsMargins(10, 8, 10, 8)
+            line_layout.setContentsMargins(0, 6, 0, 10)
             line_layout.setSpacing(10)
             left = QVBoxLayout()
             name = str(row.get("name") or row.get("id") or "unknown")
@@ -481,14 +494,18 @@ class ChatInfoDialog(QDialog):
 
 
 class ChatStatisticsDialog(QDialog):
-    def __init__(self, title: str, data: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
+    def __init__(self, title: str, data: Dict[str, Any], parent: Optional[QWidget] = None, *, embedded: bool = False) -> None:
         super().__init__(parent)
+        self._embedded = bool(embedded)
         self.setWindowTitle("Статистика чата")
         self.resize(520, 640)
         self.setStyleSheet(
             "QDialog{background-color:#0f1b27;color:#dfe7f5;}"
             "QProgressBar{background-color:rgba(255,255,255,0.05);border:none;border-radius:6px;height:10px;text-align:center;}"
             "QProgressBar::chunk{background-color:#59b7ff;border-radius:6px;}"
+            "QTabWidget::pane{border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:#102033;}"
+            "QTabBar::tab{background:rgba(255,255,255,0.04);color:#b9cce3;padding:8px 12px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;}"
+            "QTabBar::tab:selected{background:rgba(89,183,255,0.22);color:#f4f7ff;}"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -497,6 +514,23 @@ class ChatStatisticsDialog(QDialog):
         heading = QLabel(str(title or "Чат"))
         heading.setStyleSheet("font-size:20px;font-weight:700;color:#f4f7ff;")
         root.addWidget(heading)
+
+        tabs = QTabWidget(self)
+        root.addWidget(tabs, 1)
+
+        summary_tab, summary_layout = self._stats_tab()
+        activity_tab, activity_layout = self._stats_tab()
+        reactions_tab, reactions_layout = self._stats_tab()
+        senders_tab, senders_layout = self._stats_tab()
+        polls_tab, polls_layout = self._stats_tab()
+        risk_tab, risk_layout = self._stats_tab()
+
+        tabs.addTab(summary_tab, "Сводка")
+        tabs.addTab(activity_tab, "Активность")
+        tabs.addTab(reactions_tab, "Реакции")
+        tabs.addTab(senders_tab, "Отправители")
+        tabs.addTab(polls_tab, "Опросы")
+        tabs.addTab(risk_tab, "Риски")
 
         summary = _StatsSection("Сводка", self)
         metrics = [
@@ -511,23 +545,22 @@ class ChatStatisticsDialog(QDialog):
             row = QLabel(f"{label}: {value}")
             row.setStyleSheet("color:#dfe7f5;font-size:13px;")
             summary.body.addWidget(row)
-        root.addWidget(summary)
+        summary_layout.addWidget(summary)
 
         engagement = data.get("engagement") if isinstance(data.get("engagement"), dict) else {}
         if engagement:
-            section = _StatsSection("Engagement", self)
+            section = _StatsSection("Вовлечённость", self)
             section.body.addWidget(QLabel(f"Просмотров на сообщение: {float(engagement.get('views_per_message') or 0):.2f}"))
             section.body.addWidget(QLabel(f"Реакций на 100 сообщений: {float(engagement.get('reactions_per_100_messages') or 0):.2f}"))
             section.body.addWidget(QLabel(f"Пересылок на 100 сообщений: {float(engagement.get('forwards_per_100_messages') or 0):.2f}"))
-            root.addWidget(section)
+            summary_layout.addWidget(section)
 
         hourly = [row for row in list(data.get("hourly_activity") or []) if isinstance(row, dict)]
         if hourly:
-            section = _StatsSection("Активность по часам (локальное время)", self)
+            section = _StatsSection("Часы пик", self)
             ranked = sorted(hourly, key=lambda row: int(row.get("count") or 0), reverse=True)
-            top_hours = sorted(ranked[:10], key=lambda row: int(row.get("hour") or 0))
+            top_hours = sorted(ranked[:12], key=lambda row: int(row.get("hour") or 0))
             max_count = max([int(row.get("count") or 0) for row in top_hours] or [1])
-            section.body.addWidget(QLabel("Показаны самые активные часы"))
             for row in top_hours:
                 hour = int(row.get("hour") or 0)
                 count = int(row.get("count") or 0)
@@ -541,13 +574,13 @@ class ChatStatisticsDialog(QDialog):
                 line.addWidget(bar, 1)
                 line.addWidget(QLabel(str(count)), 0)
                 section.body.addLayout(line)
-            root.addWidget(section)
+            activity_layout.addWidget(section)
 
         daily = [row for row in list(data.get("daily_activity") or []) if isinstance(row, dict)]
         if daily:
-            section = _StatsSection("Активность по дням", self)
-            max_count = max([int(row.get("count") or 0) for row in daily[-10:]] or [1])
-            for row in daily[-10:]:
+            section = _StatsSection("Дни", self)
+            max_count = max([int(row.get("count") or 0) for row in daily[-14:]] or [1])
+            for row in daily[-14:]:
                 day = str(row.get("day") or "")
                 count = int(row.get("count") or 0)
                 line = QHBoxLayout()
@@ -560,7 +593,7 @@ class ChatStatisticsDialog(QDialog):
                 line.addWidget(bar, 1)
                 line.addWidget(QLabel(str(count)), 0)
                 section.body.addLayout(line)
-            root.addWidget(section)
+            activity_layout.addWidget(section)
 
         reactions = list(data.get("top_reactions") or [])
         if reactions:
@@ -579,7 +612,7 @@ class ChatStatisticsDialog(QDialog):
                 line.addWidget(bar, 1)
                 line.addWidget(text, 0)
                 section.body.addLayout(line)
-            root.addWidget(section)
+            reactions_layout.addWidget(section)
 
         senders = list(data.get("top_senders") or [])
         if senders:
@@ -606,7 +639,7 @@ class ChatStatisticsDialog(QDialog):
                 line.addWidget(bar, 1)
                 line.addWidget(QLabel(str(count)), 0)
                 section.body.addLayout(line)
-            root.addWidget(section)
+            senders_layout.addWidget(section)
 
         reason_labels = {
             "bot_like_sender": "похож на бота",
@@ -615,7 +648,7 @@ class ChatStatisticsDialog(QDialog):
         }
         suspicious = list(data.get("suspicious_senders") or [])
         if suspicious:
-            section = _StatsSection("Анти-накрутка: подозрительные отправители", self)
+            section = _StatsSection("Подозрительные отправители", self)
             for row in suspicious:
                 name = str(row.get("name") or row.get("sender_id") or "unknown")
                 username = str(row.get("username") or "").strip()
@@ -637,7 +670,7 @@ class ChatStatisticsDialog(QDialog):
                 lbl.setWordWrap(True)
                 lbl.setStyleSheet("color:#ffd78c;")
                 section.body.addWidget(lbl)
-            root.addWidget(section)
+            risk_layout.addWidget(section)
 
         anomaly_labels = {
             "reactions_exceed_views": "Реакций существенно больше просмотров.",
@@ -649,7 +682,7 @@ class ChatStatisticsDialog(QDialog):
             section = _StatsSection("Аномалии", self)
             for flag in anomaly_flags:
                 section.body.addWidget(QLabel(f"• {anomaly_labels.get(flag, flag)}"))
-            root.addWidget(section)
+            risk_layout.addWidget(section)
 
         polls_summary = data.get("polls_summary") if isinstance(data.get("polls_summary"), dict) else {}
         if polls_summary:
@@ -658,31 +691,12 @@ class ChatStatisticsDialog(QDialog):
             section.body.addWidget(QLabel(f"Открытых: {int(polls_summary.get('open_polls') or 0)}"))
             section.body.addWidget(QLabel(f"Закрытых: {int(polls_summary.get('closed_polls') or 0)}"))
             section.body.addWidget(QLabel(f"Сумма голосов: {int(polls_summary.get('total_voters') or 0)}"))
-            top_polls = [row for row in list(polls_summary.get("top_polls") or []) if isinstance(row, dict)]
-            if top_polls:
-                top_title = QLabel("Топ опросов по числу голосов")
-                top_title.setStyleSheet("color:#8da8c4;")
-                section.body.addWidget(top_title)
-                for poll in top_polls[:8]:
-                    voters = int(poll.get("total_voter_count") or 0)
-                    question = str(poll.get("question") or "Опрос")
-                    state = "закрыт" if bool(poll.get("is_closed")) else "открыт"
-                    row_label = QLabel(f"• {question} — {voters} ({state})")
-                    row_label.setWordWrap(True)
-                    section.body.addWidget(row_label)
-            root.addWidget(section)
+            polls_layout.addWidget(section)
 
         polls = list(data.get("polls") or [])
         if polls:
-            scroll = QScrollArea(self)
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
-            container = QWidget(scroll)
-            container_layout = QVBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(12)
             for poll in polls[:10]:
-                block = _StatsSection(str(poll.get("question") or "Опрос"), container)
+                block = _StatsSection(str(poll.get("question") or "Опрос"), self)
                 total_voters = int(poll.get("total_voter_count") or 0)
                 block.body.addWidget(QLabel(f"Голосов: {total_voters}"))
                 max_votes = max([int(opt.get("voter_count") or 0) for opt in list(poll.get("options") or [])] or [1])
@@ -692,26 +706,41 @@ class ChatStatisticsDialog(QDialog):
                     label.setWordWrap(True)
                     label.setMinimumWidth(160)
                     value = int(option.get("voter_count") or 0)
-                    bar = QProgressBar(container)
+                    bar = QProgressBar(self)
                     bar.setRange(0, max_votes)
                     bar.setValue(value)
                     row.addWidget(label, 1)
                     row.addWidget(bar, 1)
                     row.addWidget(QLabel(str(value)), 0)
                     block.body.addLayout(row)
-                container_layout.addWidget(block)
-            container_layout.addStretch(1)
-            scroll.setWidget(container)
-            root.addWidget(scroll, 1)
+                polls_layout.addWidget(block)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        for layout in (summary_layout, activity_layout, reactions_layout, senders_layout, polls_layout, risk_layout):
+            layout.addStretch(1)
+
+        if not self._embedded:
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+            buttons.rejected.connect(self.reject)
+            root.addWidget(buttons)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _stats_tab(self) -> tuple[QScrollArea, QVBoxLayout]:
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget(scroll)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+        scroll.setWidget(container)
+        return scroll, layout
 
 
 class MessageStatisticsDialog(QDialog):
-    def __init__(self, data: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
+    def __init__(self, data: Dict[str, Any], parent: Optional[QWidget] = None, *, embedded: bool = False) -> None:
         super().__init__(parent)
+        self._embedded = bool(embedded)
         self.setWindowTitle("Статистика сообщения")
         self.resize(500, 540)
         self.setStyleSheet(
@@ -723,13 +752,23 @@ class MessageStatisticsDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget(scroll)
+        body = QVBoxLayout(container)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(12)
+        scroll.setWidget(container)
+        root.addWidget(scroll, 1)
+
         message = dict(data.get("message") or {})
         deleted_snapshot = data.get("deleted_snapshot") if isinstance(data.get("deleted_snapshot"), dict) else None
 
         preview = QLabel(str(message.get("text") or deleted_snapshot.get("snapshot_text") if deleted_snapshot else ""))
         preview.setWordWrap(True)
-        preview.setStyleSheet("background-color:rgba(255,255,255,0.04);border-radius:12px;padding:10px 12px;color:#dfe7f5;")
-        root.addWidget(preview)
+        preview.setStyleSheet("padding:0;color:#dfe7f5;")
+        body.addWidget(preview)
 
         summary = _StatsSection("Показатели", self)
         rows = [
@@ -740,7 +779,7 @@ class MessageStatisticsDialog(QDialog):
         ]
         for label, value in rows:
             summary.body.addWidget(QLabel(f"{label}: {value}"))
-        root.addWidget(summary)
+        body.addWidget(summary)
 
         sender_profile = data.get("sender_profile") if isinstance(data.get("sender_profile"), dict) else None
         if sender_profile:
@@ -753,7 +792,7 @@ class MessageStatisticsDialog(QDialog):
                 section.body.addWidget(QLabel(f"Username: @{sender_username}"))
             if sender_type:
                 section.body.addWidget(QLabel(f"Тип: {sender_type}"))
-            root.addWidget(section)
+            body.addWidget(section)
 
         reactions = list(message.get("reactions") or [])
         if reactions:
@@ -769,7 +808,7 @@ class MessageStatisticsDialog(QDialog):
                 row.addWidget(bar, 1)
                 row.addWidget(QLabel(str(count)), 0)
                 section.body.addLayout(row)
-            root.addWidget(section)
+            body.addWidget(section)
 
         poll = message.get("poll") if isinstance(message.get("poll"), dict) else None
         if poll:
@@ -785,7 +824,7 @@ class MessageStatisticsDialog(QDialog):
                 row.addWidget(bar, 1)
                 row.addWidget(QLabel(str(value)), 0)
                 section.body.addLayout(row)
-            root.addWidget(section)
+            body.addWidget(section)
 
         if deleted_snapshot:
             section = _StatsSection("Удаление", self)
@@ -799,7 +838,7 @@ class MessageStatisticsDialog(QDialog):
                 label.setWordWrap(True)
                 label.setStyleSheet("color:#9fb3cc;")
                 section.body.addWidget(label)
-            root.addWidget(section)
+            body.addWidget(section)
 
         risk_labels = {
             "reactions_exceed_views": "Реакций больше ожидаемого относительно просмотров.",
@@ -813,11 +852,15 @@ class MessageStatisticsDialog(QDialog):
                 lbl = QLabel(f"• {risk_labels.get(flag, flag)}")
                 lbl.setStyleSheet("color:#ffd78c;")
                 section.body.addWidget(lbl)
-            root.addWidget(section)
+            body.addWidget(section)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        body.addStretch(1)
+        if not self._embedded:
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+            buttons.rejected.connect(self.reject)
+            root.addWidget(buttons)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
 
 def build_header_menu(parent: QWidget) -> QMenu:

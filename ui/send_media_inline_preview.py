@@ -199,10 +199,32 @@ class InlineMediaPreviewBar(QFrame):
             except Exception:
                 pass
         else:
-            icon = QLabel("Голосовое сообщение", self)
+            card = QFrame(self)
+            card.setStyleSheet(
+                "QFrame{background-color:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:16px;}"
+                "QLabel{background:transparent;}"
+            )
+            card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(12, 12, 12, 12)
+            card_layout.setSpacing(12)
+            icon = QLabel("🎙", card)
             icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon.setStyleSheet("font-size:13px; padding:6px 0;")
-            self._media_container.addWidget(icon)
+            icon.setFixedSize(48, 48)
+            icon.setStyleSheet(
+                "background-color:rgba(89,183,255,0.18);color:#dff2ff;border-radius:24px;font-size:24px;font-weight:700;"
+            )
+            card_layout.addWidget(icon, 0)
+            text_col = QVBoxLayout()
+            text_col.setContentsMargins(0, 0, 0, 0)
+            text_col.setSpacing(2)
+            title_lbl = QLabel("Голосовое сообщение", card)
+            title_lbl.setStyleSheet("color:#eef7ff;font-size:13px;font-weight:700;")
+            subtitle_lbl = QLabel("Проверьте аудио перед отправкой", card)
+            subtitle_lbl.setStyleSheet("color:#8da8c4;font-size:11px;")
+            text_col.addWidget(title_lbl)
+            text_col.addWidget(subtitle_lbl)
+            card_layout.addLayout(text_col, 1)
+            self._media_container.addWidget(card)
             try:
                 player.setVideoOutput(None)  # type: ignore[arg-type]
             except Exception:

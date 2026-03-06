@@ -112,6 +112,7 @@ class HistoryWorker(QObject):
                 "reply_to",
                 "is_deleted",
                 "forward_info",
+                "reply_markup",
                 "duration",
                 "waveform",
                 "media_group_id",

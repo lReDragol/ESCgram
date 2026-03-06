@@ -50,6 +50,7 @@ class MessageFeedMixin:
         layout = QVBoxLayout()
 
         self._msg_search_last_index: Optional[int] = None
+        self._msg_search_match_indexes: List[int] = []
         self._msg_search_bar = QWidget()
         self._msg_search_bar.setVisible(False)
         search_row = QHBoxLayout(self._msg_search_bar)
@@ -58,7 +59,7 @@ class MessageFeedMixin:
 
         self._msg_search_edit = QLineEdit()
         self._msg_search_edit.setPlaceholderText("Поиск по сообщениям…")
-        self._msg_search_edit.textChanged.connect(lambda: self._reset_message_search())
+        self._msg_search_edit.textChanged.connect(self._on_message_search_text_changed)
         self._msg_search_edit.returnPressed.connect(lambda: self.find_in_messages(forward=True))
         search_row.addWidget(self._msg_search_edit, 1)
 
@@ -189,9 +190,34 @@ class MessageFeedMixin:
 
     def _reset_message_search(self) -> None:
         self._msg_search_last_index = None
+        self._msg_search_match_indexes = []
         lbl = getattr(self, "_msg_search_status", None)
         if lbl:
             lbl.setText("")
+        for widget in list(getattr(self, "_message_order", []) or []):
+            try:
+                setter = getattr(widget, "set_search_query", None)
+                if callable(setter):
+                    setter("", active=False)
+            except Exception:
+                continue
+
+    def _on_message_search_text_changed(self) -> None:
+        self._reset_message_search()
+        edit = getattr(self, "_msg_search_edit", None)
+        if edit and str(edit.text() or "").strip():
+            self.find_in_messages(forward=True)
+
+    @staticmethod
+    def _widget_search_text(widget: QWidget) -> str:
+        for attr in ("_original_text", "text"):
+            try:
+                value = getattr(widget, attr, None)
+            except Exception:
+                value = None
+            if isinstance(value, str) and value:
+                return value
+        return ""
 
     def find_in_messages(self, *, forward: bool = True) -> None:
         edit = getattr(self, "_msg_search_edit", None)
@@ -210,6 +236,25 @@ class MessageFeedMixin:
                 lbl.setText("0")
             return
 
+        matches: List[int] = []
+        for idx, widget in enumerate(order):
+            text = self._widget_search_text(widget)
+            if query in text.lower():
+                matches.append(idx)
+        self._msg_search_match_indexes = matches
+        total_matches = len(matches)
+        if not matches:
+            if lbl:
+                lbl.setText("0 / 0")
+            for widget in order:
+                try:
+                    setter = getattr(widget, "set_search_query", None)
+                    if callable(setter):
+                        setter("", active=False)
+                except Exception:
+                    pass
+            return
+
         start = self._msg_search_last_index
         if start is None:
             idx = 0 if forward else (len(order) - 1)
@@ -220,14 +265,7 @@ class MessageFeedMixin:
         found_idx: Optional[int] = None
         while checked < len(order):
             widget = order[idx]
-            text = ""
-            try:
-                if hasattr(widget, "_original_text"):
-                    text = str(getattr(widget, "_original_text") or "")
-                elif hasattr(widget, "text"):
-                    text = str(getattr(widget, "text") or "")
-            except Exception:
-                text = ""
+            text = self._widget_search_text(widget)
             if query in text.lower():
                 found_idx = idx
                 break
@@ -240,8 +278,20 @@ class MessageFeedMixin:
             return
 
         self._msg_search_last_index = found_idx
+        current_match_no = 1
+        try:
+            current_match_no = matches.index(found_idx) + 1
+        except Exception:
+            current_match_no = 1
         if lbl:
-            lbl.setText("✓")
+            lbl.setText(f"{current_match_no} / {total_matches}")
+        for idx_widget, widget in enumerate(order):
+            try:
+                setter = getattr(widget, "set_search_query", None)
+                if callable(setter):
+                    setter(query if idx_widget in matches else "", active=(idx_widget == found_idx))
+            except Exception:
+                pass
         target = order[found_idx]
         wrap = getattr(target, "_row_wrap", None) or target
         try:
@@ -474,11 +524,19 @@ class MessageFeedMixin:
         reply_preview: Optional[Dict[str, Any]] = None,
         is_deleted: bool = False,
         forward_info: Optional[Dict[str, Any]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
         timestamp: Optional[int] = None,
         insert_at: Optional[int] = None,
     ) -> TextMessageWidget:
         color = self._display_color_for(user_id, header, role)
-        widget = TextMessageWidget(header, text, role=role, entities=entities)
+        widget = TextMessageWidget(
+            header,
+            text,
+            role=role,
+            entities=entities,
+            chat_id=chat_id or self.current_chat_id,
+            msg_id=msg_id,
+        )
         self._bind_message_context_menu(widget)
         if color:
             widget.set_header_color(color)
@@ -486,6 +544,8 @@ class MessageFeedMixin:
             widget.set_forward_info(forward_info)
         if reply_preview:
             widget.set_reply_preview(reply_preview)
+        if reply_markup:
+            widget.set_reply_markup(reply_markup)
         if has_hidden and hasattr(widget, "set_has_hidden"):
             try:
                 widget.set_has_hidden(True)
@@ -556,6 +616,7 @@ class MessageFeedMixin:
         is_deleted: bool = False,
         voice_waveform: bool = True,
         forward_info: Optional[Dict[str, Any]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
         duration_ms: Optional[int] = None,
         waveform: Optional[List[int]] = None,
         media_group_id: Optional[str] = None,
@@ -584,6 +645,8 @@ class MessageFeedMixin:
             widget.set_forward_info(forward_info)
         if reply_preview:
             widget.set_reply_preview(reply_preview)
+        if reply_markup:
+            widget.set_reply_markup(reply_markup)
         if is_deleted:
             widget.set_deleted(True)
         if has_hidden and hasattr(widget, "set_has_hidden"):

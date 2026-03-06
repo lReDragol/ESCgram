@@ -884,13 +884,14 @@ class TelegramAdapter:
 
                 media_type, _media_id, media_size, mime, duration, waveform = self._extract_media_meta(message)
                 media_group_id = self._extract_media_group_id(message)
+                reply_markup = self._reply_markup_to_dict(getattr(message, "reply_markup", None))
                 ts = int(getattr(message, "date", 0).timestamp()) if getattr(message, "date", None) else None
 
                 cached: Optional[str] = None
                 if self._server:
                     if media_type == "text":
-                        if text:
-                            entities = self._entities_to_dicts(getattr(message, "entities", None))
+                        entities = self._entities_to_dicts(getattr(message, "entities", None))
+                        if text or reply_markup:
                             self._server.tg_incoming_message(
                                 chat_id=str(message.chat.id),
                                 user_id=uid,
@@ -900,6 +901,7 @@ class TelegramAdapter:
                                 reply_to=reply_to_id,
                                 forward_info=forward_info,
                                 entities=entities,
+                                reply_markup=reply_markup,
                                 sender_name=sender_label,
                             )
                     else:
@@ -919,6 +921,7 @@ class TelegramAdapter:
                             reply_to=reply_to_id,
                             forward_info=forward_info,
                             file_name=file_name,
+                            reply_markup=reply_markup,
                             sender_name=sender_label,
                             file_size=media_size,
                             mime=mime,
@@ -962,14 +965,15 @@ class TelegramAdapter:
 
                 media_type, _media_id, media_size, mime, duration, waveform = self._extract_media_meta(message)
                 media_group_id = self._extract_media_group_id(message)
+                reply_markup = self._reply_markup_to_dict(getattr(message, "reply_markup", None))
                 ts = int(getattr(message, "date", 0).timestamp()) if getattr(message, "date", None) else None
 
                 # Если было медиа — переотрисовать превью/подпись
                 cached_path: Optional[str] = None
                 if self._server:
                     if media_type == "text":
-                        if text:
-                            entities = self._entities_to_dicts(getattr(message, "entities", None))
+                        entities = self._entities_to_dicts(getattr(message, "entities", None))
+                        if text or reply_markup:
                             self._server.tg_incoming_message(
                                 chat_id=str(message.chat.id),
                                 user_id=uid,
@@ -979,6 +983,7 @@ class TelegramAdapter:
                                 reply_to=reply_to_id,
                                 forward_info=forward_info,
                                 entities=entities,
+                                reply_markup=reply_markup,
                                 sender_name=sender_label,
                             )
                     else:
@@ -998,6 +1003,7 @@ class TelegramAdapter:
                             reply_to=reply_to_id,
                             forward_info=forward_info,
                             file_name=file_name,
+                            reply_markup=reply_markup,
                             sender_name=sender_label,
                             file_size=media_size,
                             mime=mime,
@@ -1969,6 +1975,7 @@ class TelegramAdapter:
         entities = self._entities_to_dicts(
             getattr(message, "entities", None) if media_type == "text" else getattr(message, "caption_entities", None)
         )
+        reply_markup = self._reply_markup_to_dict(getattr(message, "reply_markup", None))
         return {
             "id": message_id,
             "date": date_ts,
@@ -1984,6 +1991,7 @@ class TelegramAdapter:
             "forward_info": forward_info,
             "file_name": file_name,
             "entities": entities,
+            "reply_markup": reply_markup,
             "duration": duration,
             "waveform": waveform,
             "reactions": reactions,
@@ -2350,6 +2358,73 @@ class TelegramAdapter:
             except Exception:
                 continue
         return out or None
+
+    def _reply_markup_to_dict(self, markup: Any) -> Optional[Dict[str, Any]]:
+        if not markup:
+            return None
+        try:
+            class_name = str(type(markup).__name__ or "").lower()
+        except Exception:
+            class_name = ""
+        if "replykeyboardremove" in class_name:
+            return {"type": "remove"}
+        if "forcereply" in class_name:
+            return {"type": "force_reply"}
+
+        inline_rows = getattr(markup, "inline_keyboard", None)
+        reply_rows = getattr(markup, "keyboard", None)
+        rows_src = inline_rows if inline_rows is not None else reply_rows
+        if not rows_src:
+            return None
+        result_rows: List[List[Dict[str, Any]]] = []
+        for row_idx, row in enumerate(list(rows_src or [])):
+            buttons: List[Dict[str, Any]] = []
+            for col_idx, button in enumerate(list(row or [])):
+                try:
+                    text = str(getattr(button, "text", "") or "").strip()
+                except Exception:
+                    text = ""
+                if not text:
+                    continue
+                payload: Dict[str, Any] = {"text": text, "row": int(row_idx), "col": int(col_idx)}
+                url = getattr(button, "url", None)
+                if url:
+                    payload["url"] = str(url)
+                callback_data = getattr(button, "callback_data", None)
+                if callback_data is not None:
+                    if isinstance(callback_data, bytes):
+                        try:
+                            payload["callback_data"] = callback_data.decode("utf-8", "ignore")
+                        except Exception:
+                            payload["callback_data"] = callback_data.hex()
+                    else:
+                        payload["callback_data"] = str(callback_data)
+                for attr in ("switch_inline_query", "switch_inline_query_current_chat"):
+                    value = getattr(button, attr, None)
+                    if value not in (None, ""):
+                        payload[attr] = str(value)
+                for attr in ("request_contact", "request_location"):
+                    value = getattr(button, attr, None)
+                    if value is not None:
+                        payload[attr] = bool(value)
+                web_app = getattr(button, "web_app", None)
+                if web_app is not None:
+                    web_app_url = getattr(web_app, "url", None)
+                    if web_app_url:
+                        payload["web_app_url"] = str(web_app_url)
+                buttons.append(payload)
+            if buttons:
+                result_rows.append(buttons)
+        if not result_rows:
+            return None
+        return {
+            "type": "inline" if inline_rows is not None else "reply",
+            "rows": result_rows,
+            "resize_keyboard": bool(getattr(markup, "resize_keyboard", False)),
+            "one_time_keyboard": bool(getattr(markup, "one_time_keyboard", False)),
+            "is_persistent": bool(getattr(markup, "is_persistent", False)),
+            "placeholder": str(getattr(markup, "placeholder", "") or ""),
+        }
 
     @staticmethod
     def _extract_reply_to_id(message: "Message") -> Optional[int]:
@@ -2736,6 +2811,36 @@ class TelegramAdapter:
                 return False
 
         return bool(self._call(_forward(), timeout))
+
+    def press_inline_button_sync(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        row: int,
+        col: int,
+        timeout: float = 15.0,
+    ) -> Dict[str, Any]:
+        if not (self._enabled and self._client and self._loop):
+            return {"ok": False, "error": "telegram unavailable"}
+
+        async def _press() -> Dict[str, Any]:
+            try:
+                msg = await self._client.get_messages(int(chat_id), int(message_id))
+                result = await msg.click(int(row), int(col))
+                payload: Dict[str, Any] = {"ok": True}
+                if isinstance(result, str) and result.strip():
+                    payload["text"] = result.strip()
+                elif result is not None:
+                    payload["text"] = str(result)
+                return payload
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+        try:
+            return dict(self._call(_press(), timeout) or {"ok": False})
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def send_reaction_sync(
         self,
@@ -3599,6 +3704,7 @@ class TelegramAdapter:
                 reactions = self._extract_reactions(m)
                 poll = self._extract_poll(m)
                 views, forwards = self._extract_message_counters(m)
+                reply_markup = self._reply_markup_to_dict(getattr(m, "reply_markup", None))
                 item = {
                     "id": m.id,
                     "date": int(m.date.timestamp()) if m.date else None,
@@ -3617,6 +3723,7 @@ class TelegramAdapter:
                     "forward_info": self._extract_forward_info(m),
                     "file_name": self._extract_file_name(m),
                     "is_deleted": False,
+                    "reply_markup": reply_markup,
                     "duration": int(duration) if duration else None,
                     "waveform": waveform,
                     "reactions": reactions,

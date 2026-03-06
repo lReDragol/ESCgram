@@ -234,6 +234,7 @@ class ServerCore:
                                 "forward_info",
                                 "media_group_id",
                                 "entities",
+                                "reply_markup",
                                 "reactions",
                                 "poll",
                                 "views",
@@ -671,6 +672,7 @@ class ServerCore:
         reply_to: Optional[int] = None,
         forward_info: Optional[Dict[str, Any]] = None,
         entities: Optional[List[Dict[str, Any]]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
         sender_name: Optional[str] = None,
     ) -> None:
         ts = int(date_ts or time.time())
@@ -681,6 +683,7 @@ class ServerCore:
             "sender_id": user_id,
             "sender": sender_name or self.get_user_display_name(user_id) or user_id,
             "entities": entities or None,
+            "reply_markup": reply_markup or None,
             "reply_to": reply_to,
             "forward_info": forward_info,
             "file_name": None,
@@ -691,7 +694,7 @@ class ServerCore:
         self.events.put({"type": "gui_touch_dialog", "chat_id": chat_id, "ts": ts})
 
         my_id = self.get_self_user_id()
-        if self.should_autoreply(chat_id) and str(user_id) != str(my_id or ""):
+        if text.strip() and self.should_autoreply(chat_id) and str(user_id) != str(my_id or ""):
             self._schedule_ai_reply(str(chat_id), text)
 
 
@@ -710,6 +713,7 @@ class ServerCore:
         reply_to: Optional[int] = None,
         forward_info: Optional[Dict[str, Any]] = None,
         entities: Optional[List[Dict[str, Any]]] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
         file_name: Optional[str] = None,
         sender_name: Optional[str] = None,
         file_size: Optional[int] = None,
@@ -727,6 +731,7 @@ class ServerCore:
             "mtype": mtype,
             "text": text or "",
             "entities": entities or None,
+            "reply_markup": reply_markup or None,
             "file_path": file_path,
             "thumb_path": thumb_path,
             "ts": ts,
@@ -919,6 +924,25 @@ class ServerCore:
             return bool(sender(chat_id=chat_id, message_id=int(message_id), reaction=str(reaction or "").strip()))
         except Exception:
             return False
+
+    def press_inline_button(self, chat_id: str, message_id: int, row: int, col: int) -> Dict[str, Any]:
+        if not self._tg_adapter:
+            return {"ok": False, "error": "telegram unavailable"}
+        sender = getattr(self._tg_adapter, "press_inline_button_sync", None)
+        if not callable(sender):
+            return {"ok": False, "error": "inline buttons unsupported"}
+        try:
+            return dict(
+                sender(
+                    chat_id=str(chat_id),
+                    message_id=int(message_id),
+                    row=int(row),
+                    col=int(col),
+                )
+                or {"ok": False}
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     # ---------------------------------------------------------------------
     #                    AI helpers (in-process)

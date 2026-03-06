@@ -6,19 +6,21 @@ import hashlib
 import os
 import re
 import shutil
+from urllib.parse import quote as _url_quote, unquote as _url_unquote
 from html import escape
 from typing import Optional, Dict, Any, Callable, List, Sequence, Tuple
 from weakref import WeakSet
 from utils import app_paths
 
-from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot
-from PySide6.QtGui import QDesktopServices, QPainter, QColor, QMouseEvent, QPainterPath, QPen
+from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot, QTimer
+from PySide6.QtGui import QDesktopServices, QPainter, QColor, QMouseEvent, QPainterPath, QPen, QLinearGradient
 from PySide6.QtWidgets import (
     QLabel,
     QFrame,
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
+    QPushButton,
     QProgressBar,
     QToolButton,
     QSizePolicy,
@@ -114,6 +116,7 @@ _TME_RE = re.compile(r'(?P<url>(?:t\.me|telegram\.me)/[^\s<]+)', re.I)
 _EMAIL_RE = re.compile(r'(?P<email>[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 _HASHTAG_RE = re.compile(r'(?P<hash>#[A-Za-zА-Яа-я0-9_]{2,64})')
 _MENTION_RE = re.compile(r'(?<![\w])(?P<mention>@[A-Za-z0-9_]{5,32})')
+_COMMAND_RE = re.compile(r'(?<![\w/])(?P<command>/[A-Za-z0-9_]{1,64}(?:@[A-Za-z0-9_]{3,32})?)')
 _QUOTE_OPEN = "\ufff0"
 _QUOTE_CLOSE = "\ufff1"
 _QUOTE_BLOCK_STYLE = _STYLE_MGR.value("message_widgets.quote_block_style", "margin:4px 0; padding-left:8px; border-left:3px solid rgba(89,183,233,0.45); color:#c4d4eb;")
@@ -276,6 +279,11 @@ def _normalize_entity_spans(text: str, entities: Sequence[Dict[str, Any]]) -> Li
                 etype = "text_link"
                 url = f"tg://user?id={uid}"
 
+        if etype == "bot_command":
+            snippet = text[start:end].strip()
+            if snippet:
+                url = f"tgcmd://{_url_quote(snippet, safe='')}"
+
         if etype in {"url", "email"}:
             snippet = text[start:end]
             if etype == "email":
@@ -357,12 +365,46 @@ def _autolink_spans(text: str, existing: List[_RichSpan]) -> List[_RichSpan]:
         username = m.group("mention").lstrip("@")
         spans.append(_RichSpan(type="text_link", start=start, end=end, url=f"https://t.me/{username}"))
 
+    for m in _COMMAND_RE.finditer(text):
+        start, end = m.span("command")
+        if not _can_add(start, end):
+            continue
+        command = m.group("command")
+        spans.append(_RichSpan(type="bot_command", start=start, end=end, url=f"tgcmd://{_url_quote(command, safe='')}"))
+        already_linked.append((start, end))
+
     return spans
 
 
-def _render_entities_html(text: str, entities: Sequence[Dict[str, Any]], *, reveal_spoilers: bool) -> Tuple[str, bool]:
+def _search_spans(text: str, query: str, *, active: bool) -> List[_RichSpan]:
+    needle = str(query or "").strip()
+    if not needle:
+        return []
+    lower_text = text.casefold()
+    lower_needle = needle.casefold()
+    spans: List[_RichSpan] = []
+    pos = 0
+    while True:
+        idx = lower_text.find(lower_needle, pos)
+        if idx < 0:
+            break
+        end = idx + len(lower_needle)
+        spans.append(_RichSpan(type="search_active" if active else "search_hit", start=idx, end=end))
+        pos = end
+    return spans
+
+
+def _render_entities_html(
+    text: str,
+    entities: Sequence[Dict[str, Any]],
+    *,
+    reveal_spoilers: bool,
+    search_query: str = "",
+    search_active: bool = False,
+) -> Tuple[str, bool]:
     spans = _normalize_entity_spans(text, entities)
     spans.extend(_autolink_spans(text, spans))
+    spans.extend(_search_spans(text, search_query, active=search_active))
 
     has_spoilers = any(s.type == "spoiler" for s in spans)
 
@@ -380,32 +422,39 @@ def _render_entities_html(text: str, entities: Sequence[Dict[str, Any]], *, reve
             return '<span style="font-family:Consolas,Monaco,monospace;background-color:rgba(110,120,140,0.22);padding:1px 4px;border-radius:4px;">'
         if t == "pre":
             return '<pre style="font-family:Consolas,Monaco,monospace;background-color:rgba(110,120,140,0.18);padding:8px 10px;border-radius:8px;white-space:pre-wrap;">'
-        if t in {"hashtag", "mention", "bot_command"}:
+        if t in {"hashtag", "mention"}:
             return f'<span style="color:{ACCENT_LINK_COLOR};font-weight:600;">'
+        if t == "bot_command":
+            href = escape(str(span.url or ""), quote=True)
+            return f'<a href="{href}" style="color:{ACCENT_LINK_COLOR};text-decoration:none;font-weight:700;">'
         if t == "text_link" and span.url:
             href = escape(str(span.url), quote=True)
             return f'<a href="{href}" style="color:{ACCENT_LINK_COLOR};text-decoration:none;font-weight:600;">'
         if t == "blockquote":
             return '<span style="color:#c4d4eb;border-left:3px solid rgba(89,183,233,0.45);padding-left:8px;">'
         if t == "spoiler":
-            bg = "rgba(110,120,140,0.28)"
+            bg = "rgba(73,130,190,0.28)"
             if reveal_spoilers:
                 return f'<a href="spoiler://toggle" style="text-decoration:none;color:inherit;background-color:{bg};border-radius:4px;padding:0 2px;">'
             return f'<a href="spoiler://toggle" style="text-decoration:none;color:transparent;background-color:{bg};border-radius:4px;padding:0 2px;">'
         if t == "hidden":
             bg = "rgba(140,150,165,0.28)"
             return f'<span style="background-color:{bg};border-radius:4px;padding:0 2px;">'
+        if t == "search_active":
+            return '<span style="background-color:rgba(89,183,255,0.34);border-radius:4px;padding:0 1px;">'
+        if t == "search_hit":
+            return '<span style="background-color:rgba(89,183,255,0.18);border-radius:4px;padding:0 1px;">'
         return ""
 
     def _close_tag(span: _RichSpan) -> str:
         t = span.type
         if t in {"bold", "italic", "underline", "strikethrough"}:
             return {"bold": "</b>", "italic": "</i>", "underline": "</u>", "strikethrough": "</s>"}[t]
-        if t in {"code", "hashtag", "mention", "bot_command", "hidden", "blockquote"}:
+        if t in {"code", "hashtag", "mention", "hidden", "blockquote", "search_active", "search_hit"}:
             return "</span>"
         if t == "pre":
             return "</pre>"
-        if t in {"text_link", "spoiler"}:
+        if t in {"text_link", "spoiler", "bot_command"}:
             return "</a>"
         return ""
 
@@ -448,6 +497,8 @@ def _render_entities_html(text: str, entities: Sequence[Dict[str, Any]], *, reve
 
 class RichTextLabel(QLabel):
     """QLabel с кликабельными ссылками и выделением текста."""
+    commandActivated = Signal(str)
+
     def __init__(self, text: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWordWrap(True)
@@ -461,12 +512,27 @@ class RichTextLabel(QLabel):
         self._entities: Optional[List[Dict[str, Any]]] = None
         self._spoilers_revealed = False
         self._has_spoilers = False
+        self._search_query = ""
+        self._search_active = False
+        self._spoiler_phase = 0.0
+        self._spoiler_flash = 0.0
+        self._spoiler_timer = QTimer(self)
+        self._spoiler_timer.setInterval(48)
+        self._spoiler_timer.timeout.connect(self._tick_spoiler_animation)
         self.linkActivated.connect(self._on_link_activated)
         self.set_message(text)
 
     def _on_link_activated(self, href: str) -> None:
+        if href and str(href).startswith("tgcmd://"):
+            command = _url_unquote(str(href).split("://", 1)[1])
+            if command:
+                self.commandActivated.emit(command)
+            return
         if href and str(href).startswith("spoiler://") and self._has_spoilers:
             self._spoilers_revealed = not self._spoilers_revealed
+            self._spoiler_flash = 1.0
+            if not self._spoiler_timer.isActive():
+                self._spoiler_timer.start()
             self._render_current()
             return
         QDesktopServices.openUrl(QUrl(str(href)))
@@ -477,17 +543,34 @@ class RichTextLabel(QLabel):
         self._spoilers_revealed = False
         self._render_current()
 
+    def set_search(self, query: str, *, active: bool = False) -> None:
+        normalized = str(query or "")
+        active = bool(active and normalized)
+        if self._search_query == normalized and self._search_active == active:
+            return
+        self._search_query = normalized
+        self._search_active = active
+        self._render_current()
+
     def _render_current(self) -> None:
-        if self._entities:
+        if self._entities or self._search_query:
             html, has_spoilers = _render_entities_html(
                 self._raw_text,
-                self._entities,
+                self._entities or [],
                 reveal_spoilers=self._spoilers_revealed,
+                search_query=self._search_query,
+                search_active=self._search_active,
             )
             self._has_spoilers = bool(has_spoilers)
             self.setText(html)
+            if self._has_spoilers and not self._spoilers_revealed and not self._spoiler_timer.isActive():
+                self._spoiler_timer.start()
+            elif not self._has_spoilers and self._spoiler_timer.isActive():
+                self._spoiler_timer.stop()
             return
         self._has_spoilers = False
+        if self._spoiler_timer.isActive():
+            self._spoiler_timer.stop()
         self.set_rich_text(self._raw_text)
 
     def set_rich_text(self, text: str) -> None:
@@ -496,6 +579,99 @@ class RichTextLabel(QLabel):
         else:
             html = _prepare_rich_text(text)
         self.setText(html)
+
+    @Slot()
+    def _tick_spoiler_animation(self) -> None:
+        self._spoiler_phase = (self._spoiler_phase + 0.06) % 1.0
+        if self._spoiler_flash > 0.0:
+            self._spoiler_flash = max(0.0, self._spoiler_flash - 0.08)
+        if not (self._has_spoilers and not self._spoilers_revealed) and self._spoiler_flash <= 0.0:
+            self._spoiler_timer.stop()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if not ((self._has_spoilers and not self._spoilers_revealed) or self._spoiler_flash > 0.0):
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        if rect.isEmpty():
+            painter.end()
+            return
+        grad = QLinearGradient(rect.left() + (rect.width() * self._spoiler_phase), rect.top(), rect.right(), rect.bottom())
+        shimmer_alpha = 55 if self._has_spoilers and not self._spoilers_revealed else 0
+        flash_alpha = int(110 * self._spoiler_flash)
+        grad.setColorAt(0.0, QColor(36, 73, 116, shimmer_alpha))
+        grad.setColorAt(0.45, QColor(89, 183, 255, max(shimmer_alpha + 20, flash_alpha)))
+        grad.setColorAt(1.0, QColor(19, 34, 52, shimmer_alpha))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(grad)
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.end()
+
+
+class MessageReplyMarkupWidget(QWidget):
+    buttonActivated = Signal(dict)
+
+    def __init__(self, mode: str = "inline", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._mode = str(mode or "inline").strip().lower()
+        self._markup: Optional[Dict[str, Any]] = None
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(6)
+
+    def clear_buttons(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                while child_layout.count():
+                    child_item = child_layout.takeAt(0)
+                    child_widget = child_item.widget()
+                    if child_widget is not None:
+                        child_widget.deleteLater()
+
+    def set_markup(self, markup: Optional[Dict[str, Any]]) -> None:
+        self._markup = dict(markup or {}) if isinstance(markup, dict) else None
+        self.clear_buttons()
+        rows = list((self._markup or {}).get("rows") or [])
+        if not rows:
+            self.hide()
+            return
+        inline = str((self._markup or {}).get("type") or "").strip().lower() == "inline"
+        css = (
+            "QPushButton{background-color:rgba(89,183,255,0.16);border:1px solid rgba(89,183,255,0.30);"
+            "border-radius:12px;color:#dff1ff;padding:8px 12px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background-color:rgba(89,183,255,0.24);}"
+        ) if inline else (
+            "QPushButton{background-color:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);"
+            "border-radius:12px;color:#dfe7f5;padding:9px 12px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background-color:rgba(255,255,255,0.11);}"
+        )
+        for row in rows:
+            row_buttons = list(row or [])
+            if not row_buttons:
+                continue
+            line = QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(6)
+            for button_data in row_buttons:
+                if not isinstance(button_data, dict):
+                    continue
+                text = str(button_data.get("text") or "").strip() or "Кнопка"
+                btn = QPushButton(text, self)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setStyleSheet(css)
+                payload = dict(button_data)
+                btn.clicked.connect(lambda _checked=False, p=payload: self.buttonActivated.emit(dict(p)))
+                line.addWidget(btn, 1)
+            self._layout.addLayout(line)
+        self.show()
 
 
 # -------------------------------- Bubble ---------------------------------
@@ -892,6 +1068,8 @@ class ForwardInfoWidget(QWidget):
 
 class TextMessageWidget(QWidget):
     """Widget that renders plain text messages with optional reply preview."""
+    commandActivated = Signal(str)
+    replyMarkupButtonActivated = Signal(dict)
 
     def __init__(
         self,
@@ -900,11 +1078,15 @@ class TextMessageWidget(QWidget):
         *,
         role: str = "other",
         entities: Optional[List[Dict[str, Any]]] = None,
+        chat_id: Optional[str] = None,
+        msg_id: Optional[int] = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.role = role
         self.kind = "text"
+        self.chat_id = chat_id
+        self.msg_id = msg_id
         self._show_header_label = not (
             self.role == "me" and str(header or "").strip().lower() in {"", "вы", "you", "me"}
         )
@@ -914,6 +1096,8 @@ class TextMessageWidget(QWidget):
         self._reply_data: Optional[Dict[str, Any]] = None
         self._forward_widget: Optional[ForwardInfoWidget] = None
         self._forward_data: Optional[Dict[str, Any]] = None
+        self._reply_markup_widget: Optional[MessageReplyMarkupWidget] = None
+        self._reply_markup_data: Optional[Dict[str, Any]] = None
         self._is_deleted = False
         self._custom_header_color: Optional[str] = None
         self._content_hidden = False
@@ -945,6 +1129,7 @@ class TextMessageWidget(QWidget):
         root.addWidget(self.bubble, 0)
         self._message_label = RichTextLabel(text, self)
         self._message_label.setStyleSheet(_style_sheet("message.body.rich_text", "background-color: transparent;"))
+        self._message_label.commandActivated.connect(self.commandActivated.emit)
         if self._text_entities:
             self._message_label.set_message(text, entities=self._text_entities)
         self.bubble.add_content(self._message_label)
@@ -1017,6 +1202,28 @@ class TextMessageWidget(QWidget):
         self._forward_widget.set_info(data)
         self._reinsert_reply_widget()
 
+    def set_reply_markup(self, data: Optional[Dict[str, Any]]) -> None:
+        markup = dict(data) if isinstance(data, dict) else None
+        if markup and str(markup.get("type") or "").strip().lower() != "inline":
+            markup = None
+        self._reply_markup_data = markup
+        if not markup:
+            if self._reply_markup_widget:
+                self.bubble.remove_content(self._reply_markup_widget)
+                self._reply_markup_widget.deleteLater()
+                self._reply_markup_widget = None
+            return
+        if not self._reply_markup_widget:
+            self._reply_markup_widget = MessageReplyMarkupWidget("inline", self)
+            self._reply_markup_widget.buttonActivated.connect(self._emit_reply_markup_action)
+        self.bubble.remove_content(self._reply_markup_widget)
+        self.bubble.add_content(self._reply_markup_widget)
+        self._reply_markup_widget.set_markup(markup)
+
+    def set_search_query(self, query: str, *, active: bool = False) -> None:
+        if self._message_label:
+            self._message_label.set_search(query, active=active)
+
     def set_message_text(self, text: str, *, entities: Optional[List[Dict[str, Any]]] = None) -> None:
         self._original_text = text
         if entities is not None:
@@ -1041,6 +1248,15 @@ class TextMessageWidget(QWidget):
             self.bubble.remove_content(self._reply_widget)
             idx = 1 if self._forward_widget else 0
             self.bubble.add_content(self._reply_widget, at=idx)
+
+    @Slot(dict)
+    def _emit_reply_markup_action(self, action: Dict[str, Any]) -> None:
+        payload = dict(action or {})
+        if self.chat_id:
+            payload.setdefault("chat_id", str(self.chat_id))
+        if self.msg_id is not None:
+            payload.setdefault("message_id", int(self.msg_id))
+        self.replyMarkupButtonActivated.emit(payload)
 
     def set_deleted(self, deleted: bool) -> None:
         self._is_deleted = bool(deleted)
@@ -1070,6 +1286,11 @@ class TextMessageWidget(QWidget):
         if self._forward_widget:
             try:
                 self._forward_widget.deleteLater()
+            except Exception:
+                pass
+        if self._reply_markup_widget:
+            try:
+                self._reply_markup_widget.deleteLater()
             except Exception:
                 pass
 
@@ -1218,6 +1439,9 @@ class VoiceWaveformWidget(QWidget):
 # -------------------------- Элемент ленты: медиа --------------------------
 
 class ChatItemWidget(MediaRenderingMixin, QWidget):
+    commandActivated = Signal(str)
+    replyMarkupButtonActivated = Signal(dict)
+
     def __init__(
         self,
         kind: str,
@@ -1295,6 +1519,8 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._reply_data: Optional[Dict[str, Any]] = None
         self._forward_widget: Optional[ForwardInfoWidget] = None
         self._forward_data: Optional[Dict[str, Any]] = None
+        self._reply_markup_widget: Optional[MessageReplyMarkupWidget] = None
+        self._reply_markup_data: Optional[Dict[str, Any]] = None
         self._custom_header_color: Optional[str] = None
         self._content_layout: Optional[QVBoxLayout] = None
         self._deleted_placeholder: Optional[QLabel] = None
@@ -2013,6 +2239,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         caption = RichTextLabel(self.text, self)
         caption.setStyleSheet(_style_sheet("message.caption", "font-size:13px;"))
         caption.setWordWrap(True)
+        caption.commandActivated.connect(self.commandActivated.emit)
         if self.text_entities:
             caption.set_message(self.text, entities=self.text_entities)
         if self.kind == "image" and not self.bubble:
@@ -2037,6 +2264,38 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         if self._caption_label:
             self._caption_label.set_message(self.text, entities=self.text_entities)
             self._caption_label.show()
+
+    def set_reply_markup(self, data: Optional[Dict[str, Any]]) -> None:
+        markup = dict(data) if isinstance(data, dict) else None
+        if markup and str(markup.get("type") or "").strip().lower() != "inline":
+            markup = None
+        self._reply_markup_data = markup
+        if not markup:
+            if self._reply_markup_widget and self._content_layout:
+                self._content_layout.removeWidget(self._reply_markup_widget)
+                self._reply_markup_widget.deleteLater()
+                self._reply_markup_widget = None
+            return
+        if not self._reply_markup_widget:
+            self._reply_markup_widget = MessageReplyMarkupWidget("inline", self)
+            self._reply_markup_widget.buttonActivated.connect(self._emit_reply_markup_action)
+        if self._content_layout and self._reply_markup_widget:
+            self._content_layout.removeWidget(self._reply_markup_widget)
+            self._content_layout.addWidget(self._reply_markup_widget, 0)
+            self._reply_markup_widget.set_markup(markup)
+
+    def set_search_query(self, query: str, *, active: bool = False) -> None:
+        if self._caption_label:
+            self._caption_label.set_search(query, active=active)
+
+    @Slot(dict)
+    def _emit_reply_markup_action(self, action: Dict[str, Any]) -> None:
+        payload = dict(action or {})
+        if self.chat_id:
+            payload.setdefault("chat_id", str(self.chat_id))
+        if self.msg_id is not None:
+            payload.setdefault("message_id", int(self.msg_id))
+        self.replyMarkupButtonActivated.emit(payload)
 
 
     def _set_doc_status_text(self, text: Optional[str]) -> None:
@@ -2463,6 +2722,12 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             except Exception:
                 pass
             self._forward_widget = None
+        if self._reply_markup_widget:
+            try:
+                self._reply_markup_widget.deleteLater()
+            except Exception:
+                pass
+            self._reply_markup_widget = None
         if self._voice_wave_widget:
             try:
                 self._voice_wave_widget.deleteLater()
