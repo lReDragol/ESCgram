@@ -6,6 +6,8 @@ import re
 import tarfile
 import tempfile
 import zipfile
+import sys
+import subprocess
 from typing import List, Optional, Dict, Any, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -535,4 +537,47 @@ class FfmpegInstallWorker(QObject):
                 shutil.rmtree(tmp_root, ignore_errors=True)
             except Exception:
                 pass
+        self.finished.emit(payload)
+
+
+class VoiceDepsInstallWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, *, packages: Optional[List[str]] = None):
+        super().__init__()
+        self.packages = list(packages or ["sounddevice", "soundfile"])
+
+    @Slot()
+    def run(self) -> None:
+        payload: Dict[str, Any] = {"ok": False, "error": "", "output": ""}
+        if bool(getattr(sys, "frozen", False)):
+            payload["ok"] = True
+            payload["output"] = "Сборка уже содержит зависимости Python. Для голосовых нужен ffmpeg."
+            self.finished.emit(payload)
+            return
+
+        cmd = [sys.executable, "-m", "pip", "install", "-U", *self.packages]
+        self.progress.emit("Устанавливаю Python-зависимости для голосовых…")
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=600,
+                check=False,
+            )
+            out = str(proc.stdout or "").strip()
+            payload["output"] = out[-4000:] if out else ""
+            if int(proc.returncode) == 0:
+                payload["ok"] = True
+            else:
+                payload["error"] = f"pip завершился с кодом {proc.returncode}"
+        except subprocess.TimeoutExpired:
+            payload["error"] = "Установка зависимостей заняла слишком много времени."
+        except Exception as exc:
+            payload["error"] = str(exc)
         self.finished.emit(payload)

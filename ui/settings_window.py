@@ -238,6 +238,13 @@ class SettingsWindow(QDialog):
         else:
             self.btn_install_ffmpeg.setEnabled(False)
         media_layout.addWidget(self.btn_install_ffmpeg, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.btn_install_voice_deps = QPushButton("Установить зависимости голосовых")
+        voice_deps_cb = callbacks.get("install_voice_deps")
+        if callable(voice_deps_cb):
+            self.btn_install_voice_deps.clicked.connect(lambda: voice_deps_cb())
+        else:
+            self.btn_install_voice_deps.setEnabled(False)
+        media_layout.addWidget(self.btn_install_voice_deps, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(media_box)
 
         theme_box = QGroupBox("Тема оформления")

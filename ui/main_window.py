@@ -69,6 +69,7 @@ from ui.dialog_workers import (
     LastDateWorker,
     ReleaseCheckWorker,
     UpdateDownloadWorker,
+    VoiceDepsInstallWorker,
 )
 from ui.account_workers import AccountProfileWorker
 from ui.event_pump import EventPump
@@ -236,6 +237,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._global_search_worker: Optional[GlobalPeerSearchWorker] = None
         self._ffmpeg_install_thread: Optional[QThread] = None
         self._ffmpeg_install_worker: Optional[FfmpegInstallWorker] = None
+        self._voice_deps_thread: Optional[QThread] = None
+        self._voice_deps_worker: Optional[VoiceDepsInstallWorker] = None
 
         # аватары
         self.avatar_cache = AvatarCache(
@@ -1775,6 +1778,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         menu = build_header_menu(self)
         menu.addAction("Открыть профиль").triggered.connect(self._show_current_chat_info)
         menu.addAction("Статистика чата").triggered.connect(self._show_current_chat_statistics)
+        menu.addAction("Анти-накрутка").triggered.connect(self._show_current_chat_statistics)
         menu.addSeparator()
         menu.addAction("Обновить историю").triggered.connect(lambda: self.load_chat_history_async(reset=True))
         menu.addAction("Пометить прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
@@ -2152,12 +2156,24 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         script_path = str(app_paths.temp_dir() / "escgram_apply_update.cmd")
         quoted_installer = update_path.replace('"', '""')
         quoted_exe = current_exe.replace('"', '""')
+        quoted_install = os.path.dirname(current_exe).replace('"', '""')
         quoted_data = str(app_paths.get_data_dir()).replace('"', '""')
         script = (
             "@echo off\r\n"
             "setlocal\r\n"
+            f"set \"DATA_DIR={quoted_data}\"\r\n"
+            "set \"BACKUP_DIR=%TEMP%\\escgram_data_backup_%RANDOM%%RANDOM%\"\r\n"
+            "if exist \"%DATA_DIR%\" (\r\n"
+            "  mkdir \"%BACKUP_DIR%\" >nul 2>&1\r\n"
+            "  robocopy \"%DATA_DIR%\" \"%BACKUP_DIR%\" /E /NFL /NDL /NJH /NJS /NC /NS >nul\r\n"
+            ")\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
-            f"start /wait \"\" \"{quoted_installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n"
+            f"start /wait \"\" \"{quoted_installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=\"{quoted_install}\" /DATADIR=\"{quoted_data}\"\r\n"
+            "if exist \"%BACKUP_DIR%\" (\r\n"
+            "  mkdir \"%DATA_DIR%\" >nul 2>&1\r\n"
+            "  robocopy \"%BACKUP_DIR%\" \"%DATA_DIR%\" /E /NFL /NDL /NJH /NJS /NC /NS >nul\r\n"
+            "  rmdir /S /Q \"%BACKUP_DIR%\" >nul 2>&1\r\n"
+            ")\r\n"
             f"start \"\" \"{quoted_exe}\" --data-dir \"{quoted_data}\"\r\n"
             "del \"%~f0\"\r\n"
         )
@@ -2227,8 +2243,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "set -euo pipefail\n"
             "sleep 1\n"
             "TMP_DIR=\"$(mktemp -d)\"\n"
+            "BACKUP_DIR=\"$(mktemp -d)\"\n"
             "cleanup(){ rm -rf \"$TMP_DIR\"; }\n"
             "trap cleanup EXIT\n"
+            f"if [[ -d \"{quoted_data}\" ]]; then\n"
+            "  if command -v rsync >/dev/null 2>&1; then\n"
+            f"    rsync -a \"{quoted_data}\"/ \"$BACKUP_DIR\"/\n"
+            "  else\n"
+            f"    cp -a \"{quoted_data}\"/. \"$BACKUP_DIR\"/ 2>/dev/null || true\n"
+            "  fi\n"
+            "fi\n"
             f"tar -xzf \"{quoted_archive}\" -C \"$TMP_DIR\"\n"
             "SRC_DIR=\"\"\n"
             "if [[ -d \"$TMP_DIR/ESCgram\" ]]; then SRC_DIR=\"$TMP_DIR/ESCgram\"; fi\n"
@@ -2248,6 +2272,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             f"  cp -a \"$SRC_DIR\"/. \"{quoted_install}\"/\n"
             "fi\n"
             f"mkdir -p \"{quoted_data}\"\n"
+            "if command -v rsync >/dev/null 2>&1; then\n"
+            f"  rsync -a \"$BACKUP_DIR\"/ \"{quoted_data}\"/ 2>/dev/null || true\n"
+            "else\n"
+            f"  cp -a \"$BACKUP_DIR\"/. \"{quoted_data}\"/ 2>/dev/null || true\n"
+            "fi\n"
+            "rm -rf \"$BACKUP_DIR\" >/dev/null 2>&1 || true\n"
             f"nohup \"{quoted_exe}\" --data-dir \"{quoted_data}\" >/dev/null 2>&1 &\n"
         )
         try:
@@ -4612,6 +4642,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 reaction_menu.addAction(emoji).triggered.connect(lambda _, e=emoji, mid=mid: self._set_message_reaction(mid, e))
             menu.addSeparator()
             menu.addAction("Статистика сообщения").triggered.connect(lambda: self._show_message_statistics(mid))
+            menu.addAction("Анти-накрутка / аналитика").triggered.connect(lambda: self._show_message_statistics(mid))
             menu.addAction("Удалить сообщение").triggered.connect(lambda: self._delete_message(mid))
             menu.addAction("Копировать ссылку на сообщение").triggered.connect(lambda: self._copy_message_link(mid))
             menu.addAction("Переслать").triggered.connect(lambda: self._forward_message(mid))
@@ -5427,6 +5458,53 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         QMessageBox.warning(self, "ffmpeg", f"Не удалось установить ffmpeg.\n{err or 'Неизвестная ошибка.'}")
 
+    def _install_voice_dependencies_from_settings(self) -> None:
+        thread = getattr(self, "_voice_deps_thread", None)
+        if thread is not None and thread.isRunning():
+            self._toast("Установка зависимостей уже выполняется")
+            return
+        self._toast("Запущена установка зависимостей голосовых…")
+        try:
+            thread = QThread(self)
+            thread.setObjectName("voice_deps_install_thread")
+            worker = VoiceDepsInstallWorker()
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_voice_deps_install_progress)
+            worker.finished.connect(self._on_voice_deps_install_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_voice_deps_thread", None))
+            thread.finished.connect(lambda: setattr(self, "_voice_deps_worker", None))
+            self._voice_deps_thread = thread
+            self._voice_deps_worker = worker
+            thread.start()
+        except Exception:
+            log.exception("Failed to start voice dependencies installer")
+            self._voice_deps_thread = None
+            self._voice_deps_worker = None
+            QMessageBox.warning(self, "Голосовые", "Не удалось запустить установку зависимостей.")
+
+    @Slot(str)
+    def _on_voice_deps_install_progress(self, text: str) -> None:
+        if text:
+            self._toast(str(text))
+
+    @Slot(dict)
+    def _on_voice_deps_install_finished(self, payload: Dict[str, Any]) -> None:
+        ok = bool((payload or {}).get("ok"))
+        err = str((payload or {}).get("error") or "").strip()
+        out = str((payload or {}).get("output") or "").strip()
+        if ok:
+            message = "Зависимости для голосовых установлены."
+            if out:
+                message = message + "\n\n" + out[-1200:]
+            QMessageBox.information(self, "Голосовые", message)
+            self._toast("Зависимости голосовых установлены")
+            return
+        QMessageBox.warning(self, "Голосовые", f"Не удалось установить зависимости.\n{err or 'Неизвестная ошибка.'}")
+
     def _build_voice_ffmpeg_cmd(self, ffmpeg: str, src_path: str, dst_path: str) -> List[str]:
         return [
             ffmpeg,
@@ -5961,6 +6039,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "show_my_avatar": self.on_show_my_avatar_setting_changed,
             "keep_deleted_messages": self.on_keep_deleted_messages_setting_changed,
             "install_ffmpeg": self._install_ffmpeg_from_settings,
+            "install_voice_deps": self._install_voice_dependencies_from_settings,
         }
         if hasattr(self, "auto_ai_checkbox"):
             callbacks["auto_ai"] = lambda checked: self.auto_ai_checkbox.setChecked(bool(checked))
@@ -6106,6 +6185,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self._ffmpeg_install_worker = None
         self._ffmpeg_install_thread = None
+
+        voice_deps_thread = getattr(self, "_voice_deps_thread", None)
+        if _thread_is_running(voice_deps_thread):
+            try:
+                voice_deps_thread.quit()
+                voice_deps_thread.wait(1200)
+            except Exception:
+                pass
+        self._voice_deps_worker = None
+        self._voice_deps_thread = None
 
         profile_thread = getattr(self, "_account_profile_thread", None)
         if _thread_is_running(profile_thread):

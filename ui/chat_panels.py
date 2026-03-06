@@ -274,6 +274,76 @@ class ChatStatisticsDialog(QDialog):
                 section.body.addLayout(line)
             root.addWidget(section)
 
+        senders = list(data.get("top_senders") or [])
+        if senders:
+            section = _StatsSection("Активность отправителей", self)
+            max_count = max(int(item.get("count") or 0) for item in senders) or 1
+            for item in senders:
+                name = str(item.get("name") or item.get("sender_id") or "unknown")
+                username = str(item.get("username") or "").strip()
+                sender_type = str(item.get("type") or "").strip().lower()
+                count = int(item.get("count") or 0)
+                label_text = name
+                if username:
+                    label_text += f" (@{username})"
+                if sender_type:
+                    label_text += f" [{sender_type}]"
+                line = QHBoxLayout()
+                label = QLabel(label_text)
+                label.setMinimumWidth(180)
+                label.setWordWrap(True)
+                bar = QProgressBar(self)
+                bar.setRange(0, max_count)
+                bar.setValue(count)
+                line.addWidget(label, 1)
+                line.addWidget(bar, 1)
+                line.addWidget(QLabel(str(count)), 0)
+                section.body.addLayout(line)
+            root.addWidget(section)
+
+        reason_labels = {
+            "bot_like_sender": "похож на бота",
+            "high_message_share": "высокая доля сообщений",
+            "dominant_sender": "доминирует в потоке сообщений",
+        }
+        suspicious = list(data.get("suspicious_senders") or [])
+        if suspicious:
+            section = _StatsSection("Анти-накрутка: подозрительные отправители", self)
+            for row in suspicious:
+                name = str(row.get("name") or row.get("sender_id") or "unknown")
+                username = str(row.get("username") or "").strip()
+                reason_items = [
+                    reason_labels.get(str(x).strip(), str(x).strip())
+                    for x in list(row.get("reasons") or [])
+                    if str(x).strip()
+                ]
+                reasons = ", ".join(reason_items)
+                count = int(row.get("count") or 0)
+                share = float(row.get("share") or 0.0)
+                details = name
+                if username:
+                    details += f" (@{username})"
+                details += f" • сообщений: {count} • доля: {share * 100.0:.1f}%"
+                if reasons:
+                    details += f"\nПризнаки: {reasons}"
+                lbl = QLabel(details)
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color:#ffd78c;")
+                section.body.addWidget(lbl)
+            root.addWidget(section)
+
+        anomaly_labels = {
+            "reactions_exceed_views": "Реакций существенно больше просмотров.",
+            "forwards_exceed_views": "Пересылок существенно больше просмотров.",
+            "multiple_suspicious_senders": "Обнаружено несколько подозрительных отправителей.",
+        }
+        anomaly_flags = [str(x) for x in list(data.get("anomaly_flags") or []) if str(x).strip()]
+        if anomaly_flags:
+            section = _StatsSection("Аномалии", self)
+            for flag in anomaly_flags:
+                section.body.addWidget(QLabel(f"• {anomaly_labels.get(flag, flag)}"))
+            root.addWidget(section)
+
         polls = list(data.get("polls") or [])
         if polls:
             scroll = QScrollArea(self)
@@ -344,6 +414,19 @@ class MessageStatisticsDialog(QDialog):
             summary.body.addWidget(QLabel(f"{label}: {value}"))
         root.addWidget(summary)
 
+        sender_profile = data.get("sender_profile") if isinstance(data.get("sender_profile"), dict) else None
+        if sender_profile:
+            section = _StatsSection("Отправитель", self)
+            sender_name = str(sender_profile.get("name") or sender_profile.get("id") or "unknown")
+            sender_username = str(sender_profile.get("username") or "")
+            sender_type = str(sender_profile.get("type") or "")
+            section.body.addWidget(QLabel(f"Имя: {sender_name}"))
+            if sender_username:
+                section.body.addWidget(QLabel(f"Username: @{sender_username}"))
+            if sender_type:
+                section.body.addWidget(QLabel(f"Тип: {sender_type}"))
+            root.addWidget(section)
+
         reactions = list(message.get("reactions") or [])
         if reactions:
             section = _StatsSection("Реакции", self)
@@ -388,6 +471,20 @@ class MessageStatisticsDialog(QDialog):
                 label.setWordWrap(True)
                 label.setStyleSheet("color:#9fb3cc;")
                 section.body.addWidget(label)
+            root.addWidget(section)
+
+        risk_labels = {
+            "reactions_exceed_views": "Реакций больше ожидаемого относительно просмотров.",
+            "forwards_exceed_views": "Пересылок больше ожидаемого относительно просмотров.",
+            "sender_bot_like": "Отправитель похож на бот-аккаунт.",
+        }
+        risk_flags = [str(x) for x in list(data.get("risk_flags") or []) if str(x).strip()]
+        if risk_flags:
+            section = _StatsSection("Анти-накрутка: риск-флаги", self)
+            for flag in risk_flags:
+                lbl = QLabel(f"• {risk_labels.get(flag, flag)}")
+                lbl.setStyleSheet("color:#ffd78c;")
+                section.body.addWidget(lbl)
             root.addWidget(section)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)

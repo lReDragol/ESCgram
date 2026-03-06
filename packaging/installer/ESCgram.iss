@@ -36,7 +36,80 @@ var
   DataDirPage: TInputDirWizardPage;
   ApiPage: TInputQueryWizardPage;
 
+function _JsonEscape(const S: String): String; forward;
+
+function _FindCharFrom(const S: String; const Ch: Char; const StartPos: Integer): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := StartPos to Length(S) do
+  begin
+    if S[I] = Ch then
+    begin
+      Result := I;
+      Exit;
+    end;
+  end;
+end;
+
+function _ReadBootstrapDataDir: String;
+var
+  BootstrapPath: String;
+  Content: String;
+  KeyPos: Integer;
+  ColonPos: Integer;
+  QuoteStart: Integer;
+  QuoteEnd: Integer;
+begin
+  Result := '';
+  BootstrapPath := ExpandConstant('{userappdata}\\DragoGUI\\bootstrap.json');
+  if not FileExists(BootstrapPath) then
+    Exit;
+  if not LoadStringFromFile(BootstrapPath, Content) then
+    Exit;
+
+  KeyPos := Pos('"data_dir"', Content);
+  if KeyPos <= 0 then
+    Exit;
+  ColonPos := _FindCharFrom(Content, ':', KeyPos + 10);
+  if ColonPos <= 0 then
+    Exit;
+  QuoteStart := _FindCharFrom(Content, '"', ColonPos + 1);
+  if QuoteStart <= 0 then
+    Exit;
+  QuoteEnd := _FindCharFrom(Content, '"', QuoteStart + 1);
+  if QuoteEnd <= QuoteStart then
+    Exit;
+
+  Result := Copy(Content, QuoteStart + 1, QuoteEnd - QuoteStart - 1);
+  StringChangeEx(Result, '\\', '\', True);
+end;
+
+procedure _WriteBootstrapDataDir(const DataDir: String);
+var
+  BootstrapDir: String;
+  BootstrapPath: String;
+  SafeDir: String;
+  Payload: String;
+begin
+  SafeDir := Trim(DataDir);
+  if SafeDir = '' then
+    Exit;
+  BootstrapDir := ExpandConstant('{userappdata}\\DragoGUI');
+  if not DirExists(BootstrapDir) then
+    ForceDirectories(BootstrapDir);
+  BootstrapPath := AddBackslash(BootstrapDir) + 'bootstrap.json';
+  SafeDir := _JsonEscape(SafeDir);
+  Payload := '{'#13#10 + '  "data_dir": "' + SafeDir + '"'#13#10 + '}';
+  SaveStringToFile(BootstrapPath, Payload, False);
+end;
+
 procedure InitializeWizard;
+var
+  DefaultDataDir: String;
+  ParamDataDir: String;
+  BootstrapDataDir: String;
 begin
   DataDirPage := CreateInputDirPage(
     wpSelectDir,
@@ -47,7 +120,17 @@ begin
     ''
   );
   DataDirPage.Add('');
-  DataDirPage.Values[0] := ExpandConstant('{localappdata}\\ESCgram');
+  DefaultDataDir := ExpandConstant('{localappdata}\\ESCgram');
+  ParamDataDir := Trim(ExpandConstant('{param:DATADIR|}'));
+  if ParamDataDir <> '' then
+    DefaultDataDir := ParamDataDir
+  else
+  begin
+    BootstrapDataDir := _ReadBootstrapDataDir;
+    if BootstrapDataDir <> '' then
+      DefaultDataDir := BootstrapDataDir;
+  end;
+  DataDirPage.Values[0] := DefaultDataDir;
 
   ApiPage := CreateInputQueryPage(
     DataDirPage.ID,
@@ -200,5 +283,8 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
+  begin
     _WriteConfigIfMissing;
+    _WriteBootstrapDataDir(DataDirPage.Values[0]);
+  end;
 end;

@@ -940,99 +940,105 @@ class Storage:
             mids.append(val)
         if not mids:
             return {}
-        placeholders = ",".join(["?"] * len(mids))
-        rows = self._query(
-            f"""
-            SELECT
-              m.id,
-              m.from_id,
-              m.reply_to,
-              m.message,
-              m.media_type,
-              m.is_deleted,
-              m.forward_info,
-              m.file_name,
-              m.entities,
-              COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
-              m.duration,
-              m.waveform,
-              m.reactions,
-              m.poll,
-              m.views,
-              m.forwards,
-              m.media_group_id
-            FROM messages m
-            LEFT JOIN peers p
-              ON p.id = m.from_id
-            WHERE m.peer_id = ? AND m.id IN ({placeholders})
-            """,
-            (int(peer_id), *mids),
-        )
         out: Dict[int, Dict[str, Any]] = {}
-        for row in rows:
-            try:
-                mid = int(row[0])
-            except Exception:
-                continue
-            fwd_raw = row[6]
-            if fwd_raw:
+        chunk_size = 400
+        for idx in range(0, len(mids), chunk_size):
+            chunk = mids[idx : idx + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = self._query(
+                f"""
+                SELECT
+                  m.id,
+                  m.from_id,
+                  m.reply_to,
+                  m.message,
+                  m.media_type,
+                  m.is_deleted,
+                  m.forward_info,
+                  m.file_name,
+                  m.entities,
+                  COALESCE(p.title, p.username, CAST(m.from_id AS TEXT)),
+                  m.duration,
+                  m.waveform,
+                  m.reactions,
+                  m.poll,
+                  m.views,
+                  m.forwards,
+                  m.media_group_id
+                FROM messages m
+                LEFT JOIN peers p
+                  ON p.id = m.from_id
+                WHERE m.peer_id = ? AND m.id IN ({placeholders})
+                """,
+                (int(peer_id), *chunk),
+            )
+            for row in rows:
                 try:
-                    forward_info = json.loads(fwd_raw)
+                    mid = int(row[0])
                 except Exception:
-                    forward_info = {"sender": fwd_raw}
-            else:
-                forward_info = None
-            entities_raw = row[8]
-            if entities_raw:
+                    continue
                 try:
-                    entities = json.loads(entities_raw)
+                    fwd_raw = row[6]
+                    if fwd_raw:
+                        try:
+                            forward_info = json.loads(fwd_raw)
+                        except Exception:
+                            forward_info = {"sender": fwd_raw}
+                    else:
+                        forward_info = None
+                    entities_raw = row[8]
+                    if entities_raw:
+                        try:
+                            entities = json.loads(entities_raw)
+                        except Exception:
+                            entities = None
+                    else:
+                        entities = None
+                    waveform_raw = row[11]
+                    if waveform_raw:
+                        try:
+                            waveform = json.loads(waveform_raw)
+                        except Exception:
+                            waveform = None
+                    else:
+                        waveform = None
+                    reactions_raw = row[12]
+                    if reactions_raw:
+                        try:
+                            reactions = json.loads(reactions_raw)
+                        except Exception:
+                            reactions = None
+                    else:
+                        reactions = None
+                    poll_raw = row[13]
+                    if poll_raw:
+                        try:
+                            poll = json.loads(poll_raw)
+                        except Exception:
+                            poll = None
+                    else:
+                        poll = None
+                    out[mid] = {
+                        "id": mid,
+                        "from_id": row[1],
+                        "reply_to": row[2],
+                        "text": row[3] or "",
+                        "type": row[4] or "text",
+                        "is_deleted": bool(row[5]),
+                        "forward_info": forward_info,
+                        "file_name": row[7],
+                        "entities": entities,
+                        "sender": row[9] or (str(row[1]) if row[1] is not None else ""),
+                        "duration": row[10],
+                        "waveform": waveform,
+                        "reactions": reactions,
+                        "poll": poll,
+                        "views": row[14],
+                        "forwards": row[15],
+                        "media_group_id": row[16],
+                    }
                 except Exception:
-                    entities = None
-            else:
-                entities = None
-            waveform_raw = row[11]
-            if waveform_raw:
-                try:
-                    waveform = json.loads(waveform_raw)
-                except Exception:
-                    waveform = None
-            else:
-                waveform = None
-            reactions_raw = row[12]
-            if reactions_raw:
-                try:
-                    reactions = json.loads(reactions_raw)
-                except Exception:
-                    reactions = None
-            else:
-                reactions = None
-            poll_raw = row[13]
-            if poll_raw:
-                try:
-                    poll = json.loads(poll_raw)
-                except Exception:
-                    poll = None
-            else:
-                poll = None
-            out[mid] = {
-                "id": mid,
-                "from_id": row[1],
-                "reply_to": row[2],
-                "text": row[3] or "",
-                "type": row[4] or "text",
-                "is_deleted": bool(row[5]),
-                "forward_info": forward_info,
-                "file_name": row[7],
-                "entities": entities,
-                "sender": row[9] or (str(row[1]) if row[1] is not None else ""),
-                "duration": row[10],
-                "waveform": waveform,
-                "reactions": reactions,
-                "poll": poll,
-                "views": row[14],
-                "forwards": row[15],
-                "media_group_id": row[16],
-            }
+                    continue
         return out
 
     def find_peers_for_message_ids(self, message_ids: Iterable[int]) -> Dict[int, List[int]]:
@@ -1049,24 +1055,26 @@ class Storage:
             mids.append(val)
         if not mids:
             return {}
-
-        placeholders = ",".join(["?"] * len(mids))
-        rows = self._query(
-            f"""
-            SELECT peer_id, id
-            FROM messages
-            WHERE id IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0
-            """,
-            tuple(mids),
-        )
         out: Dict[int, List[int]] = {}
-        for peer_id, msg_id in rows:
-            try:
-                pid = int(peer_id)
-                mid = int(msg_id)
-            except Exception:
-                continue
-            out.setdefault(pid, []).append(mid)
+        chunk_size = 400
+        for idx in range(0, len(mids), chunk_size):
+            chunk = mids[idx : idx + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = self._query(
+                f"""
+                SELECT peer_id, id
+                FROM messages
+                WHERE id IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0
+                """,
+                tuple(chunk),
+            )
+            for peer_id, msg_id in rows:
+                try:
+                    pid = int(peer_id)
+                    mid = int(msg_id)
+                except Exception:
+                    continue
+                out.setdefault(pid, []).append(mid)
         return out
 
     def get_recent_emojis(self, *, limit: int = 48, sender_id: Optional[int] = None) -> List[str]:
@@ -1109,7 +1117,8 @@ class Storage:
               reactions,
               poll,
               COALESCE(views, 0),
-              COALESCE(forwards, 0)
+              COALESCE(forwards, 0),
+              COALESCE(from_id, 0)
             FROM messages
             WHERE peer_id = ?
             ORDER BY id DESC
@@ -1124,14 +1133,21 @@ class Storage:
         total_forwards = 0
         total_reactions = 0
         reaction_counter: Counter[str] = Counter()
+        sender_counter: Counter[int] = Counter()
         polls: List[Dict[str, Any]] = []
-        for _, media_type, is_deleted, reactions_raw, poll_raw, views, forwards in rows:
+        for _, media_type, is_deleted, reactions_raw, poll_raw, views, forwards, from_id in rows:
             if str(media_type or "text") != "text":
                 media_messages += 1
             if bool(is_deleted):
                 deleted_messages += 1
             total_views += int(views or 0)
             total_forwards += int(forwards or 0)
+            try:
+                sender = int(from_id or 0)
+            except Exception:
+                sender = 0
+            if sender:
+                sender_counter[sender] += 1
             if reactions_raw:
                 try:
                     reactions = json.loads(reactions_raw)
@@ -1154,6 +1170,69 @@ class Storage:
                     poll = None
                 if isinstance(poll, dict):
                     polls.append(poll)
+
+        sender_meta: Dict[int, Dict[str, str]] = {}
+        if sender_counter:
+            sender_ids = sorted(sender_counter.keys())
+            placeholders = ",".join(["?"] * len(sender_ids))
+            peer_rows = self._query(
+                f"""
+                SELECT id, COALESCE(title, ''), COALESCE(username, ''), COALESCE(type, '')
+                FROM peers
+                WHERE id IN ({placeholders})
+                """,
+                tuple(sender_ids),
+            )
+            for pid, title, username, ptype in peer_rows:
+                try:
+                    key = int(pid)
+                except Exception:
+                    continue
+                sender_meta[key] = {
+                    "title": str(title or ""),
+                    "username": str(username or ""),
+                    "type": str(ptype or ""),
+                }
+
+        top_senders: List[Dict[str, Any]] = []
+        suspicious_senders: List[Dict[str, Any]] = []
+        denominator = max(1, int(total_messages or 0))
+        for sender_id, count in sender_counter.most_common(12):
+            meta = sender_meta.get(sender_id, {})
+            username = str(meta.get("username") or "")
+            sender_type = str(meta.get("type") or "")
+            title = str(meta.get("title") or username or sender_id)
+            share = float(count) / float(denominator)
+            row = {
+                "sender_id": int(sender_id),
+                "name": title,
+                "username": username,
+                "type": sender_type,
+                "count": int(count),
+                "share": round(share, 4),
+            }
+            top_senders.append(row)
+            reasons: List[str] = []
+            lower_user = username.lower()
+            lower_type = sender_type.lower()
+            if lower_type == "bot" or lower_user.endswith("bot"):
+                reasons.append("bot_like_sender")
+            if count >= 20 and share >= 0.35:
+                reasons.append("high_message_share")
+            if count >= 50 and share >= 0.50:
+                reasons.append("dominant_sender")
+            if reasons:
+                suspicious_row = dict(row)
+                suspicious_row["reasons"] = reasons
+                suspicious_senders.append(suspicious_row)
+
+        anomaly_flags: List[str] = []
+        if total_views > 0 and total_reactions > int(total_views * 1.2):
+            anomaly_flags.append("reactions_exceed_views")
+        if total_views > 0 and total_forwards > int(total_views * 1.1):
+            anomaly_flags.append("forwards_exceed_views")
+        if len(suspicious_senders) >= 2:
+            anomaly_flags.append("multiple_suspicious_senders")
         return {
             "total_messages": total_messages,
             "media_messages": media_messages,
@@ -1163,10 +1242,37 @@ class Storage:
             "total_reactions": total_reactions,
             "top_reactions": [{"emoji": key, "count": value} for key, value in reaction_counter.most_common(8)],
             "polls": polls[:10],
+            "top_senders": top_senders,
+            "suspicious_senders": suspicious_senders[:10],
+            "anomaly_flags": anomaly_flags,
         }
 
     def get_message_statistics(self, peer_id: int, message_id: int) -> Dict[str, Any]:
         item = self.get_message_by_id(int(peer_id), int(message_id)) or {}
+        sender_profile = None
+        sender_raw = item.get("from_id")
+        try:
+            sender_id = int(sender_raw) if sender_raw is not None else 0
+        except Exception:
+            sender_id = 0
+        if sender_id:
+            rows = self._query(
+                """
+                SELECT id, COALESCE(title, ''), COALESCE(username, ''), COALESCE(type, '')
+                FROM peers
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (sender_id,),
+            )
+            if rows:
+                row = rows[0]
+                sender_profile = {
+                    "id": int(row[0]),
+                    "name": str(row[1] or row[2] or row[0]),
+                    "username": str(row[2] or ""),
+                    "type": str(row[3] or ""),
+                }
         deleted_rows = self._query(
             """
             SELECT deleted_at, snapshot_text, media_type, sender_id, source
@@ -1186,9 +1292,32 @@ class Storage:
                 "sender_id": row[3],
                 "source": str(row[4] or ""),
             }
+        risk_flags: List[str] = []
+        views = int(item.get("views") or 0)
+        forwards = int(item.get("forwards") or 0)
+        reactions_total = 0
+        reactions = item.get("reactions") if isinstance(item.get("reactions"), list) else []
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            try:
+                reactions_total += int(reaction.get("count") or 0)
+            except Exception:
+                continue
+        if views > 0 and reactions_total > int(views * 1.2):
+            risk_flags.append("reactions_exceed_views")
+        if views > 0 and forwards > int(views * 1.1):
+            risk_flags.append("forwards_exceed_views")
+        if sender_profile:
+            sender_type = str(sender_profile.get("type") or "").lower()
+            sender_username = str(sender_profile.get("username") or "").lower()
+            if sender_type == "bot" or sender_username.endswith("bot"):
+                risk_flags.append("sender_bot_like")
         return {
             "message": item,
             "deleted_snapshot": deleted_snapshot,
+            "sender_profile": sender_profile,
+            "risk_flags": risk_flags,
         }
 
     # --------------------------- AI history ---------------------------

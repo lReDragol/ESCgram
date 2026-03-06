@@ -223,6 +223,10 @@ class TelegramAdapter:
         self._download_jobs: Dict[str, _DownloadJob] = {}
         self._message_to_job: Dict[Tuple[str, int], str] = {}
         self._download_lock = threading.Lock()
+        self._pending_deleted_by_peer: Dict[int, Set[int]] = {}
+        self._pending_deleted_unknown: Set[int] = set()
+        self._deleted_flush_task: Optional[asyncio.Task[Any]] = None
+        self._raw_delete_handler: Optional["RawUpdateHandler"] = None
 
         self._local_outgoing_ids: Deque[int] = deque()
         self._local_outgoing_lookup: Set[int] = set()
@@ -428,6 +432,16 @@ class TelegramAdapter:
 
         async def _shutdown():
             try:
+                try:
+                    if self._pending_deleted_by_peer or self._pending_deleted_unknown:
+                        await self._flush_deleted_messages_now()
+                    task = self._deleted_flush_task
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                except Exception:
+                    log.exception("[TG] Failed to flush pending deleted events during shutdown")
                 if self._initialized and self._client:
                     await self._client.terminate()
                     self._initialized = False
@@ -450,6 +464,10 @@ class TelegramAdapter:
             self._thread.join(timeout=5)
         self._thread = None
         self._loop = None
+        self._raw_delete_handler = None
+        self._deleted_flush_task = None
+        self._pending_deleted_by_peer = {}
+        self._pending_deleted_unknown = set()
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -995,7 +1013,7 @@ class TelegramAdapter:
         async def _on_deleted_messages(client: "Client", messages: List["Message"]):
             try:
                 by_chat: Dict[int, List[int]] = {}
-                unknown_chat_ids: List[int] = []
+                unknown_ids: List[int] = []
                 for msg in messages or []:
                     try:
                         mid = int(msg.id)
@@ -1003,49 +1021,50 @@ class TelegramAdapter:
                         continue
                     chat = getattr(msg, "chat", None)
                     if not chat:
-                        unknown_chat_ids.append(mid)
+                        unknown_ids.append(mid)
                         continue
                     try:
                         chat_id = int(chat.id)
                     except Exception:
-                        unknown_chat_ids.append(mid)
+                        unknown_ids.append(mid)
                         continue
                     by_chat.setdefault(chat_id, []).append(mid)
-
-                # For private/group deletions Telegram doesn't always provide chat id.
-                # Resolve affected peers via local storage.
-                if unknown_chat_ids and self._storage:
-                    try:
-                        mapped = self._storage.find_peers_for_message_ids(unknown_chat_ids)
-                        for peer_id, mids in mapped.items():
-                            if not mids:
-                                continue
-                            by_chat.setdefault(int(peer_id), []).extend([int(mid) for mid in mids])
-                    except Exception:
-                        log.exception("[TG] Failed to resolve deleted message peers for ids=%s", unknown_chat_ids)
-
                 for peer_id, mids in by_chat.items():
-                    if not mids:
-                        continue
-                    uniq_mids = sorted({int(mid) for mid in mids if int(mid) > 0})
-                    if not uniq_mids:
-                        continue
-                    if self._storage:
-                        try:
-                            self._storage.log_deleted_messages(peer_id, uniq_mids, source="telegram_updates")
-                        except Exception:
-                            log.exception("[TG] Failed to snapshot deleted messages %s/%s", peer_id, uniq_mids)
-                        try:
-                            self._storage.mark_messages_deleted(peer_id, uniq_mids, deleted=True)
-                        except Exception:
-                            log.exception("[TG] Failed to update storage for deleted messages %s/%s", peer_id, uniq_mids)
-                    if self._server:
-                        try:
-                            self._server.tg_messages_deleted(str(peer_id), uniq_mids)
-                        except Exception:
-                            log.exception("[TG] Failed to notify server about deletions %s/%s", peer_id, uniq_mids)
+                    self._queue_deleted_messages(peer_id=int(peer_id), message_ids=list(mids or []))
+                if unknown_ids:
+                    self._queue_deleted_messages(peer_id=None, message_ids=unknown_ids)
             except Exception as exc:
                 log.exception("on_deleted_messages failed: %s", exc)
+
+        async def _on_raw_update(
+            _client: "Client",
+            update: Any,
+            _users: Dict[int, Any],
+            _chats: Dict[int, Any],
+        ) -> None:
+            try:
+                if isinstance(update, raw_types.UpdateDeleteChannelMessages):
+                    try:
+                        peer_id = self._channel_id_to_peer_id(int(update.channel_id))
+                    except Exception:
+                        peer_id = None
+                    mids = [int(mid) for mid in list(getattr(update, "messages", None) or [])]
+                    self._queue_deleted_messages(peer_id=peer_id, message_ids=mids)
+                    return
+                if isinstance(update, raw_types.UpdateDeleteMessages):
+                    mids = [int(mid) for mid in list(getattr(update, "messages", None) or [])]
+                    self._queue_deleted_messages(peer_id=None, message_ids=mids)
+                    return
+            except Exception:
+                log.exception("[TG] raw delete update processing failed")
+
+        if self._raw_delete_handler is None:
+            try:
+                self._raw_delete_handler = RawUpdateHandler(_on_raw_update)
+                self._client.add_handler(self._raw_delete_handler, group=0)
+            except Exception:
+                self._raw_delete_handler = None
+                log.exception("[TG] Failed to register raw delete update handler")
 
         log.info("[TG] updates initialized (me=%s, premium=%s)",
                  getattr(m, "id", None), getattr(m, "is_premium", None))
@@ -2090,6 +2109,94 @@ class TelegramAdapter:
             return None
         value = str(raw).strip()
         return value or None
+
+    @staticmethod
+    def _channel_id_to_peer_id(channel_id: int) -> int:
+        raw = abs(int(channel_id))
+        return int(f"-100{raw}")
+
+    def _queue_deleted_messages(self, *, peer_id: Optional[int], message_ids: List[int]) -> None:
+        mids: Set[int] = set()
+        for mid in list(message_ids or []):
+            try:
+                val = int(mid)
+            except Exception:
+                continue
+            if val > 0:
+                mids.add(val)
+        if not mids:
+            return
+        if peer_id is None:
+            self._pending_deleted_unknown.update(mids)
+        else:
+            try:
+                pid = int(peer_id)
+            except Exception:
+                pid = 0
+            if pid == 0:
+                self._pending_deleted_unknown.update(mids)
+            else:
+                self._pending_deleted_by_peer.setdefault(pid, set()).update(mids)
+        self._schedule_deleted_flush()
+
+    def _schedule_deleted_flush(self) -> None:
+        task = self._deleted_flush_task
+        if task is not None and not task.done():
+            return
+        self._deleted_flush_task = asyncio.create_task(self._flush_deleted_messages_after_delay())
+
+    async def _flush_deleted_messages_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(0.8)
+            await self._flush_deleted_messages_now()
+        finally:
+            self._deleted_flush_task = None
+
+    async def _flush_deleted_messages_now(self) -> None:
+        by_peer = self._pending_deleted_by_peer
+        unknown = self._pending_deleted_unknown
+        self._pending_deleted_by_peer = {}
+        self._pending_deleted_unknown = set()
+        if not by_peer and not unknown:
+            return
+
+        if unknown and self._storage:
+            try:
+                mapped = self._storage.find_peers_for_message_ids(list(unknown))
+                for peer, mids in mapped.items():
+                    if not mids:
+                        continue
+                    bucket = by_peer.setdefault(int(peer), set())
+                    for mid in mids:
+                        try:
+                            val = int(mid)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            bucket.add(val)
+            except Exception:
+                log.exception("[TG] Failed to resolve deleted message peers for ids=%s", sorted(unknown))
+
+        for peer_id, mids_set in by_peer.items():
+            if not mids_set:
+                continue
+            uniq_mids = sorted({int(mid) for mid in mids_set if int(mid) > 0})
+            if not uniq_mids:
+                continue
+            if self._storage:
+                try:
+                    self._storage.log_deleted_messages(peer_id, uniq_mids, source="telegram_updates")
+                except Exception:
+                    log.exception("[TG] Failed to snapshot deleted messages %s/%s", peer_id, uniq_mids)
+                try:
+                    self._storage.mark_messages_deleted(peer_id, uniq_mids, deleted=True)
+                except Exception:
+                    log.exception("[TG] Failed to update storage for deleted messages %s/%s", peer_id, uniq_mids)
+            if self._server:
+                try:
+                    self._server.tg_messages_deleted(str(peer_id), uniq_mids)
+                except Exception:
+                    log.exception("[TG] Failed to notify server about deletions %s/%s", peer_id, uniq_mids)
 
     def _entities_to_dicts(self, entities: Any) -> Optional[List[Dict[str, Any]]]:
         if not entities:
