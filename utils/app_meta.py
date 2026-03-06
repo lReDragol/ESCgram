@@ -37,11 +37,18 @@ def resolve_app_icon_path() -> str:
     env_icon = str(os.getenv("DRAGO_APP_ICON") or "").strip()
     if env_icon and os.path.isfile(env_icon):
         return env_icon
-    candidates = [
-        Path("ui/assets/app/ESCgram_ICO.png"),
-        Path("ui/assets/app/escgram.ico"),
-        Path("ESCgram_ICO.png"),
-    ]
+    if os.name == "nt":
+        candidates = [
+            Path("ui/assets/app/escgram.ico"),
+            Path("ui/assets/app/ESCgram_ICO.png"),
+            Path("ESCgram_ICO.png"),
+        ]
+    else:
+        candidates = [
+            Path("ui/assets/app/ESCgram_ICO.png"),
+            Path("ui/assets/app/escgram.ico"),
+            Path("ESCgram_ICO.png"),
+        ]
     for root in _candidate_roots():
         for rel in candidates:
             path = root / rel
@@ -68,4 +75,3 @@ def get_app_version() -> str:
 
 def get_update_repo() -> str:
     return str(os.getenv("DRAGO_UPDATE_REPO") or "lReDragol/ESCgram").strip()
-

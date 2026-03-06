@@ -4,6 +4,7 @@ import os
 import sys
 import signal
 import argparse
+from typing import Optional
 
 from server import ServerCore
 from utils.error_guard import guard_module
@@ -11,8 +12,25 @@ from utils.logging_setup import configure_logging
 from utils import app_paths
 from telegram import TelegramAdapter
 from gui_chat import run_gui
+from PySide6.QtCore import QLockFile
 
 SERVICE_TOKEN = os.getenv("DRAGO_SERVICE_TOKEN", "dev-service-token")
+
+
+def _acquire_single_instance_lock() -> Optional[QLockFile]:
+    try:
+        lock_path = str(app_paths.temp_dir() / "escgram.instance.lock")
+    except Exception:
+        return None
+    lock = QLockFile(lock_path)
+    # Auto-recover if previous process crashed and left stale lock file.
+    lock.setStaleLockTime(120000)
+    try:
+        if lock.tryLock(0):
+            return lock
+    except Exception:
+        return None
+    return None
 
 def _prepend_local_ffmpeg_to_path() -> None:
     exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
@@ -45,6 +63,10 @@ def main():
         except Exception:
             pass
     _prepend_local_ffmpeg_to_path()
+    instance_lock = _acquire_single_instance_lock()
+    if instance_lock is None:
+        print("ESCgram уже запущен. Вторая копия не будет открыта.")
+        return
 
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
     server = ServerCore(service_token=SERVICE_TOKEN)
@@ -61,6 +83,10 @@ def main():
     finally:
         tg.stop()
         server.stop()
+        try:
+            instance_lock.unlock()
+        except Exception:
+            pass
 
 guard_module(globals())
 

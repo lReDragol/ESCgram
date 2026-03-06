@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+import ctypes
 import json
 import mimetypes
 import os
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QFrame,
     QWidget,
+    QSystemTrayIcon,
 )
 try:
     from shiboken6 import isValid as _qt_is_valid
@@ -239,6 +241,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._ffmpeg_install_worker: Optional[FfmpegInstallWorker] = None
         self._voice_deps_thread: Optional[QThread] = None
         self._voice_deps_worker: Optional[VoiceDepsInstallWorker] = None
+        self._tray_icon: Optional[QSystemTrayIcon] = None
+        self._tray_menu: Optional[QMenu] = None
+        self._tray_quit_requested: bool = False
+        self._tray_minimize_notice_shown: bool = False
 
         # аватары
         self.avatar_cache = AvatarCache(
@@ -279,6 +285,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         # сборка UI
         self._init_event_pump()
         self._init_ui()
+        self._init_system_tray()
 
         # синхронизация состояния панели настроек
         if hasattr(self, "settings_panel"):
@@ -6294,7 +6301,95 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         except Exception:
             pass
 
+    def _init_system_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        try:
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon_path = resolve_app_icon_path()
+                if icon_path:
+                    icon = QIcon(icon_path)
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip("ESCgram")
+            menu = QMenu(self)
+            act_open = menu.addAction("Открыть ESCgram")
+            act_exit = menu.addAction("Выход")
+            act_open.triggered.connect(self._restore_from_tray)
+
+            def _quit_from_tray() -> None:
+                self._tray_quit_requested = True
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
+
+            act_exit.triggered.connect(_quit_from_tray)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)
+            tray.show()
+            self._tray_icon = tray
+            self._tray_menu = menu
+        except Exception:
+            self._tray_icon = None
+            self._tray_menu = None
+            log.exception("Failed to initialize system tray")
+
+    @Slot(QSystemTrayIcon.ActivationReason)
+    def _on_tray_activated(self, reason) -> None:
+        try:
+            if reason in (
+                QSystemTrayIcon.ActivationReason.Trigger,
+                QSystemTrayIcon.ActivationReason.DoubleClick,
+                QSystemTrayIcon.ActivationReason.MiddleClick,
+            ):
+                self._restore_from_tray()
+        except Exception:
+            pass
+
+    def _restore_from_tray(self) -> None:
+        try:
+            self.show()
+            self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def _minimize_to_tray(self) -> None:
+        tray = getattr(self, "_tray_icon", None)
+        if tray is None:
+            return
+        if not self.isMinimized():
+            return
+        try:
+            self.hide()
+            if not self._tray_minimize_notice_shown:
+                self._tray_minimize_notice_shown = True
+                tray.showMessage(
+                    "ESCgram",
+                    "Приложение свернуто в системный трей.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    1800,
+                )
+        except Exception:
+            pass
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            if event is not None and event.type() == QEvent.Type.WindowStateChange:
+                if self.isMinimized() and getattr(self, "_tray_icon", None) is not None:
+                    QTimer.singleShot(0, self._minimize_to_tray)
+        except Exception:
+            pass
+        super().changeEvent(event)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        tray = getattr(self, "_tray_icon", None)
+        if tray is not None:
+            try:
+                tray.hide()
+            except Exception:
+                pass
         self._shutdown_background_workers()
         self._flush_history_save()
         save_history(self.history)
@@ -6323,6 +6418,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 def run_gui(server, tg_adapter) -> None:
     # When GUI is launched directly, keep logs in the selected data dir by default.
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("lReDragol.ESCgram")
+        except Exception:
+            pass
     app = QApplication.instance() or QApplication([])
     icon_path = resolve_app_icon_path()
     if icon_path:
