@@ -1375,6 +1375,70 @@ class TelegramAdapter:
         except Exception:
             return None
 
+    def get_chat_members_preview_sync(self, chat_id: str, limit: int = 80, timeout: float = 20.0) -> List[Dict[str, Any]]:
+        if not (self._enabled and self._client and self._loop):
+            return []
+        total = max(1, int(limit or 80))
+
+        async def _run() -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            seen: set[int] = set()
+            async for member in self._client.get_chat_members(int(chat_id), limit=total):
+                user = getattr(member, "user", None)
+                if user is None:
+                    continue
+                try:
+                    uid = int(getattr(user, "id", 0) or 0)
+                except Exception:
+                    uid = 0
+                if uid <= 0 or uid in seen:
+                    continue
+                seen.add(uid)
+                first = str(getattr(user, "first_name", "") or "").strip()
+                last = str(getattr(user, "last_name", "") or "").strip()
+                username = str(getattr(user, "username", "") or "").strip()
+                full_name = " ".join([part for part in [first, last] if part]).strip()
+                if not full_name:
+                    full_name = username or str(uid)
+                status_raw = getattr(member, "status", None)
+                status = str(getattr(status_raw, "name", None) or status_raw or "").strip().lower()
+                out.append(
+                    {
+                        "id": uid,
+                        "name": full_name,
+                        "username": username,
+                        "type": "bot" if bool(getattr(user, "is_bot", False)) else "user",
+                        "status": status,
+                        "is_verified": bool(getattr(user, "is_verified", False)),
+                    }
+                )
+                if len(out) >= total:
+                    break
+            return out
+
+        try:
+            return list(self._call(_run(), timeout) or [])
+        except Exception:
+            return []
+
+    def leave_chat_sync(self, chat_id: str, timeout: float = 15.0) -> bool:
+        if not (self._enabled and self._client and self._loop):
+            return False
+
+        async def _run() -> bool:
+            try:
+                await self._client.leave_chat(int(chat_id))
+                return True
+            except TypeError:
+                # compatibility fallback
+                await self._client.leave_chat(chat_id=int(chat_id))
+                return True
+
+        try:
+            return bool(self._call(_run(), timeout))
+        except Exception:
+            return False
+
     def create_group_sync(self, title: str, users: List[str], timeout: float = 20.0) -> Optional[str]:
         if not (self._enabled and self._client and self._loop):
             return None

@@ -37,6 +37,7 @@ EMOJI_RE = re.compile(
     "]",
     re.UNICODE,
 )
+URL_RE = re.compile(r"(https?://[^\s]+|t\.me/[^\s]+)", re.IGNORECASE)
 
 
 @dataclass
@@ -1107,11 +1108,182 @@ class Storage:
                     return ordered
         return ordered
 
+    def get_chat_shared_media(self, peer_id: int, *, limit: int = 120) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT
+              m.id,
+              m.date,
+              COALESCE(m.media_type, 'text'),
+              COALESCE(m.message, ''),
+              COALESCE(m.file_name, ''),
+              COALESCE(m.file_size, 0),
+              COALESCE(m.mime, ''),
+              COALESCE(f.path, m.file_path, ''),
+              COALESCE(m.from_id, 0)
+            FROM messages m
+            LEFT JOIN files f
+              ON f.file_id = COALESCE(m.media_id, CAST(m.peer_id AS TEXT) || ':' || CAST(m.id AS TEXT))
+            WHERE m.peer_id = ?
+              AND COALESCE(m.media_type, 'text') IN ('image','photo','video','animation','gif','video_note','sticker')
+            ORDER BY COALESCE(m.date, 0) DESC, m.id DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(limit, 1))),
+        )
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "date": int(row[1] or 0),
+                    "type": str(row[2] or "media"),
+                    "text": str(row[3] or ""),
+                    "file_name": str(row[4] or ""),
+                    "file_size": int(row[5] or 0),
+                    "mime": str(row[6] or ""),
+                    "file_path": str(row[7] or ""),
+                    "from_id": int(row[8] or 0),
+                }
+            )
+        return out
+
+    def get_chat_shared_files(self, peer_id: int, *, limit: int = 120) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT
+              m.id,
+              m.date,
+              COALESCE(m.media_type, 'text'),
+              COALESCE(m.message, ''),
+              COALESCE(m.file_name, ''),
+              COALESCE(m.file_size, 0),
+              COALESCE(m.mime, ''),
+              COALESCE(f.path, m.file_path, ''),
+              COALESCE(m.from_id, 0)
+            FROM messages m
+            LEFT JOIN files f
+              ON f.file_id = COALESCE(m.media_id, CAST(m.peer_id AS TEXT) || ':' || CAST(m.id AS TEXT))
+            WHERE m.peer_id = ?
+              AND (
+                COALESCE(m.media_type, 'text') IN ('document','audio','voice')
+                OR COALESCE(TRIM(m.file_name), '') <> ''
+              )
+            ORDER BY COALESCE(m.date, 0) DESC, m.id DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(limit, 1))),
+        )
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "date": int(row[1] or 0),
+                    "type": str(row[2] or "file"),
+                    "text": str(row[3] or ""),
+                    "file_name": str(row[4] or ""),
+                    "file_size": int(row[5] or 0),
+                    "mime": str(row[6] or ""),
+                    "file_path": str(row[7] or ""),
+                    "from_id": int(row[8] or 0),
+                }
+            )
+        return out
+
+    def get_chat_links(self, peer_id: int, *, limit: int = 150) -> List[Dict[str, Any]]:
+        sample_rows = self._query(
+            """
+            SELECT
+              id,
+              date,
+              COALESCE(message, ''),
+              COALESCE(from_id, 0)
+            FROM messages
+            WHERE peer_id = ?
+              AND COALESCE(TRIM(message), '') <> ''
+            ORDER BY COALESCE(date, 0) DESC, id DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(limit * 8, 300))),
+        )
+        out: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, str]] = set()
+        for msg_id, msg_date, text, from_id in sample_rows:
+            body = str(text or "")
+            if not body:
+                continue
+            for match in URL_RE.finditer(body):
+                raw = str(match.group(0) or "").strip()
+                if not raw:
+                    continue
+                url = raw if raw.lower().startswith("http") else f"https://{raw}"
+                key = (int(msg_id), url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    {
+                        "id": int(msg_id),
+                        "date": int(msg_date or 0),
+                        "url": url,
+                        "raw": raw,
+                        "context": body[:280],
+                        "from_id": int(from_id or 0),
+                    }
+                )
+                if len(out) >= int(limit):
+                    return out
+        return out
+
+    def get_chat_members_activity(self, peer_id: int, *, limit: int = 80) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT
+              COALESCE(m.from_id, 0),
+              COUNT(1),
+              MAX(COALESCE(m.date, 0)),
+              SUM(CASE WHEN COALESCE(m.is_deleted, 0) = 1 THEN 1 ELSE 0 END),
+              COALESCE(p.title, ''),
+              COALESCE(p.username, ''),
+              COALESCE(p.type, '')
+            FROM messages m
+            LEFT JOIN peers p
+              ON p.id = m.from_id
+            WHERE m.peer_id = ? AND COALESCE(m.from_id, 0) <> 0
+            GROUP BY COALESCE(m.from_id, 0)
+            ORDER BY COUNT(1) DESC, MAX(COALESCE(m.date, 0)) DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(limit, 1))),
+        )
+        out: List[Dict[str, Any]] = []
+        for from_id, count, last_date, deleted_count, title, username, ptype in rows:
+            try:
+                sender_id = int(from_id or 0)
+            except Exception:
+                sender_id = 0
+            if sender_id == 0:
+                continue
+            out.append(
+                {
+                    "id": sender_id,
+                    "name": str(title or username or sender_id),
+                    "username": str(username or ""),
+                    "type": str(ptype or ""),
+                    "messages": int(count or 0),
+                    "last_date": int(last_date or 0),
+                    "deleted_messages": int(deleted_count or 0),
+                }
+            )
+        return out
+
     def get_chat_statistics(self, peer_id: int, *, limit: int = 500) -> Dict[str, Any]:
         rows = self._query(
             """
             SELECT
               id,
+              COALESCE(date, 0),
               media_type,
               is_deleted,
               reactions,
@@ -1134,14 +1306,31 @@ class Storage:
         total_reactions = 0
         reaction_counter: Counter[str] = Counter()
         sender_counter: Counter[int] = Counter()
+        hour_counter: Counter[int] = Counter()
+        day_counter: Counter[str] = Counter()
         polls: List[Dict[str, Any]] = []
-        for _, media_type, is_deleted, reactions_raw, poll_raw, views, forwards, from_id in rows:
+        poll_total_voters = 0
+        poll_open = 0
+        poll_closed = 0
+        poll_top: List[Dict[str, Any]] = []
+        for _, msg_date, media_type, is_deleted, reactions_raw, poll_raw, views, forwards, from_id in rows:
             if str(media_type or "text") != "text":
                 media_messages += 1
             if bool(is_deleted):
                 deleted_messages += 1
             total_views += int(views or 0)
             total_forwards += int(forwards or 0)
+            try:
+                ts = int(msg_date or 0)
+            except Exception:
+                ts = 0
+            if ts > 0:
+                try:
+                    local_tm = time.localtime(ts)
+                    hour_counter[int(local_tm.tm_hour)] += 1
+                    day_counter[time.strftime("%Y-%m-%d", local_tm)] += 1
+                except Exception:
+                    pass
             try:
                 sender = int(from_id or 0)
             except Exception:
@@ -1170,6 +1359,19 @@ class Storage:
                     poll = None
                 if isinstance(poll, dict):
                     polls.append(poll)
+                    voters = int(poll.get("total_voter_count") or 0)
+                    poll_total_voters += voters
+                    if bool(poll.get("is_closed")):
+                        poll_closed += 1
+                    else:
+                        poll_open += 1
+                    poll_top.append(
+                        {
+                            "question": str(poll.get("question") or "Опрос"),
+                            "total_voter_count": voters,
+                            "is_closed": bool(poll.get("is_closed")),
+                        }
+                    )
 
         sender_meta: Dict[int, Dict[str, str]] = {}
         if sender_counter:
@@ -1233,6 +1435,16 @@ class Storage:
             anomaly_flags.append("forwards_exceed_views")
         if len(suspicious_senders) >= 2:
             anomaly_flags.append("multiple_suspicious_senders")
+
+        hourly_activity = [{"hour": hour, "count": int(hour_counter.get(hour, 0))} for hour in range(24)]
+        day_items = sorted(day_counter.items(), key=lambda item: item[0])
+        daily_activity = [{"day": day, "count": int(count)} for day, count in day_items[-14:]]
+        poll_top_sorted = sorted(poll_top, key=lambda row: int(row.get("total_voter_count") or 0), reverse=True)[:10]
+        engagement = {
+            "views_per_message": round(float(total_views) / float(max(1, total_messages)), 2),
+            "reactions_per_100_messages": round(float(total_reactions) * 100.0 / float(max(1, total_messages)), 2),
+            "forwards_per_100_messages": round(float(total_forwards) * 100.0 / float(max(1, total_messages)), 2),
+        }
         return {
             "total_messages": total_messages,
             "media_messages": media_messages,
@@ -1245,6 +1457,16 @@ class Storage:
             "top_senders": top_senders,
             "suspicious_senders": suspicious_senders[:10],
             "anomaly_flags": anomaly_flags,
+            "hourly_activity": hourly_activity,
+            "daily_activity": daily_activity,
+            "engagement": engagement,
+            "polls_summary": {
+                "total_polls": int(len(polls)),
+                "open_polls": int(poll_open),
+                "closed_polls": int(poll_closed),
+                "total_voters": int(poll_total_voters),
+                "top_polls": poll_top_sorted,
+            },
         }
 
     def get_message_statistics(self, peer_id: int, message_id: int) -> Dict[str, Any]:

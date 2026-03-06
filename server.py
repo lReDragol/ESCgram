@@ -398,6 +398,100 @@ class ServerCore:
             log.exception("[SERVER] Failed to load chat profile for %s", chat_id)
             return None
 
+    def get_chat_profile_sections(
+        self,
+        chat_id: str,
+        *,
+        media_limit: int = 80,
+        file_limit: int = 80,
+        link_limit: int = 120,
+        members_limit: int = 80,
+    ) -> Dict[str, Any]:
+        if not str(chat_id or "").lstrip("-").isdigit():
+            return {}
+        peer_id = int(chat_id)
+        out: Dict[str, Any] = {
+            "media": [],
+            "files": [],
+            "links": [],
+            "members": [],
+        }
+        if self._storage:
+            try:
+                out["media"] = self._storage.get_chat_shared_media(peer_id, limit=max(1, int(media_limit)))
+            except Exception:
+                log.exception("[SERVER] Failed to load shared media for %s", chat_id)
+            try:
+                out["files"] = self._storage.get_chat_shared_files(peer_id, limit=max(1, int(file_limit)))
+            except Exception:
+                log.exception("[SERVER] Failed to load shared files for %s", chat_id)
+            try:
+                out["links"] = self._storage.get_chat_links(peer_id, limit=max(1, int(link_limit)))
+            except Exception:
+                log.exception("[SERVER] Failed to load links for %s", chat_id)
+            try:
+                out["members"] = self._storage.get_chat_members_activity(peer_id, limit=max(1, int(members_limit)))
+            except Exception:
+                log.exception("[SERVER] Failed to load local members activity for %s", chat_id)
+
+        tg_members: List[Dict[str, Any]] = []
+        if self._tg_adapter:
+            getter = getattr(self._tg_adapter, "get_chat_members_preview_sync", None)
+            if callable(getter):
+                try:
+                    tg_members = list(getter(chat_id=chat_id, limit=max(1, int(members_limit))) or [])
+                except Exception:
+                    log.exception("[SERVER] Failed to load Telegram members preview for %s", chat_id)
+        if tg_members:
+            local_map: Dict[int, Dict[str, Any]] = {}
+            for row in list(out.get("members") or []):
+                try:
+                    local_map[int(row.get("id"))] = dict(row)
+                except Exception:
+                    continue
+            merged: List[Dict[str, Any]] = []
+            seen: set[int] = set()
+            for row in tg_members:
+                try:
+                    uid = int(row.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if uid <= 0:
+                    continue
+                seen.add(uid)
+                local = local_map.get(uid, {})
+                merged.append(
+                    {
+                        "id": uid,
+                        "name": str(row.get("name") or local.get("name") or uid),
+                        "username": str(row.get("username") or local.get("username") or ""),
+                        "type": str(row.get("type") or local.get("type") or ""),
+                        "status": str(row.get("status") or ""),
+                        "messages": int(local.get("messages") or 0),
+                        "last_date": int(local.get("last_date") or 0),
+                        "deleted_messages": int(local.get("deleted_messages") or 0),
+                    }
+                )
+            for uid, local in local_map.items():
+                if uid in seen:
+                    continue
+                merged.append(dict(local))
+            merged.sort(key=lambda item: int(item.get("messages") or 0), reverse=True)
+            out["members"] = merged[: max(1, int(members_limit))]
+        return out
+
+    def leave_chat(self, chat_id: str) -> bool:
+        if not self._tg_adapter:
+            return False
+        leaver = getattr(self._tg_adapter, "leave_chat_sync", None)
+        if not callable(leaver):
+            return False
+        try:
+            return bool(leaver(chat_id=chat_id))
+        except Exception:
+            log.exception("[SERVER] leave_chat failed for %s", chat_id)
+            return False
+
     def get_chat_statistics(self, chat_id: str, *, limit: int = 500) -> Dict[str, Any]:
         if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
             return {}

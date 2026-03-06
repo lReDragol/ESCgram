@@ -1734,13 +1734,62 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 merged.update(full)
                 self.all_chats[chat_id] = merged
                 self._refresh_chat_header()
+        sections: Dict[str, Any] = {}
+        if hasattr(self.server, "get_chat_profile_sections"):
+            try:
+                sections = self.server.get_chat_profile_sections(
+                    chat_id,
+                    media_limit=90,
+                    file_limit=90,
+                    link_limit=140,
+                    members_limit=100,
+                )
+            except Exception:
+                sections = {}
         avatar = None
         try:
             avatar = self.avatar_cache.chat(chat_id, info)
         except Exception:
             avatar = None
-        dlg = ChatInfoDialog(info, avatar=avatar, parent=self)
+        callbacks = {
+            "show_stats": self._show_current_chat_statistics,
+            "mark_read": lambda: self._mark_current_chat_read(local=False),
+            "leave_chat": self._leave_current_chat_from_profile,
+        }
+        dlg = ChatInfoDialog(info, avatar=avatar, sections=sections, callbacks=callbacks, parent=self)
         dlg.exec()
+
+    def _leave_current_chat_from_profile(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        info = dict(self.all_chats.get(chat_id, {}))
+        title = str(info.get("title") or chat_id)
+        reply = QMessageBox.question(
+            self,
+            "Покинуть чат",
+            f"Покинуть «{title}»?\nЭто действие выполнится в Telegram.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        ok = False
+        if hasattr(self.server, "leave_chat"):
+            try:
+                ok = bool(self.server.leave_chat(chat_id))
+            except Exception:
+                ok = False
+        if not ok:
+            QMessageBox.warning(self, "Покинуть чат", "Не удалось покинуть чат.")
+            return
+        self._toast("Чат покинут")
+        self.all_chats.pop(chat_id, None)
+        self.current_chat_id = None
+        self.clear_feed()
+        self._refresh_chat_header()
+        self.populate_chat_list()
+        QTimer.singleShot(100, self.refresh_telegram_chats_async)
 
     def _show_current_chat_statistics(self) -> None:
         chat_id = str(self.current_chat_id or "")
@@ -1782,6 +1831,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         menu.addSeparator()
         menu.addAction("Обновить историю").triggered.connect(lambda: self.load_chat_history_async(reset=True))
         menu.addAction("Пометить прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
+        menu.addAction("Покинуть чат").triggered.connect(self._leave_current_chat_from_profile)
         try:
             menu.exec(global_pos)
         finally:

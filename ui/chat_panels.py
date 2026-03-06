@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
+from functools import partial
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QPoint, Qt, Signal, QUrl
+from PySide6.QtGui import QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -142,13 +145,30 @@ class _StatsSection(QWidget):
 
 
 class ChatInfoDialog(QDialog):
-    def __init__(self, info: Dict[str, Any], *, avatar: Optional[QPixmap] = None, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        info: Dict[str, Any],
+        *,
+        avatar: Optional[QPixmap] = None,
+        sections: Optional[Dict[str, Any]] = None,
+        callbacks: Optional[Dict[str, Any]] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
+        self._info = dict(info or {})
+        self._sections = dict(sections or {})
+        self._callbacks = dict(callbacks or {})
+
         self.setWindowTitle("Профиль чата")
-        self.resize(460, 520)
+        self.resize(680, 680)
         self.setStyleSheet(
             "QDialog{background-color:#0f1b27;color:#dfe7f5;}"
             "QLabel{color:#dfe7f5;}"
+            "QTabWidget::pane{border:1px solid rgba(255,255,255,0.08);border-radius:10px;top:-1px;background:#102033;}"
+            "QTabBar::tab{background:rgba(255,255,255,0.04);color:#b9cce3;padding:8px 12px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;}"
+            "QTabBar::tab:selected{background:rgba(89,183,255,0.22);color:#f4f7ff;}"
+            "QPushButton{background:rgba(255,255,255,0.05);color:#dfe7f5;border:none;border-radius:8px;padding:7px 10px;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.10);}"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -163,10 +183,10 @@ class ChatInfoDialog(QDialog):
 
         text_col = QVBoxLayout()
         text_col.setSpacing(4)
-        title_label = QLabel(str(info.get("title") or info.get("id") or "Чат"))
+        title_label = QLabel(str(self._info.get("title") or self._info.get("id") or "Чат"))
         title_label.setStyleSheet("font-size:20px;font-weight:700;color:#f4f7ff;")
         text_col.addWidget(title_label)
-        subtitle = format_chat_subtitle(info)
+        subtitle = format_chat_subtitle(self._info)
         if subtitle:
             subtitle_label = QLabel(subtitle)
             subtitle_label.setStyleSheet("color:#8da8c4;font-size:12px;")
@@ -175,22 +195,95 @@ class ChatInfoDialog(QDialog):
         header.addLayout(text_col, 1)
         root.addLayout(header)
 
-        about = str(info.get("about") or "").strip()
+        tabs = QTabWidget(self)
+        tabs.addTab(self._build_overview_tab(), "Обзор")
+        tabs.addTab(self._build_media_tab(), "Медиа")
+        tabs.addTab(self._build_files_tab(), "Файлы")
+        tabs.addTab(self._build_links_tab(), "Ссылки")
+        tabs.addTab(self._build_members_tab(), "Участники")
+        tabs.addTab(self._build_actions_tab(), "Действия")
+        root.addWidget(tabs, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+
+    @staticmethod
+    def _format_ts(ts: Any) -> str:
+        try:
+            value = int(ts or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            return "неизвестно"
+        try:
+            return datetime.fromtimestamp(value).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _format_size(size: Any) -> str:
+        try:
+            value = int(size or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            return "n/a"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        amount = float(value)
+        unit_idx = 0
+        while amount >= 1024.0 and unit_idx < len(units) - 1:
+            amount /= 1024.0
+            unit_idx += 1
+        if unit_idx == 0:
+            return f"{int(amount)} {units[unit_idx]}"
+        return f"{amount:.1f} {units[unit_idx]}"
+
+    def _call(self, key: str) -> None:
+        cb = self._callbacks.get(key)
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _make_empty_tab(self, text: str) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(lbl)
+        layout.addStretch(1)
+        return tab
+
+    def _build_overview_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        about = str(self._info.get("about") or "").strip()
         if about:
             about_label = QLabel(about)
             about_label.setWordWrap(True)
-            about_label.setStyleSheet("background-color:rgba(255,255,255,0.04);border-radius:12px;padding:10px 12px;color:#c7d4e7;")
-            root.addWidget(about_label)
+            about_label.setStyleSheet("background-color:rgba(255,255,255,0.04);border-radius:10px;padding:10px 12px;color:#c7d4e7;")
+            layout.addWidget(about_label)
 
         details = QGridLayout()
         details.setHorizontalSpacing(10)
         details.setVerticalSpacing(8)
         rows = [
-            ("ID", info.get("id")),
-            ("Юзернейм", f"@{info.get('username')}" if info.get("username") else ""),
-            ("Телефон", info.get("phone")),
-            ("Тип", str(info.get("type") or "").strip()),
-            ("Участники", info.get("members_count")),
+            ("ID", self._info.get("id")),
+            ("Юзернейм", f"@{self._info.get('username')}" if self._info.get("username") else ""),
+            ("Телефон", self._info.get("phone")),
+            ("Тип", str(self._info.get("type") or "").strip()),
+            ("Участники", self._info.get("members_count")),
+            ("Проверка", "Да" if self._info.get("is_verified") else "Нет"),
+            ("Премиум", "Да" if self._info.get("is_premium") else "Нет"),
         ]
         row_idx = 0
         for label, value in rows:
@@ -205,21 +298,189 @@ class ChatInfoDialog(QDialog):
             details.addWidget(right, row_idx, 1)
             row_idx += 1
         if row_idx:
-            root.addLayout(details)
+            layout.addLayout(details)
 
-        reactions = list(info.get("available_reactions") or [])
+        reactions = list(self._info.get("available_reactions") or [])
         if reactions:
-            section = _StatsSection("Доступные реакции", self)
-            chips = QLabel(" ".join(str(item) for item in reactions[:32]))
+            section = _StatsSection("Доступные реакции", tab)
+            chips = QLabel(" ".join(str(item) for item in reactions[:80]))
             chips.setWordWrap(True)
             chips.setStyleSheet("color:#59b7ff;font-size:18px;")
             section.body.addWidget(chips)
-            root.addWidget(section)
+            layout.addWidget(section)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        root.addWidget(buttons)
+        layout.addStretch(1)
+        return tab
+
+    def _create_cards_tab(self, rows: List[Dict[str, Any]], *, mode: str) -> QWidget:
+        if not rows:
+            if mode == "media":
+                return self._make_empty_tab("Медиа из этого чата появится здесь после загрузки истории.")
+            if mode == "files":
+                return self._make_empty_tab("Файлы из этого чата появятся здесь после загрузки истории.")
+            if mode == "links":
+                return self._make_empty_tab("Ссылки из сообщений этого чата появятся здесь.")
+            return self._make_empty_tab("Пока нет данных.")
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        for row in rows:
+            card = QFrame(container)
+            card.setStyleSheet("QFrame{background:rgba(255,255,255,0.04);border-radius:10px;}")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 9, 10, 9)
+            card_layout.setSpacing(6)
+
+            if mode == "links":
+                url = str(row.get("url") or "")
+                top = QLabel(url)
+                top.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                top.setStyleSheet("color:#59b7ff;font-weight:600;")
+                card_layout.addWidget(top)
+                context = str(row.get("context") or "").strip()
+                if context:
+                    context_lbl = QLabel(context)
+                    context_lbl.setWordWrap(True)
+                    context_lbl.setStyleSheet("color:#b5c7dc;")
+                    card_layout.addWidget(context_lbl)
+                meta = QLabel(
+                    f"Сообщение #{int(row.get('id') or 0)} • {self._format_ts(row.get('date'))}"
+                )
+                meta.setStyleSheet("color:#8da8c4;font-size:11px;")
+                card_layout.addWidget(meta)
+                actions = QHBoxLayout()
+                open_btn = QPushButton("Открыть ссылку", card)
+                open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl(url)))
+                actions.addWidget(open_btn, 0)
+                actions.addStretch(1)
+                card_layout.addLayout(actions)
+            else:
+                file_name = str(row.get("file_name") or "").strip()
+                msg_text = str(row.get("text") or "").strip()
+                title = file_name or msg_text or f"Сообщение #{int(row.get('id') or 0)}"
+                top = QLabel(title)
+                top.setWordWrap(True)
+                top.setStyleSheet("color:#f4f7ff;font-weight:600;")
+                card_layout.addWidget(top)
+
+                typ = str(row.get("type") or "file")
+                meta_parts = [
+                    f"#{int(row.get('id') or 0)}",
+                    typ,
+                    self._format_ts(row.get("date")),
+                    self._format_size(row.get("file_size")),
+                ]
+                meta = QLabel(" • ".join([part for part in meta_parts if part]))
+                meta.setStyleSheet("color:#8da8c4;font-size:11px;")
+                card_layout.addWidget(meta)
+                file_path = str(row.get("file_path") or "").strip()
+                if file_path:
+                    path_lbl = QLabel(file_path)
+                    path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                    path_lbl.setStyleSheet("color:#9fb3cc;font-size:11px;")
+                    card_layout.addWidget(path_lbl)
+                    actions = QHBoxLayout()
+                    open_btn = QPushButton("Открыть файл", card)
+                    open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl.fromLocalFile(file_path)))
+                    actions.addWidget(open_btn, 0)
+                    actions.addStretch(1)
+                    card_layout.addLayout(actions)
+            layout.addWidget(card)
+        layout.addStretch(1)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(container)
+        return scroll
+
+    def _build_media_tab(self) -> QWidget:
+        rows = [row for row in list(self._sections.get("media") or []) if isinstance(row, dict)]
+        return self._create_cards_tab(rows, mode="media")
+
+    def _build_files_tab(self) -> QWidget:
+        rows = [row for row in list(self._sections.get("files") or []) if isinstance(row, dict)]
+        return self._create_cards_tab(rows, mode="files")
+
+    def _build_links_tab(self) -> QWidget:
+        rows = [row for row in list(self._sections.get("links") or []) if isinstance(row, dict)]
+        return self._create_cards_tab(rows, mode="links")
+
+    def _build_members_tab(self) -> QWidget:
+        members = [row for row in list(self._sections.get("members") or []) if isinstance(row, dict)]
+        if not members:
+            return self._make_empty_tab("Список участников появится после синхронизации чата.")
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        for row in members:
+            line = QFrame(tab)
+            line.setStyleSheet("QFrame{background:rgba(255,255,255,0.04);border-radius:9px;}")
+            line_layout = QHBoxLayout(line)
+            line_layout.setContentsMargins(10, 8, 10, 8)
+            line_layout.setSpacing(10)
+            left = QVBoxLayout()
+            name = str(row.get("name") or row.get("id") or "unknown")
+            username = str(row.get("username") or "").strip()
+            status = str(row.get("status") or "").strip()
+            kind = str(row.get("type") or "").strip()
+            head = name
+            if username:
+                head += f" (@{username})"
+            if status:
+                head += f" • {status}"
+            if kind:
+                head += f" [{kind}]"
+            title = QLabel(head)
+            title.setWordWrap(True)
+            title.setStyleSheet("color:#f4f7ff;font-weight:600;")
+            left.addWidget(title)
+            msgs = int(row.get("messages") or 0)
+            deleted = int(row.get("deleted_messages") or 0)
+            last_date = self._format_ts(row.get("last_date"))
+            details = QLabel(f"Сообщений: {msgs} • удалено: {deleted} • активен: {last_date}")
+            details.setStyleSheet("color:#8da8c4;font-size:11px;")
+            left.addWidget(details)
+            line_layout.addLayout(left, 1)
+            layout.addWidget(line)
+        layout.addStretch(1)
+        return tab
+
+    def _build_actions_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Быстрые действия")
+        title.setStyleSheet("font-size:16px;font-weight:700;color:#f4f7ff;")
+        layout.addWidget(title)
+
+        stats_btn = QPushButton("Открыть статистику чата", tab)
+        stats_btn.clicked.connect(partial(self._call, "show_stats"))
+        layout.addWidget(stats_btn, 0)
+
+        read_btn = QPushButton("Пометить чат прочитанным", tab)
+        read_btn.clicked.connect(partial(self._call, "mark_read"))
+        layout.addWidget(read_btn, 0)
+
+        leave_btn = QPushButton("Покинуть чат / канал", tab)
+        leave_btn.setStyleSheet(
+            "QPushButton{background:rgba(255,96,96,0.18);color:#ffd7d7;border:none;border-radius:8px;padding:7px 10px;}"
+            "QPushButton:hover{background:rgba(255,96,96,0.30);}"
+        )
+        leave_btn.clicked.connect(partial(self._call, "leave_chat"))
+        layout.addWidget(leave_btn, 0)
+
+        note = QLabel("Часть действий может быть недоступна в приватных диалогах или без прав администратора.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(note)
+        layout.addStretch(1)
+        return tab
 
 
 class ChatStatisticsDialog(QDialog):
@@ -254,6 +515,55 @@ class ChatStatisticsDialog(QDialog):
             row.setStyleSheet("color:#dfe7f5;font-size:13px;")
             summary.body.addWidget(row)
         root.addWidget(summary)
+
+        engagement = data.get("engagement") if isinstance(data.get("engagement"), dict) else {}
+        if engagement:
+            section = _StatsSection("Engagement", self)
+            section.body.addWidget(QLabel(f"Просмотров на сообщение: {float(engagement.get('views_per_message') or 0):.2f}"))
+            section.body.addWidget(QLabel(f"Реакций на 100 сообщений: {float(engagement.get('reactions_per_100_messages') or 0):.2f}"))
+            section.body.addWidget(QLabel(f"Пересылок на 100 сообщений: {float(engagement.get('forwards_per_100_messages') or 0):.2f}"))
+            root.addWidget(section)
+
+        hourly = [row for row in list(data.get("hourly_activity") or []) if isinstance(row, dict)]
+        if hourly:
+            section = _StatsSection("Активность по часам (локальное время)", self)
+            ranked = sorted(hourly, key=lambda row: int(row.get("count") or 0), reverse=True)
+            top_hours = sorted(ranked[:10], key=lambda row: int(row.get("hour") or 0))
+            max_count = max([int(row.get("count") or 0) for row in top_hours] or [1])
+            section.body.addWidget(QLabel("Показаны самые активные часы"))
+            for row in top_hours:
+                hour = int(row.get("hour") or 0)
+                count = int(row.get("count") or 0)
+                line = QHBoxLayout()
+                label = QLabel(f"{hour:02d}:00")
+                label.setFixedWidth(54)
+                bar = QProgressBar(self)
+                bar.setRange(0, max_count)
+                bar.setValue(count)
+                line.addWidget(label, 0)
+                line.addWidget(bar, 1)
+                line.addWidget(QLabel(str(count)), 0)
+                section.body.addLayout(line)
+            root.addWidget(section)
+
+        daily = [row for row in list(data.get("daily_activity") or []) if isinstance(row, dict)]
+        if daily:
+            section = _StatsSection("Активность по дням", self)
+            max_count = max([int(row.get("count") or 0) for row in daily[-10:]] or [1])
+            for row in daily[-10:]:
+                day = str(row.get("day") or "")
+                count = int(row.get("count") or 0)
+                line = QHBoxLayout()
+                label = QLabel(day or "день")
+                label.setMinimumWidth(100)
+                bar = QProgressBar(self)
+                bar.setRange(0, max_count)
+                bar.setValue(count)
+                line.addWidget(label, 0)
+                line.addWidget(bar, 1)
+                line.addWidget(QLabel(str(count)), 0)
+                section.body.addLayout(line)
+            root.addWidget(section)
 
         reactions = list(data.get("top_reactions") or [])
         if reactions:
@@ -342,6 +652,27 @@ class ChatStatisticsDialog(QDialog):
             section = _StatsSection("Аномалии", self)
             for flag in anomaly_flags:
                 section.body.addWidget(QLabel(f"• {anomaly_labels.get(flag, flag)}"))
+            root.addWidget(section)
+
+        polls_summary = data.get("polls_summary") if isinstance(data.get("polls_summary"), dict) else {}
+        if polls_summary:
+            section = _StatsSection("Сводка по опросам", self)
+            section.body.addWidget(QLabel(f"Опросов: {int(polls_summary.get('total_polls') or 0)}"))
+            section.body.addWidget(QLabel(f"Открытых: {int(polls_summary.get('open_polls') or 0)}"))
+            section.body.addWidget(QLabel(f"Закрытых: {int(polls_summary.get('closed_polls') or 0)}"))
+            section.body.addWidget(QLabel(f"Сумма голосов: {int(polls_summary.get('total_voters') or 0)}"))
+            top_polls = [row for row in list(polls_summary.get("top_polls") or []) if isinstance(row, dict)]
+            if top_polls:
+                top_title = QLabel("Топ опросов по числу голосов")
+                top_title.setStyleSheet("color:#8da8c4;")
+                section.body.addWidget(top_title)
+                for poll in top_polls[:8]:
+                    voters = int(poll.get("total_voter_count") or 0)
+                    question = str(poll.get("question") or "Опрос")
+                    state = "закрыт" if bool(poll.get("is_closed")) else "открыт"
+                    row_label = QLabel(f"• {question} — {voters} ({state})")
+                    row_label.setWordWrap(True)
+                    section.body.addWidget(row_label)
             root.addWidget(section)
 
         polls = list(data.get("polls") or [])
