@@ -19,6 +19,31 @@ datas = [
     (str(project_root / "version.txt"), "."),
 ]
 
+excluded_modules = [
+    # Optional ML stacks pulled by transitive packages but not required
+    # for the desktop client/runtime release.
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "tensorflow",
+    "transformers",
+    "scipy",
+    "sklearn",
+    "sentence_transformers",
+    "jax",
+    "jaxlib",
+    "matplotlib",
+    "pandas",
+    "sympy",
+    "triton",
+    "expecttest",
+    # The app uses PySide6 only. Exclude other Qt bindings if they happen
+    # to be installed in the build environment.
+    "PyQt5",
+    "PyQt6",
+    "PySide2",
+]
+
 
 a = Analysis(
     [str(project_root / "main.py")],
@@ -29,7 +54,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excluded_modules,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=None,
