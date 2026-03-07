@@ -40,6 +40,55 @@ EMOJI_RE = re.compile(
 URL_RE = re.compile(r"(https?://[^\s]+|t\.me/[^\s]+)", re.IGNORECASE)
 
 
+def _iter_emoji_sequences(text: str) -> Iterator[str]:
+    raw = str(text or "")
+    if not raw:
+        return
+    try:
+        import emoji as emoji_lib  # type: ignore
+
+        emoji_list = getattr(emoji_lib, "emoji_list", None)
+        if callable(emoji_list):
+            rows = list(emoji_list(raw) or [])
+            if rows:
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    value = str(item.get("emoji") or "").strip()
+                    if value:
+                        yield value
+                return
+    except Exception:
+        pass
+
+    length = len(raw)
+    pos = 0
+    while pos < length:
+        match = EMOJI_RE.search(raw, pos)
+        if match is None:
+            break
+        start, end = match.span()
+        while end < length:
+            ch = raw[end]
+            code = ord(ch)
+            if ch in {"\ufe0f", "\ufe0e"}:
+                end += 1
+                continue
+            if 0x1F3FB <= code <= 0x1F3FF:
+                end += 1
+                continue
+            if ch == "\u200d" and (end + 1) < length:
+                next_match = EMOJI_RE.match(raw, end + 1)
+                if next_match is not None:
+                    end = next_match.end()
+                    continue
+            break
+        value = raw[start:end].strip()
+        if value:
+            yield value
+        pos = max(end, start + 1)
+
+
 @dataclass
 class _ConnWrap:
     is_apsw: bool
@@ -244,6 +293,14 @@ class Storage:
               PRIMARY KEY (peer_id, message_id)
             );
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_statistics_snapshots (
+              peer_id     INTEGER NOT NULL,
+              scanned_at  INTEGER NOT NULL,
+              payload     TEXT NOT NULL,
+              PRIMARY KEY (peer_id, scanned_at)
+            );
+            """,
             # files: медиа-кэш по file_id (в т.ч. avatar/media пути)
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -273,6 +330,7 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_messages_peer_date ON messages(peer_id, date DESC);",
             "CREATE INDEX IF NOT EXISTS idx_messages_peer_id   ON messages(peer_id, id DESC);",
             "CREATE INDEX IF NOT EXISTS idx_deleted_events_peer_date ON deleted_message_events(peer_id, deleted_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_chat_statistics_snapshots_peer_time ON chat_statistics_snapshots(peer_id, scanned_at DESC);",
             "CREATE INDEX IF NOT EXISTS idx_ai_history_chat_id ON ai_history(chat_id, id DESC);",
         ]
         with self._lock:
@@ -1146,8 +1204,7 @@ class Storage:
         ordered: List[str] = []
         seen: set[str] = set()
         for (message_text,) in rows:
-            for match in EMOJI_RE.finditer(str(message_text or "")):
-                emoji = match.group(0)
+            for emoji in _iter_emoji_sequences(str(message_text or "")):
                 if emoji in seen:
                     continue
                 seen.add(emoji)
@@ -1327,25 +1384,45 @@ class Storage:
         return out
 
     def get_chat_statistics(self, peer_id: int, *, limit: int = 500) -> Dict[str, Any]:
-        rows = self._query(
-            """
-            SELECT
-              id,
-              COALESCE(date, 0),
-              media_type,
-              is_deleted,
-              reactions,
-              poll,
-              COALESCE(views, 0),
-              COALESCE(forwards, 0),
-              COALESCE(from_id, 0)
-            FROM messages
-            WHERE peer_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(peer_id), int(max(limit, 1))),
-        )
+        if int(limit or 0) > 0:
+            rows = self._query(
+                """
+                SELECT
+                  id,
+                  COALESCE(date, 0),
+                  media_type,
+                  is_deleted,
+                  reactions,
+                  poll,
+                  COALESCE(views, 0),
+                  COALESCE(forwards, 0),
+                  COALESCE(from_id, 0)
+                FROM messages
+                WHERE peer_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(peer_id), int(max(limit, 1))),
+            )
+        else:
+            rows = self._query(
+                """
+                SELECT
+                  id,
+                  COALESCE(date, 0),
+                  media_type,
+                  is_deleted,
+                  reactions,
+                  poll,
+                  COALESCE(views, 0),
+                  COALESCE(forwards, 0),
+                  COALESCE(from_id, 0)
+                FROM messages
+                WHERE peer_id = ?
+                ORDER BY id DESC
+                """,
+                (int(peer_id),),
+            )
         total_messages = len(rows)
         media_messages = 0
         deleted_messages = 0
@@ -1516,6 +1593,48 @@ class Storage:
                 "top_polls": poll_top_sorted,
             },
         }
+
+    def save_chat_statistics_snapshot(
+        self,
+        peer_id: int,
+        payload: Dict[str, Any],
+        *,
+        scanned_at: Optional[int] = None,
+    ) -> int:
+        ts = int(scanned_at or time.time())
+        data = dict(payload or {})
+        data["scanned_at"] = ts
+        self._exec(
+            """
+            INSERT OR REPLACE INTO chat_statistics_snapshots(peer_id, scanned_at, payload)
+            VALUES (?, ?, ?)
+            """,
+            (int(peer_id), ts, json.dumps(data, ensure_ascii=False)),
+        )
+        return ts
+
+    def get_chat_statistics_snapshots(self, peer_id: int, *, limit: int = 2) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT scanned_at, payload
+            FROM chat_statistics_snapshots
+            WHERE peer_id = ?
+            ORDER BY scanned_at DESC
+            LIMIT ?
+            """,
+            (int(peer_id), int(max(1, limit))),
+        )
+        out: List[Dict[str, Any]] = []
+        for scanned_at, payload_raw in rows:
+            try:
+                payload = json.loads(payload_raw) if payload_raw else {}
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.setdefault("scanned_at", int(scanned_at or 0))
+            out.append(payload)
+        return out
 
     def get_message_statistics(self, peer_id: int, message_id: int) -> Dict[str, Any]:
         item = self.get_message_by_id(int(peer_id), int(message_id)) or {}

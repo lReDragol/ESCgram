@@ -67,7 +67,8 @@ class _ThumbLimiter:
 class _ClickLabel(QLabel):
     clicked = Signal(QPointF)
     def mousePressEvent(self, e: QMouseEvent) -> None:
-        self.clicked.emit(QPointF(e.position()))
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(QPointF(e.position()))
         super().mousePressEvent(e)
 
 

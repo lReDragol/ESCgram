@@ -885,13 +885,14 @@ class TelegramAdapter:
                 media_type, _media_id, media_size, mime, duration, waveform = self._extract_media_meta(message)
                 media_group_id = self._extract_media_group_id(message)
                 reply_markup = self._reply_markup_to_dict(getattr(message, "reply_markup", None))
+                reactions = self._extract_reactions(message)
                 ts = int(getattr(message, "date", 0).timestamp()) if getattr(message, "date", None) else None
 
                 cached: Optional[str] = None
                 if self._server:
                     if media_type == "text":
                         entities = self._entities_to_dicts(getattr(message, "entities", None))
-                        if text or reply_markup:
+                        if text or entities or reply_markup:
                             self._server.tg_incoming_message(
                                 chat_id=str(message.chat.id),
                                 user_id=uid,
@@ -902,6 +903,7 @@ class TelegramAdapter:
                                 forward_info=forward_info,
                                 entities=entities,
                                 reply_markup=reply_markup,
+                                reactions=reactions,
                                 sender_name=sender_label,
                             )
                     else:
@@ -922,6 +924,7 @@ class TelegramAdapter:
                             forward_info=forward_info,
                             file_name=file_name,
                             reply_markup=reply_markup,
+                            reactions=reactions,
                             sender_name=sender_label,
                             file_size=media_size,
                             mime=mime,
@@ -966,6 +969,7 @@ class TelegramAdapter:
                 media_type, _media_id, media_size, mime, duration, waveform = self._extract_media_meta(message)
                 media_group_id = self._extract_media_group_id(message)
                 reply_markup = self._reply_markup_to_dict(getattr(message, "reply_markup", None))
+                reactions = self._extract_reactions(message)
                 ts = int(getattr(message, "date", 0).timestamp()) if getattr(message, "date", None) else None
 
                 # Если было медиа — переотрисовать превью/подпись
@@ -973,7 +977,7 @@ class TelegramAdapter:
                 if self._server:
                     if media_type == "text":
                         entities = self._entities_to_dicts(getattr(message, "entities", None))
-                        if text or reply_markup:
+                        if text or entities or reply_markup:
                             self._server.tg_incoming_message(
                                 chat_id=str(message.chat.id),
                                 user_id=uid,
@@ -984,6 +988,7 @@ class TelegramAdapter:
                                 forward_info=forward_info,
                                 entities=entities,
                                 reply_markup=reply_markup,
+                                reactions=reactions,
                                 sender_name=sender_label,
                             )
                     else:
@@ -1004,6 +1009,7 @@ class TelegramAdapter:
                             forward_info=forward_info,
                             file_name=file_name,
                             reply_markup=reply_markup,
+                            reactions=reactions,
                             sender_name=sender_label,
                             file_size=media_size,
                             mime=mime,
@@ -2385,7 +2391,7 @@ class TelegramAdapter:
                 except Exception:
                     text = ""
                 if not text:
-                    continue
+                    text = "Кнопка"
                 payload: Dict[str, Any] = {"text": text, "row": int(row_idx), "col": int(col_idx)}
                 url = getattr(button, "url", None)
                 if url:

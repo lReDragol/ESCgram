@@ -66,6 +66,7 @@ from ui.settings_window import SettingsWindow
 from ui.auto_download import AutoDownloadPolicy
 from ui.config_store import DEFAULT_CONFIG, load_config, save_config
 from ui.dialog_workers import (
+    BulkChatStatisticsWorker,
     DialogsStreamWorker,
     FfmpegInstallWorker,
     GlobalPeerSearchWorker,
@@ -512,57 +513,79 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if app is None:
             return
         theme_cfg = self._config.setdefault("theme", {})
+        freeze_targets = [
+            self,
+            getattr(self, "chat_history_wrap", None),
+            getattr(self, "chat_list", None),
+            getattr(self, "_chat_details_host", None),
+        ]
+        for widget in freeze_targets:
+            if widget is None or not _qt_is_valid(widget):
+                continue
+            try:
+                widget.setUpdatesEnabled(False)
+            except Exception:
+                continue
 
-        mgr = StyleManager.instance()
         try:
-            mgr.set_active_profile(mode)
-        except Exception:
-            # If profile is missing, fall back to whatever is active.
-            pass
+            mgr = StyleManager.instance()
+            try:
+                mgr.set_active_profile(mode)
+            except Exception:
+                pass
 
-        extra_palette = theme_cfg.get("palette")
-        extra_stylesheet = theme_cfg.get("stylesheet")
-        overrides: Dict[str, Any] = {}
-        if isinstance(extra_palette, dict):
-            overrides["palette"] = dict(extra_palette)
-        if isinstance(extra_stylesheet, list):
-            overrides["stylesheet"] = list(extra_stylesheet)
-        elif isinstance(extra_stylesheet, str) and extra_stylesheet.strip():
-            overrides["stylesheet"] = str(extra_stylesheet)
-        if overrides:
-            apply_theme(app, overrides=overrides)
+            extra_palette = theme_cfg.get("palette")
+            extra_stylesheet = theme_cfg.get("stylesheet")
+            overrides: Dict[str, Any] = {}
+            if isinstance(extra_palette, dict):
+                overrides["palette"] = dict(extra_palette)
+            if isinstance(extra_stylesheet, list):
+                overrides["stylesheet"] = list(extra_stylesheet)
+            elif isinstance(extra_stylesheet, str) and extra_stylesheet.strip():
+                overrides["stylesheet"] = str(extra_stylesheet)
+            if overrides:
+                apply_theme(app, overrides=overrides)
 
-        bubbles: Dict[str, Dict[str, str]] = {}
-        try:
-            raw_bubbles = mgr.bubbles()
-            if isinstance(raw_bubbles, dict):
-                for role, colors in raw_bubbles.items():
-                    if isinstance(colors, dict):
-                        bubbles[str(role)] = {str(k): str(v) for k, v in colors.items() if isinstance(k, str) and isinstance(v, str)}
-        except Exception:
-            bubbles = {}
-        if not bubbles:
-            bubbles = {role: dict(DEFAULT_BUBBLE_THEME.get(role, DEFAULT_BUBBLE_THEME["other"])) for role in ("me", "assistant", "other")}
+            bubbles: Dict[str, Dict[str, str]] = {}
+            try:
+                raw_bubbles = mgr.bubbles()
+                if isinstance(raw_bubbles, dict):
+                    for role, colors in raw_bubbles.items():
+                        if isinstance(colors, dict):
+                            bubbles[str(role)] = {str(k): str(v) for k, v in colors.items() if isinstance(k, str) and isinstance(v, str)}
+            except Exception:
+                bubbles = {}
+            if not bubbles:
+                bubbles = {role: dict(DEFAULT_BUBBLE_THEME.get(role, DEFAULT_BUBBLE_THEME["other"])) for role in ("me", "assistant", "other")}
 
-        extra_bubbles = theme_cfg.get("bubbles")
-        if isinstance(extra_bubbles, dict):
-            for role, entry in extra_bubbles.items():
-                if role in bubbles and isinstance(entry, dict):
-                    bubbles[role].update({str(k): str(v) for k, v in entry.items() if isinstance(k, str) and isinstance(v, str)})
+            extra_bubbles = theme_cfg.get("bubbles")
+            if isinstance(extra_bubbles, dict):
+                for role, entry in extra_bubbles.items():
+                    if role in bubbles and isinstance(entry, dict):
+                        bubbles[role].update({str(k): str(v) for k, v in entry.items() if isinstance(k, str) and isinstance(v, str)})
 
-        set_bubble_theme(bubbles)
-        if hasattr(self, "settings_panel"):
-            self.settings_panel.set_theme(bubbles)
+            set_bubble_theme(bubbles)
+            if hasattr(self, "settings_panel"):
+                self.settings_panel.set_theme(bubbles)
 
-        self._theme_mode = mode
-        self._night_mode_enabled = (mode == "night")
-        theme_cfg["mode"] = mode
-        try:
-            save_config(self._config)
-        except Exception:
-            log.debug("Не удалось сохранить настройки темы")
-        if hasattr(self, "settings_panel"):
-            self.settings_panel.set_night_mode_checked(self._night_mode_enabled)
+            self._theme_mode = mode
+            self._night_mode_enabled = (mode == "night")
+            theme_cfg["mode"] = mode
+            try:
+                save_config(self._config)
+            except Exception:
+                log.debug("Не удалось сохранить настройки темы")
+            if hasattr(self, "settings_panel"):
+                self.settings_panel.set_night_mode_checked(self._night_mode_enabled)
+        finally:
+            for widget in freeze_targets:
+                if widget is None or not _qt_is_valid(widget):
+                    continue
+                try:
+                    widget.setUpdatesEnabled(True)
+                    widget.update()
+                except Exception:
+                    continue
 
     def _hydrate_cached_dialogs(self) -> None:
         try:
@@ -1160,14 +1183,22 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         header_layout.addWidget(btn_close, 0)
         layout.addWidget(header, 0)
 
-        container = QWidget(host)
+        scroll = QScrollArea(host)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}QScrollArea>QWidget>QWidget{background:transparent;}")
+        layout.addWidget(scroll, 1)
+
+        container = QWidget(scroll)
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
-        layout.addWidget(container, 1)
+        scroll.setWidget(container)
 
         host.hide()
         self._chat_details_host = host
+        self._chat_details_scroll = scroll
         self._chat_details_header_label = title
         self._chat_details_container = container
         self._chat_details_layout = container_layout
@@ -1791,7 +1822,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             viewer = MediaViewerDialog(media_path=candidate, kind=kind, parent=self)
             self._media_viewers.add(viewer)
             viewer.destroyed.connect(lambda *_args, w=viewer: self._media_viewers.discard(w))
-            viewer.showFullScreen()
+            viewer.setGeometry(self.rect())
+            viewer.show()
             viewer.raise_()
             viewer.activateWindow()
             return True
@@ -2023,7 +2055,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._clear_message_selection()
         self.current_chat_id = chat_id
         self._close_chat_details()
-        self._apply_chat_activity(chat_id, clear_unread=True, refresh_delay_ms=0)
+        self._apply_chat_activity(chat_id, refresh_delay_ms=0)
         self._refresh_chat_header()
         self._update_bot_keyboard_bar()
         self.update_ai_controls_state()
@@ -2134,16 +2166,25 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.populate_chat_list()
         QTimer.singleShot(100, self.refresh_telegram_chats_async)
 
-    def _show_current_chat_statistics(self) -> None:
+    def _show_current_chat_statistics(self, *, scan: bool = False) -> None:
         chat_id = str(self.current_chat_id or "")
         if not chat_id:
             return
-        stats = self.server.get_chat_statistics(chat_id, limit=max(int(getattr(self, "_history_prefetch_limit", 300) or 300), 300))
+        limit = max(int(getattr(self, "_history_prefetch_limit", 300) or 300), 300)
+        stats = self.server.scan_chat_statistics(chat_id, limit=0 if scan else limit) if scan else self.server.get_chat_statistics(chat_id, limit=limit)
         if not stats:
             self._toast("Нет данных для статистики")
             return
+        if scan:
+            self._toast("Скан завершён")
         title = str(self._current_chat_meta().get("title") or chat_id)
-        panel = ChatStatisticsDialog(title, stats, parent=self, embedded=True)
+        panel = ChatStatisticsDialog(
+            title,
+            stats,
+            parent=self,
+            embedded=True,
+            callbacks={"scan": lambda: self._show_current_chat_statistics(scan=True)},
+        )
         self._set_chat_details_widget("Статистика", panel)
 
     def _show_message_statistics(self, message_id: int) -> None:
@@ -3043,41 +3084,122 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         total = len(order)
         if total <= 0:
             return
-        for idx, widget in enumerate(order):
-            group_id = str(getattr(widget, "_media_group_id", "") or "").strip()
-            setter = getattr(widget, "set_media_group_position", None)
-            if not callable(setter):
-                continue
-            if not group_id:
+        supported_album_kinds = {"image", "video", "animation"}
+        for widget in order:
+            row_wrap = getattr(widget, "_row_wrap", None)
+            if row_wrap is not None:
                 try:
-                    setter("single")
+                    row_wrap.show()
                 except Exception:
                     pass
+            album_setter = getattr(widget, "set_media_group_items", None)
+            if callable(album_setter):
+                try:
+                    album_setter(None)
+                except Exception:
+                    pass
+
+        idx = 0
+        while idx < total:
+            widget = order[idx]
+            group_id = str(getattr(widget, "_media_group_id", "") or "").strip()
+            setter = getattr(widget, "set_media_group_position", None)
+            role_key = str(getattr(widget, "_message_role", "") or "").lower()
+            if not group_id:
+                if callable(setter):
+                    try:
+                        setter("single")
+                    except Exception:
+                        pass
+                idx += 1
                 continue
-            prev = order[idx - 1] if idx > 0 else None
-            next_w = order[idx + 1] if idx + 1 < total else None
-            same_prev = (
-                prev is not None
-                and str(getattr(prev, "_media_group_id", "") or "").strip() == group_id
-                and str(getattr(prev, "_message_role", "") or "").lower() == str(getattr(widget, "_message_role", "") or "").lower()
-            )
-            same_next = (
-                next_w is not None
-                and str(getattr(next_w, "_media_group_id", "") or "").strip() == group_id
-                and str(getattr(next_w, "_message_role", "") or "").lower() == str(getattr(widget, "_message_role", "") or "").lower()
-            )
-            if same_prev and same_next:
-                pos = "middle"
-            elif same_prev:
-                pos = "bottom"
-            elif same_next:
-                pos = "top"
-            else:
+
+            end = idx + 1
+            while end < total:
+                probe = order[end]
+                same_group = str(getattr(probe, "_media_group_id", "") or "").strip() == group_id
+                same_role = str(getattr(probe, "_message_role", "") or "").lower() == role_key
+                if not (same_group and same_role):
+                    break
+                end += 1
+            group_widgets = order[idx:end]
+
+            can_album = len(group_widgets) > 1
+            if can_album:
+                for member in group_widgets:
+                    kind = str(getattr(member, "kind", "") or "").lower()
+                    deleted_checker = getattr(member, "is_deleted", None)
+                    is_deleted = bool(deleted_checker()) if callable(deleted_checker) else False
+                    if kind not in supported_album_kinds or is_deleted:
+                        can_album = False
+                        break
+
+            if can_album:
+                first = group_widgets[0]
+                album_items: List[Dict[str, Any]] = []
+                for member in group_widgets:
+                    row_wrap = getattr(member, "_row_wrap", None)
+                    member_id = self._message_id_from_widget(member)
+                    album_items.append(
+                        {
+                            "kind": str(getattr(member, "kind", "") or "").lower(),
+                            "file_path": getattr(member, "file_path", None),
+                            "thumb_path": getattr(member, "thumb_path", None),
+                            "path": getattr(member, "file_path", None) or getattr(member, "thumb_path", None),
+                            "message_id": int(member_id) if member_id is not None else None,
+                        }
+                    )
+                for member in group_widgets:
+                    row_wrap = getattr(member, "_row_wrap", None)
+                    if member is first:
+                        if callable(setter := getattr(member, "set_media_group_position", None)):
+                            try:
+                                setter("single")
+                            except Exception:
+                                pass
+                        album_setter = getattr(member, "set_media_group_items", None)
+                        if callable(album_setter):
+                            try:
+                                album_setter(album_items)
+                            except Exception:
+                                pass
+                        if row_wrap is not None:
+                            try:
+                                row_wrap.show()
+                            except Exception:
+                                pass
+                    else:
+                        if row_wrap is not None:
+                            try:
+                                row_wrap.hide()
+                            except Exception:
+                                pass
+                idx = end
+                continue
+
+            group_total = len(group_widgets)
+            for local_idx, member in enumerate(group_widgets):
                 pos = "single"
-            try:
-                setter(pos)
-            except Exception:
-                pass
+                if group_total > 1:
+                    if local_idx == 0:
+                        pos = "top"
+                    elif local_idx == group_total - 1:
+                        pos = "bottom"
+                    else:
+                        pos = "middle"
+                member_setter = getattr(member, "set_media_group_position", None)
+                if callable(member_setter):
+                    try:
+                        member_setter(pos)
+                    except Exception:
+                        pass
+                row_wrap = getattr(member, "_row_wrap", None)
+                if row_wrap is not None:
+                    try:
+                        row_wrap.show()
+                    except Exception:
+                        pass
+            idx = end
 
     def _maybe_auto_download_widget(self, widget: ChatItemWidget) -> None:
         if not self._auto_download_enabled or self._loading_history:
@@ -3191,6 +3313,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         duration: Optional[int] = None,
         waveform: Optional[List[int]] = None,
         media_group_id: Optional[str] = None,
+        reactions: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         if msg_id is None:
             return
@@ -3209,6 +3332,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "duration": duration,
             "waveform": list(waveform) if isinstance(waveform, list) else None,
             "media_group_id": (str(media_group_id).strip() if media_group_id else None),
+            "reactions": [dict(item) for item in list(reactions or []) if isinstance(item, dict)] or None,
         }
         self._message_cache[mid] = cached
         if reply_to:
@@ -3678,6 +3802,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
         forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
         reply_markup = payload.get("reply_markup") if isinstance(payload.get("reply_markup"), dict) else None
+        reactions = payload.get("reactions") if isinstance(payload.get("reactions"), list) else None
         if reply_markup:
             self._bot_reply_markup_by_chat[chat_id] = reply_markup
             if chat_id == str(self.current_chat_id or ""):
@@ -3704,6 +3829,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
                 if hasattr(existing, "set_reply_markup"):
                     existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
+                if hasattr(existing, "set_reactions"):
+                    existing.set_reactions(reactions if isinstance(reactions, list) else None)
             except Exception:
                 pass
         else:
@@ -3723,6 +3850,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 is_deleted=is_deleted,
                 forward_info=forward_info,
                 reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
+                reactions=reactions if isinstance(reactions, list) else None,
                 timestamp=timestamp,
                 insert_at=insert_at,
             )
@@ -3736,6 +3864,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 reply_to=reply_to,
                 is_deleted=is_deleted,
                 forward_info=forward_info,
+                reactions=reactions if isinstance(reactions, list) else None,
             )
             self._update_reply_references(msg_id)
 
@@ -3790,6 +3919,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         forward_info = payload.get("forward_info") if isinstance(payload.get("forward_info"), dict) else None
         text_entities = payload.get("entities") if isinstance(payload.get("entities"), list) else None
         reply_markup = payload.get("reply_markup") if isinstance(payload.get("reply_markup"), dict) else None
+        reactions = payload.get("reactions") if isinstance(payload.get("reactions"), list) else None
         if reply_markup:
             self._bot_reply_markup_by_chat[chat_id] = reply_markup
             if chat_id == str(self.current_chat_id or ""):
@@ -3840,6 +3970,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
                 if hasattr(existing, "set_reply_markup"):
                     existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
+                if hasattr(existing, "set_reactions"):
+                    existing.set_reactions(reactions if isinstance(reactions, list) else None)
                 if hasattr(existing, "set_caption"):
                     existing.set_caption(text, entities=text_entities)
                 elif hasattr(existing, "set_message_text"):
@@ -3869,6 +4001,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 voice_waveform=self._voice_waveform_enabled,
                 forward_info=forward_info,
                 reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
+                reactions=reactions if isinstance(reactions, list) else None,
                 duration_ms=duration_ms,
                 waveform=waveform,
                 media_group_id=media_group_id,
@@ -3886,6 +4019,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             duration=int(duration_raw) if duration_raw is not None else None,
             waveform=waveform,
             media_group_id=media_group_id,
+            reactions=reactions if isinstance(reactions, list) else None,
         )
         self._refresh_media_group_layout()
         self._update_reply_references(msg_id)
@@ -4031,11 +4165,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
 
         if auto_scroll is None:
-            auto_scroll = bool(reset)
+            auto_scroll = False if reset else False
         self._history_auto_scroll_on_finish = bool(auto_scroll)
+        self._history_anchor_to_top = bool(reset and not auto_scroll)
+        self._feed_scroll_lock_mode = "top" if self._history_anchor_to_top else ""
+        self._feed_autostick_block_until = time.monotonic() + (1.2 if self._history_anchor_to_top else 0.0)
 
         if reset:
             self.clear_feed()
+            self._clear_jump_indicator()
             self._clear_message_selection()
             self._clear_reply_target()
             self.hide_message_search()
@@ -4176,6 +4314,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                                 existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
                             if hasattr(existing, "set_reply_markup"):
                                 existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
+                            reactions = entry.get("reactions") if isinstance(entry.get("reactions"), list) else None
+                            if hasattr(existing, "set_reactions"):
+                                existing.set_reactions(reactions if isinstance(reactions, list) else None)
                             if hasattr(existing, "set_caption"):
                                 existing.set_caption(caption_text, entities=caption_entities)
                             if hasattr(existing, "set_has_hidden"):
@@ -4207,6 +4348,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                             voice_waveform=self._voice_waveform_enabled,
                             forward_info=forward_info if isinstance(forward_info, dict) else None,
                             reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
+                            reactions=entry.get("reactions") if isinstance(entry.get("reactions"), list) else None,
                             duration_ms=duration_ms,
                             waveform=waveform,
                             media_group_id=media_group_id,
@@ -4232,6 +4374,9 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                                 existing.set_forward_info(forward_info if isinstance(forward_info, dict) else None)
                             if hasattr(existing, "set_reply_markup"):
                                 existing.set_reply_markup(reply_markup if isinstance(reply_markup, dict) else None)
+                            reactions = entry.get("reactions") if isinstance(entry.get("reactions"), list) else None
+                            if hasattr(existing, "set_reactions"):
+                                existing.set_reactions(reactions if isinstance(reactions, list) else None)
                             if hasattr(existing, "set_has_hidden"):
                                 existing.set_has_hidden(bool(has_hidden))
                         except Exception:
@@ -4252,6 +4397,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                             is_deleted=is_deleted,
                             forward_info=forward_info if isinstance(forward_info, dict) else None,
                             reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
+                            reactions=entry.get("reactions") if isinstance(entry.get("reactions"), list) else None,
                             insert_at=insert_at,
                         )
                 if not self._loading_history:
@@ -4268,6 +4414,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     duration=int(duration_raw) if duration_raw is not None else None,
                     waveform=waveform,
                     media_group_id=media_group_id,
+                    reactions=entry.get("reactions") if isinstance(entry.get("reactions"), list) else None,
                 )
                 if msg_id is not None:
                     pending_reply_updates.add(msg_id)
@@ -4291,8 +4438,34 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if self.current_chat_id:
             self._apply_chat_activity(self.current_chat_id, clear_unread=True, refresh_delay_ms=0)
         if bool(getattr(self, "_history_auto_scroll_on_finish", True)):
+            self._feed_scroll_lock_mode = ""
+            self._feed_autostick_block_until = 0.0
             QTimer.singleShot(0, self._scroll_to_bottom)
             QTimer.singleShot(60, self._scroll_to_bottom)
+        elif bool(getattr(self, "_history_anchor_to_top", False)):
+            self._feed_scroll_lock_mode = "top"
+            self._feed_autostick_block_until = time.monotonic() + 1.4
+            def _scroll_to_history_top() -> None:
+                try:
+                    bar = self.chat_scroll.verticalScrollBar()
+                    bar.setValue(bar.minimum())
+                    self._clear_jump_indicator()
+                    self._position_jump_button()
+                except Exception:
+                    pass
+            QTimer.singleShot(0, _scroll_to_history_top)
+            QTimer.singleShot(60, _scroll_to_history_top)
+            QTimer.singleShot(180, _scroll_to_history_top)
+            def _unlock_history_anchor() -> None:
+                setattr(self, "_feed_scroll_lock_mode", "")
+                setattr(self, "_feed_autostick_block_until", 0.0)
+                try:
+                    self._update_jump_button_visibility()
+                    self._position_jump_button()
+                except Exception:
+                    pass
+            QTimer.singleShot(900, _unlock_history_anchor)
+        self._history_anchor_to_top = False
         if getattr(self, "_auto_download_enabled", False):
             QTimer.singleShot(180, self._apply_auto_download_to_feed)
         if bool(getattr(self, "_history_load_requested_by_scroll", False)):
@@ -6537,6 +6710,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "media_volume": self.on_media_volume_setting_changed,
             "install_ffmpeg": self._install_ffmpeg_from_settings,
             "install_voice_deps": self._install_voice_dependencies_from_settings,
+            "refresh_all_avatars": self._refresh_all_avatars_from_settings,
+            "scan_all_chats": self._scan_all_chats_from_settings,
             "send_bug_report": self._send_bug_report_from_settings,
         }
         if hasattr(self, "auto_ai_checkbox"):
@@ -6554,6 +6729,112 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             dlg.exec()
         finally:
             self._settings_window = None
+
+    def _set_settings_tools_status(self, message: str) -> None:
+        window = getattr(self, "_settings_window", None)
+        if window is None:
+            return
+        setter = getattr(window, "set_tools_status", None)
+        if callable(setter):
+            try:
+                setter(str(message or ""))
+            except Exception:
+                pass
+
+    def _refresh_all_avatars_from_settings(self) -> tuple[bool, str]:
+        if not hasattr(self, "avatar_cache"):
+            return False, "Кэш аватарок недоступен."
+        scheduled = 0
+        for chat_id, raw_info in list(getattr(self, "all_chats", {}).items()):
+            cid = str(chat_id or "").strip()
+            if not cid or cid.startswith("__"):
+                continue
+            info = dict(raw_info or {})
+            try:
+                self.avatar_cache.chat(cid, info)
+                scheduled += 1
+            except Exception:
+                continue
+        try:
+            refresh_payload = getattr(self, "_chat_list_avatar_payload", None)
+            if callable(refresh_payload):
+                for cid, row_widget in list(getattr(self, "_chat_row_widgets_by_id", {}).items()):
+                    info = dict(getattr(self, "all_chats", {}).get(cid, {}) or {})
+                    title = str(info.get("title_display") or info.get("title") or cid)
+                    pixmap, avatar_key = refresh_payload(cid, info, title)
+                    if row_widget and hasattr(row_widget, "set_avatar_cached") and pixmap is not None:
+                        row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+        except Exception:
+            pass
+        try:
+            self._refresh_chat_header()
+        except Exception:
+            pass
+        message = f"Запущена принудительная подгрузка аватарок: {scheduled}"
+        self._set_settings_tools_status(message)
+        return True, message
+
+    def _scan_all_chats_from_settings(self) -> tuple[bool, str]:
+        thread = getattr(self, "_bulk_stats_thread", None)
+        if thread is not None:
+            try:
+                if _qt_is_valid(thread) and thread.isRunning():
+                    msg = "Скан уже выполняется."
+                    self._set_settings_tools_status(msg)
+                    return False, msg
+            except Exception:
+                pass
+        try:
+            rows = self.server.list_cached_dialogs(limit=2000)
+        except Exception:
+            rows = []
+        chat_ids = [str(row.get("id") or "").strip() for row in list(rows or []) if isinstance(row, dict)]
+        chat_ids = [cid for cid in chat_ids if cid and not cid.startswith("__")]
+        if not chat_ids:
+            msg = "Нет чатов для анализа."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        try:
+            thread = QThread(self)
+            thread.setObjectName("bulk_chat_statistics_thread")
+            worker = BulkChatStatisticsWorker(self.server, chat_ids=chat_ids, limit=0)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_bulk_stats_progress)
+            worker.finished.connect(self._on_bulk_stats_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_bulk_stats_worker", None))
+            thread.finished.connect(lambda: setattr(self, "_bulk_stats_thread", None))
+            self._bulk_stats_worker = worker
+            self._bulk_stats_thread = thread
+            thread.start()
+        except Exception:
+            log.exception("Failed to start bulk chat statistics scan")
+            msg = "Не удалось запустить общий анализ."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        msg = f"Запущен анализ чатов: {len(chat_ids)}"
+        self._set_settings_tools_status(msg)
+        return True, msg
+
+    @Slot(int, int, str)
+    def _on_bulk_stats_progress(self, done: int, total: int, chat_id: str) -> None:
+        msg = f"Анализ: {int(done)}/{int(total)} • {str(chat_id or '')}"
+        self._set_settings_tools_status(msg)
+
+    @Slot(dict)
+    def _on_bulk_stats_finished(self, payload: Dict[str, Any]) -> None:
+        data = dict(payload or {})
+        scanned = int(data.get("scanned") or 0)
+        total = int(data.get("total") or 0)
+        failed = int(data.get("failed") or 0)
+        if bool(data.get("stopped")):
+            msg = f"Анализ остановлен: {scanned}/{total}, ошибок {failed}"
+        else:
+            msg = f"Анализ завершён: {scanned}/{total}, ошибок {failed}"
+        self._set_settings_tools_status(msg)
 
     @staticmethod
     def _read_log_tail(path: str, *, max_lines: int = 260, max_chars: int = 40000) -> str:

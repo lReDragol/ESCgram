@@ -35,7 +35,7 @@ class AvatarCache:
         size: int = 40,
         *,
         on_ready: Optional[Callable[[str, str], None]] = None,
-        max_workers: int = 3,
+        max_workers: int = 6,
     ) -> None:
         self._server = server
         self._size = max(16, size)
@@ -91,7 +91,7 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 3.0
+        can_retry = (time.time() - failed_at) >= 1.2
         if can_retry:
             # Even if photo id is missing in dialog payload, Telegram can often resolve it by chat id.
             self._schedule_download(
@@ -127,7 +127,7 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 3.0
+        can_retry = (time.time() - failed_at) >= 1.2
         if (cache_key not in self._paths or not path) and can_retry:
             self._schedule_download(
                 cache_key=cache_key,

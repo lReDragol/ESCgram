@@ -433,6 +433,19 @@ class ChatSidebarMixin:
         folders_row.addWidget(folder_wrap, 0)
         folders_row.addWidget(self.chat_list, 1)
         left.addLayout(folders_row, 1)
+        try:
+            self.chat_list.viewport().installEventFilter(cast(QObject, self))
+        except Exception:
+            pass
+        try:
+            vbar = self.chat_list.verticalScrollBar()
+            vbar.valueChanged.connect(lambda _value=0: self._schedule_visible_chat_avatar_refresh())
+            vbar.rangeChanged.connect(lambda _min=0, _max=0: self._schedule_visible_chat_avatar_refresh())
+        except Exception:
+            pass
+        self._chat_avatar_refresh_timer = QTimer(self.chat_list)
+        self._chat_avatar_refresh_timer.setSingleShot(True)
+        self._chat_avatar_refresh_timer.timeout.connect(self._refresh_visible_chat_avatars)
 
         self._left_wrap = QWidget()
         self._left_wrap.setLayout(left)
@@ -523,7 +536,20 @@ class ChatSidebarMixin:
     def eventFilter(self, obj, event):  # type: ignore[override]
         if obj is self._left_wrap and event.type() == QEvent.Type.Resize:
             self._reposition_settings_panel()
+        if obj is getattr(self, "chat_list", None) and event.type() == QEvent.Type.Resize:
+            self._schedule_visible_chat_avatar_refresh()
+        viewport = getattr(getattr(self, "chat_list", None), "viewport", lambda: None)()
+        if obj is viewport and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
+            self._schedule_visible_chat_avatar_refresh()
         return False
+
+    def _schedule_visible_chat_avatar_refresh(self) -> None:
+        timer = getattr(self, "_chat_avatar_refresh_timer", None)
+        if timer is None:
+            return
+        if timer.isActive():
+            timer.stop()
+        timer.start(80)
 
     def _on_settings_auto_toggled(self, checked: bool) -> None:
         if not self.current_chat_id:

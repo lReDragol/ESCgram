@@ -355,6 +355,13 @@ class MessageFeedMixin:
             self.chat_scroll.setWidget(new_wrap)
         except Exception:
             pass
+        try:
+            if getattr(self, "_jump_to_latest_btn", None):
+                self._jump_to_latest_btn.raise_()
+            if getattr(self, "_jump_unread_badge", None):
+                self._jump_unread_badge.raise_()
+        except Exception:
+            pass
         self._dispose_widget_tree(old_wrap)
         if old_wrap is not None:
             try:
@@ -368,6 +375,7 @@ class MessageFeedMixin:
         self._message_widgets.clear()
         self._message_order = []
         self._clear_jump_indicator()
+        QTimer.singleShot(0, self._position_jump_button)
 
     def _insert_message_widget(
         self,
@@ -525,6 +533,7 @@ class MessageFeedMixin:
         is_deleted: bool = False,
         forward_info: Optional[Dict[str, Any]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        reactions: Optional[List[Dict[str, Any]]] = None,
         timestamp: Optional[int] = None,
         insert_at: Optional[int] = None,
     ) -> TextMessageWidget:
@@ -546,6 +555,10 @@ class MessageFeedMixin:
             widget.set_reply_preview(reply_preview)
         if reply_markup:
             widget.set_reply_markup(reply_markup)
+        if reactions:
+            setter = getattr(widget, "set_reactions", None)
+            if callable(setter):
+                widget.set_reactions(reactions)
         if has_hidden and hasattr(widget, "set_has_hidden"):
             try:
                 widget.set_has_hidden(True)
@@ -617,6 +630,7 @@ class MessageFeedMixin:
         voice_waveform: bool = True,
         forward_info: Optional[Dict[str, Any]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        reactions: Optional[List[Dict[str, Any]]] = None,
         duration_ms: Optional[int] = None,
         waveform: Optional[List[int]] = None,
         media_group_id: Optional[str] = None,
@@ -647,6 +661,10 @@ class MessageFeedMixin:
             widget.set_reply_preview(reply_preview)
         if reply_markup:
             widget.set_reply_markup(reply_markup)
+        if reactions:
+            setter = getattr(widget, "set_reactions", None)
+            if callable(setter):
+                widget.set_reactions(reactions)
         if is_deleted:
             widget.set_deleted(True)
         if has_hidden and hasattr(widget, "set_has_hidden"):
@@ -706,6 +724,8 @@ class MessageFeedMixin:
     def _scroll_to_bottom(self) -> None:
         def _go() -> None:
             bar = self.chat_scroll.verticalScrollBar()
+            setattr(self, "_feed_scroll_lock_mode", "")
+            setattr(self, "_feed_autostick_block_until", 0.0)
             bar.setValue(bar.maximum())
             self._clear_jump_indicator()
             self._position_jump_button()
@@ -718,6 +738,17 @@ class MessageFeedMixin:
             return
         try:
             bar = self.chat_scroll.verticalScrollBar()
+            lock_mode = str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower()
+            lock_until = float(getattr(self, "_feed_autostick_block_until", 0.0) or 0.0)
+            if lock_mode == "top" and time.monotonic() < lock_until:
+                bar.setValue(bar.minimum())
+                self._update_jump_button_visibility()
+                self._position_jump_button()
+                return
+            if time.monotonic() < lock_until:
+                self._update_jump_button_visibility()
+                self._position_jump_button()
+                return
             # Only auto-stick if the user is already near the bottom.
             threshold = int(getattr(self, "_scroll_stick_threshold", 96) or 96)
             if (bar.maximum() - bar.value()) <= threshold:
@@ -766,6 +797,8 @@ class MessageFeedMixin:
         self._update_jump_button_visibility()
 
     def _jump_to_latest_clicked(self) -> None:
+        setattr(self, "_feed_scroll_lock_mode", "")
+        setattr(self, "_feed_autostick_block_until", 0.0)
         self._scroll_to_bottom()
 
     def _update_jump_button_visibility(self) -> None:
@@ -795,7 +828,15 @@ class MessageFeedMixin:
         x = max(0, viewport.width() - btn.width() - margin_right)
         y = max(0, viewport.height() - btn.height() - margin_bottom)
         btn.move(x, y)
+        try:
+            btn.raise_()
+        except Exception:
+            pass
         if badge:
             bx = x - max(2, badge.width() // 4)
             by = max(0, y - badge.height() // 3)
             badge.move(bx, by)
+            try:
+                badge.raise_()
+            except Exception:
+                pass

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from bisect import bisect_left
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import json
@@ -16,11 +17,13 @@ from utils import app_paths
 from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot, QTimer
 from PySide6.QtGui import QDesktopServices, QPainter, QColor, QMouseEvent, QPainterPath, QPen, QLinearGradient
 from PySide6.QtWidgets import (
+    QApplication,
     QLabel,
     QFrame,
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
+    QGridLayout,
     QPushButton,
     QProgressBar,
     QScrollArea,
@@ -101,11 +104,11 @@ def set_bubble_theme(theme: dict[str, dict[str, str]]) -> None:
             BUBBLE_THEME[role].update(colors)
             changed = True
     if changed:
-        Bubble.refresh_all()
+        Bubble.schedule_refresh_all()
 
 
 def _on_style_profile_changed(_profile: Dict[str, Any]) -> None:
-    Bubble.refresh_all()
+    Bubble.schedule_refresh_all()
 
 
 _STYLE_MGR.style_changed.connect(_on_style_profile_changed)
@@ -434,6 +437,8 @@ def _render_entities_html(
             return f'<a href="{href}" style="color:{ACCENT_LINK_COLOR};text-decoration:none;font-weight:600;">'
         if t == "blockquote":
             return '<span style="color:#c4d4eb;border-left:3px solid rgba(89,183,233,0.45);padding-left:8px;">'
+        if t == "custom_emoji":
+            return '<span style="color:#8fd1ff;font-weight:700;">'
         if t == "spoiler":
             bg = "rgba(73,130,190,0.28)"
             if reveal_spoilers:
@@ -452,7 +457,7 @@ def _render_entities_html(
         t = span.type
         if t in {"bold", "italic", "underline", "strikethrough"}:
             return {"bold": "</b>", "italic": "</i>", "underline": "</u>", "strikethrough": "</s>"}[t]
-        if t in {"code", "hashtag", "mention", "hidden", "blockquote", "search_active", "search_hit"}:
+        if t in {"code", "hashtag", "mention", "hidden", "blockquote", "search_active", "search_hit", "custom_emoji"}:
             return "</span>"
         if t == "pre":
             return "</pre>"
@@ -540,7 +545,8 @@ class RichTextLabel(QLabel):
         QDesktopServices.openUrl(QUrl(str(href)))
 
     def set_message(self, text: str, *, entities: Optional[List[Dict[str, Any]]] = None) -> None:
-        self._raw_text = text or ""
+        normalized = str(text or "").replace("\ufffc", "✦")
+        self._raw_text = normalized
         self._entities = list(entities) if isinstance(entities, list) else None
         self._spoilers_revealed = False
         self._render_current()
@@ -808,6 +814,190 @@ class MessageReplyMarkupWidget(QWidget):
         self.show()
 
 
+class MessageReactionsWidget(QWidget):
+    reactionActivated = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._reactions: List[Dict[str, Any]] = []
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 2, 0, 0)
+        self._layout.setSpacing(6)
+
+    def clear_items(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def set_reactions(self, reactions: Optional[List[Dict[str, Any]]]) -> None:
+        rows = [dict(item) for item in list(reactions or []) if isinstance(item, dict)]
+        if rows == self._reactions:
+            self.setVisible(bool(rows))
+            return
+        self._reactions = rows
+        self.clear_items()
+        if not rows:
+            self.hide()
+            return
+        for item in rows[:12]:
+            count = max(0, int(item.get("count") or 0))
+            emoji = str(item.get("emoji") or item.get("title") or "").strip()
+            if not emoji:
+                custom_id = str(item.get("custom_emoji_id") or "").strip()
+                emoji = "✦" if custom_id else "?"
+            title = f"{emoji} {count}".strip() if count > 0 else emoji
+            btn = QToolButton(self)
+            btn.setText(title)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setAutoRaise(True)
+            btn.setStyleSheet(
+                "QToolButton{background-color:rgba(255,255,255,0.07);"
+                "border:1px solid rgba(255,255,255,0.08);border-radius:11px;"
+                "padding:3px 9px;color:#dff1ff;font-size:11px;font-weight:600;}"
+                "QToolButton:hover{background-color:rgba(89,183,255,0.16);border-color:rgba(89,183,255,0.28);}"
+            )
+            btn.clicked.connect(lambda _checked=False, value=emoji: self.reactionActivated.emit(str(value)))
+            self._layout.addWidget(btn, 0)
+        self._layout.addStretch(1)
+        self.show()
+
+
+class _AlbumTileLabel(QLabel):
+    activated = Signal(dict)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._payload: Dict[str, Any] = {}
+        self._overlay_text = ""
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setScaledContents(False)
+        self.setStyleSheet(
+            "background-color:rgba(255,255,255,0.04);"
+            "border-radius:14px;color:#dfe7f5;font-size:12px;font-weight:600;"
+        )
+
+    def set_payload(self, payload: Dict[str, Any]) -> None:
+        self._payload = dict(payload or {})
+
+    def set_overlay_text(self, text: str) -> None:
+        normalized = str(text or "").strip()
+        if self._overlay_text == normalized:
+            return
+        self._overlay_text = normalized
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit(dict(self._payload))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if not self._overlay_text:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(8, 14, 22, 166))
+        painter.drawRoundedRect(rect, 14, 14)
+        painter.setPen(QColor("#f4f7ff"))
+        font = painter.font()
+        font.setPointSize(max(20, font.pointSize()))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._overlay_text)
+        painter.end()
+
+
+class MediaAlbumGridWidget(QWidget):
+    activated = Signal(dict)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items: List[Dict[str, Any]] = []
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(2)
+
+    @staticmethod
+    def _load_pixmap(payload: Dict[str, Any]) -> Optional["QPixmap"]:
+        from PySide6.QtGui import QPixmap
+
+        for key in ("file_path", "thumb_path", "path"):
+            path = str(payload.get(key) or "").strip()
+            if not path or not os.path.isfile(path):
+                continue
+            pix = QPixmap(path)
+            if pix is not None and not pix.isNull():
+                return pix
+        return None
+
+    @staticmethod
+    def _tile_plan(count: int) -> List[Tuple[int, int, int, int]]:
+        if count <= 1:
+            return [(0, 0, 1, 1)]
+        if count == 2:
+            return [(0, 0, 1, 1), (0, 1, 1, 1)]
+        if count == 3:
+            return [(0, 0, 2, 1), (0, 1, 1, 1), (1, 1, 1, 1)]
+        return [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)]
+
+    def clear_items(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def set_items(self, items: Optional[List[Dict[str, Any]]]) -> None:
+        rows = [dict(item) for item in list(items or []) if isinstance(item, dict)]
+        if rows == self._items:
+            self.setVisible(bool(rows))
+            return
+        self._items = rows
+        self.clear_items()
+        if not rows:
+            self.hide()
+            return
+        visible = rows[:4]
+        plan = self._tile_plan(len(visible))
+        for idx, payload in enumerate(visible):
+            row, col, row_span, col_span = plan[min(idx, len(plan) - 1)]
+            tile = _AlbumTileLabel(self)
+            tile.set_payload(payload)
+            tile.activated.connect(self.activated.emit)
+            kind = str(payload.get("kind") or "").strip().lower()
+            label = ""
+            if kind in {"video", "video_note"}:
+                label = "▶ Видео"
+            elif kind == "animation":
+                label = "GIF"
+            pix = self._load_pixmap(payload)
+            if pix is not None and not pix.isNull():
+                target_size = QSize(260, 260 if len(visible) != 3 or idx != 0 else 520)
+                scaled = pix.scaled(
+                    target_size,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                tile.setPixmap(scaled)
+                tile.setMinimumSize(120, 120)
+            else:
+                tile.setText(label or "Медиа")
+                tile.setMinimumSize(120, 120)
+            if idx == len(visible) - 1 and len(rows) > 4:
+                extra = len(rows) - 4
+                tile.set_overlay_text(f"+{extra}")
+            self._grid.addWidget(tile, row, col, row_span, col_span)
+        self.show()
+
+
 # -------------------------------- Bubble ---------------------------------
 
 class Bubble(QWidget):
@@ -815,6 +1005,8 @@ class Bubble(QWidget):
 
     _instances: "WeakSet[Bubble]" = WeakSet()
     _BODY_RADIUS = _bubble_radius()
+    _refresh_queue: "deque[Bubble]" = deque()
+    _refresh_timer: Optional[QTimer] = None
 
     def __init__(self, text: str = "", role: str = "other", maxw: int = 720, parent=None):
         super().__init__(parent)
@@ -973,6 +1165,38 @@ class Bubble(QWidget):
                 bubble.set_role(bubble._role)
             except Exception:
                 continue
+
+    @classmethod
+    def schedule_refresh_all(cls) -> None:
+        cls._BODY_RADIUS = _bubble_radius()
+        cls._refresh_queue = deque(list(cls._instances))
+        app = QApplication.instance()
+        if app is None:
+            cls.refresh_all()
+            return
+        if cls._refresh_timer is None:
+            timer = QTimer(app)
+            timer.setSingleShot(True)
+            timer.timeout.connect(cls._drain_refresh_queue)
+            cls._refresh_timer = timer
+        if not cls._refresh_timer.isActive():
+            cls._refresh_timer.start(0)
+
+    @classmethod
+    def _drain_refresh_queue(cls) -> None:
+        chunk = max(24, int(_STYLE_MGR.metric("message_widgets.metrics.theme_refresh_chunk", 72) or 72))
+        processed = 0
+        while cls._refresh_queue and processed < chunk:
+            bubble = cls._refresh_queue.popleft()
+            processed += 1
+            if bubble is None or not _qt_is_valid(bubble):
+                continue
+            try:
+                bubble.set_role(bubble._role)
+            except Exception:
+                continue
+        if cls._refresh_queue and cls._refresh_timer is not None:
+            cls._refresh_timer.start(0)
 
 
 class RadialDownloadWidget(QWidget):
@@ -1232,6 +1456,8 @@ class TextMessageWidget(QWidget):
         self._forward_data: Optional[Dict[str, Any]] = None
         self._reply_markup_widget: Optional[MessageReplyMarkupWidget] = None
         self._reply_markup_data: Optional[Dict[str, Any]] = None
+        self._reactions_widget: Optional[MessageReactionsWidget] = None
+        self._reactions_data: Optional[List[Dict[str, Any]]] = None
         self._is_deleted = False
         self._custom_header_color: Optional[str] = None
         self._content_hidden = False
@@ -1354,6 +1580,21 @@ class TextMessageWidget(QWidget):
         self.bubble.add_content(self._reply_markup_widget)
         self._reply_markup_widget.set_markup(markup)
 
+    def set_reactions(self, reactions: Optional[List[Dict[str, Any]]]) -> None:
+        rows = [dict(item) for item in list(reactions or []) if isinstance(item, dict)]
+        self._reactions_data = rows or None
+        if not rows:
+            if self._reactions_widget:
+                self.bubble.remove_content(self._reactions_widget)
+                self._reactions_widget.deleteLater()
+                self._reactions_widget = None
+            return
+        if not self._reactions_widget:
+            self._reactions_widget = MessageReactionsWidget(self)
+        self.bubble.remove_content(self._reactions_widget)
+        self.bubble.add_content(self._reactions_widget)
+        self._reactions_widget.set_reactions(rows)
+
     def set_search_query(self, query: str, *, active: bool = False) -> None:
         if self._message_label:
             self._message_label.set_search(query, active=active)
@@ -1425,6 +1666,11 @@ class TextMessageWidget(QWidget):
         if self._reply_markup_widget:
             try:
                 self._reply_markup_widget.deleteLater()
+            except Exception:
+                pass
+        if self._reactions_widget:
+            try:
+                self._reactions_widget.deleteLater()
             except Exception:
                 pass
 
@@ -1638,6 +1884,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._document_status_lbl: Optional[QLabel] = None
         self._caption_label: Optional[RichTextLabel] = None
         self._caption_bubble: Optional[Bubble] = None
+        self._album_widget: Optional[MediaAlbumGridWidget] = None
         self._radial_doc_widget: Optional[RadialDownloadWidget] = None
         # Voice playback: QtMultimedia on Windows often can't decode OGG/Opus, so decode to WAV on demand.
         self._voice_decoded_path: Optional[str] = None
@@ -1655,6 +1902,8 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._forward_data: Optional[Dict[str, Any]] = None
         self._reply_markup_widget: Optional[MessageReplyMarkupWidget] = None
         self._reply_markup_data: Optional[Dict[str, Any]] = None
+        self._reactions_widget: Optional[MessageReactionsWidget] = None
+        self._reactions_data: Optional[List[Dict[str, Any]]] = None
         self._custom_header_color: Optional[str] = None
         self._content_layout: Optional[QVBoxLayout] = None
         self._deleted_placeholder: Optional[QLabel] = None
@@ -2418,6 +2667,66 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             self._content_layout.addWidget(self._reply_markup_widget, 0)
             self._reply_markup_widget.set_markup(markup)
 
+    def set_reactions(self, reactions: Optional[List[Dict[str, Any]]]) -> None:
+        rows = [dict(item) for item in list(reactions or []) if isinstance(item, dict)]
+        self._reactions_data = rows or None
+        if not rows:
+            if self._reactions_widget and self._content_layout:
+                self._content_layout.removeWidget(self._reactions_widget)
+                self._reactions_widget.deleteLater()
+                self._reactions_widget = None
+            return
+        if not self._reactions_widget:
+            self._reactions_widget = MessageReactionsWidget(self)
+        if self._content_layout and self._reactions_widget:
+            self._content_layout.removeWidget(self._reactions_widget)
+            self._content_layout.addWidget(self._reactions_widget)
+            self._reactions_widget.set_reactions(rows)
+
+    def _iter_primary_media_widgets(self) -> List[QWidget]:
+        out: List[QWidget] = []
+        for attr in ("lbl_img", "lbl_anim", "preview", "video_w", "lbl_sticker"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QWidget):
+                out.append(widget)
+        return out
+
+    def set_media_group_items(self, items: Optional[List[Dict[str, Any]]]) -> None:
+        rows = [dict(item) for item in list(items or []) if isinstance(item, dict)]
+        if len(rows) <= 1:
+            if self._album_widget and self._content_layout:
+                self._content_layout.removeWidget(self._album_widget)
+                self._album_widget.deleteLater()
+                self._album_widget = None
+            for widget in self._iter_primary_media_widgets():
+                try:
+                    widget.show()
+                except Exception:
+                    continue
+            return
+        if not self._content_layout:
+            return
+        if self._album_widget is None:
+            self._album_widget = MediaAlbumGridWidget(self)
+            self._album_widget.activated.connect(self._handle_album_activate)
+        self._content_layout.removeWidget(self._album_widget)
+        self._content_layout.insertWidget(0, self._album_widget, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._album_widget.set_items(rows)
+        for widget in self._iter_primary_media_widgets():
+            try:
+                widget.hide()
+            except Exception:
+                continue
+
+    @Slot(dict)
+    def _handle_album_activate(self, payload: Dict[str, Any]) -> None:
+        handler = getattr(self, "on_media_activate", None)
+        if callable(handler):
+            try:
+                handler(dict(payload or {}))
+            except Exception:
+                pass
+
     def set_search_query(self, query: str, *, active: bool = False) -> None:
         if self._caption_label:
             self._caption_label.set_search(query, active=active)
@@ -2862,6 +3171,18 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             except Exception:
                 pass
             self._reply_markup_widget = None
+        if self._reactions_widget:
+            try:
+                self._reactions_widget.deleteLater()
+            except Exception:
+                pass
+            self._reactions_widget = None
+        if self._album_widget:
+            try:
+                self._album_widget.deleteLater()
+            except Exception:
+                pass
+            self._album_widget = None
         if self._voice_wave_widget:
             try:
                 self._voice_wave_widget.deleteLater()

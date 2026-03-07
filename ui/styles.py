@@ -6,7 +6,7 @@ import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -53,6 +53,7 @@ class StyleManager(QObject):
         self._active_name: Optional[str] = None
         self._active_store: Dict[str, Any] = {}
         self._active_profile: Dict[str, Any] = {}
+        self._bindings_refresh_pending = False
         self._load()
         self.apply_palette()
 
@@ -205,7 +206,7 @@ class StyleManager(QObject):
             return
         self._select_store(name)
         self.apply_palette()
-        self._refresh_bindings()
+        self._refresh_bindings_async()
         self._notify_subscribers()
         self.profile_changed.emit(name)
         self.style_changed.emit(self._active_profile)
@@ -328,6 +329,17 @@ class StyleManager(QObject):
             alive.append((ref, key))
         self._bindings = alive
 
+    def _refresh_bindings_async(self) -> None:
+        if self._bindings_refresh_pending:
+            return
+        self._bindings_refresh_pending = True
+
+        def _run() -> None:
+            self._bindings_refresh_pending = False
+            self._refresh_bindings()
+
+        QTimer.singleShot(0, _run)
+
     def _notify_subscribers(self) -> None:
         for callback in list(self._subscribers):
             try:
@@ -355,7 +367,7 @@ class StyleManager(QObject):
         self._active_profile = copy.deepcopy(self._active_store)
         self._write()
         self.apply_palette()
-        self._refresh_bindings()
+        self._refresh_bindings_async()
         self._notify_subscribers()
         self.style_changed.emit(self._active_profile)
 

@@ -50,7 +50,10 @@ class MediaViewerDialog(QDialog):
 
         self.setWindowTitle("Просмотр медиа")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        if parent is not None:
+            self.setWindowFlags(Qt.WindowType.Widget | Qt.WindowType.FramelessWindowHint)
+        else:
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setStyleSheet("background-color:#050b12; color:#dce8f8;")
 
         root = QVBoxLayout(self)

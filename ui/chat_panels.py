@@ -160,7 +160,10 @@ class ChatInfoDialog(QDialog):
         self._embedded = bool(embedded)
 
         self.setWindowTitle("Профиль чата")
-        self.resize(680, 680)
+        if not self._embedded:
+            self.resize(680, 680)
+        else:
+            self.setMinimumSize(0, 0)
         self.setStyleSheet(
             "QDialog{background-color:#0f1b27;color:#dfe7f5;}"
             "QLabel{color:#dfe7f5;}"
@@ -494,11 +497,23 @@ class ChatInfoDialog(QDialog):
 
 
 class ChatStatisticsDialog(QDialog):
-    def __init__(self, title: str, data: Dict[str, Any], parent: Optional[QWidget] = None, *, embedded: bool = False) -> None:
+    def __init__(
+        self,
+        title: str,
+        data: Dict[str, Any],
+        parent: Optional[QWidget] = None,
+        *,
+        embedded: bool = False,
+        callbacks: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__(parent)
         self._embedded = bool(embedded)
+        self._callbacks = dict(callbacks or {})
         self.setWindowTitle("Статистика чата")
-        self.resize(520, 640)
+        if not self._embedded:
+            self.resize(520, 640)
+        else:
+            self.setMinimumSize(0, 0)
         self.setStyleSheet(
             "QDialog{background-color:#0f1b27;color:#dfe7f5;}"
             "QProgressBar{background-color:rgba(255,255,255,0.05);border:none;border-radius:6px;height:10px;text-align:center;}"
@@ -511,11 +526,19 @@ class ChatStatisticsDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
+        heading_row = QHBoxLayout()
+        heading_row.setSpacing(8)
         heading = QLabel(str(title or "Чат"))
         heading.setStyleSheet("font-size:20px;font-weight:700;color:#f4f7ff;")
-        root.addWidget(heading)
+        heading_row.addWidget(heading, 1)
+        btn_scan = QPushButton("Скан", self)
+        btn_scan.clicked.connect(self._scan_clicked)
+        heading_row.addWidget(btn_scan, 0)
+        root.addLayout(heading_row)
 
         tabs = QTabWidget(self)
+        tabs.setDocumentMode(True)
+        tabs.setUsesScrollButtons(True)
         root.addWidget(tabs, 1)
 
         summary_tab, summary_layout = self._stats_tab()
@@ -545,6 +568,38 @@ class ChatStatisticsDialog(QDialog):
             row = QLabel(f"{label}: {value}")
             row.setStyleSheet("color:#dfe7f5;font-size:13px;")
             summary.body.addWidget(row)
+        snapshot_meta = data.get("snapshot_meta") if isinstance(data.get("snapshot_meta"), dict) else {}
+        latest_snapshot = snapshot_meta.get("latest") if isinstance(snapshot_meta.get("latest"), dict) else None
+        previous_snapshot = snapshot_meta.get("previous") if isinstance(snapshot_meta.get("previous"), dict) else None
+        delta_snapshot = snapshot_meta.get("delta") if isinstance(snapshot_meta.get("delta"), dict) else {}
+        if latest_snapshot:
+            latest_ts = int(latest_snapshot.get("scanned_at") or 0)
+            summary.body.addWidget(QLabel(f"Последний скан: {self._format_ts(latest_ts)}"))
+        if previous_snapshot:
+            prev_ts = int(previous_snapshot.get("scanned_at") or 0)
+            summary.body.addWidget(QLabel(f"Предыдущий скан: {self._format_ts(prev_ts)}"))
+        if delta_snapshot:
+            delta_section = _StatsSection("Сравнение со прошлым сканом", self)
+            label_map = {
+                "total_messages": "Сообщений",
+                "media_messages": "Медиа",
+                "deleted_messages": "Удалено",
+                "total_views": "Просмотры",
+                "total_forwards": "Пересылки",
+                "total_reactions": "Реакции",
+            }
+            for key, label in label_map.items():
+                if key not in delta_snapshot:
+                    continue
+                try:
+                    value = int(delta_snapshot.get(key) or 0)
+                except Exception:
+                    value = 0
+                sign = "+" if value > 0 else ""
+                item = QLabel(f"{label}: {sign}{value}")
+                item.setStyleSheet("color:#8fd1ff;font-size:12px;")
+                delta_section.body.addWidget(item)
+            summary_layout.addWidget(delta_section)
         summary_layout.addWidget(summary)
 
         engagement = data.get("engagement") if isinstance(data.get("engagement"), dict) else {}
@@ -735,6 +790,14 @@ class ChatStatisticsDialog(QDialog):
         layout.setSpacing(12)
         scroll.setWidget(container)
         return scroll, layout
+
+    def _scan_clicked(self) -> None:
+        callback = self._callbacks.get("scan") if isinstance(self._callbacks, dict) else None
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                pass
 
 
 class MessageStatisticsDialog(QDialog):

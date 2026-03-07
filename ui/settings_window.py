@@ -118,13 +118,14 @@ class SettingsWindow(QDialog):
         StyleManager.instance().bind_stylesheet(tabs, "settings.tabs")
         tabs.addTab(self._build_general_tab(state, callbacks), "Общее")
         tabs.addTab(self._build_ai_tab(self._ai_state, self._ai_callbacks), "AI")
-        tabs.addTab(self._build_bug_report_tab(), "Баг-репорт")
         placeholder = QWidget()
         ph_layout = QVBoxLayout(placeholder)
         ph_layout.setContentsMargins(12, 12, 12, 12)
         ph_layout.addWidget(QLabel("Открывайте вкладку «Оформление» при необходимости — загружается лениво."))
         ph_layout.addStretch(1)
         self._style_tab_index = tabs.addTab(placeholder, "Оформление")
+        tabs.addTab(self._build_tools_tab(), "Tools")
+        tabs.addTab(self._build_bug_report_tab(), "Баг-репорт")
         tabs.currentChanged.connect(lambda idx: self._maybe_init_style_tab(tabs, idx))
         root.addWidget(tabs, 1)
 
@@ -415,6 +416,54 @@ class SettingsWindow(QDialog):
         btn_row.addWidget(self.btn_send_bug_report)
         layout.addLayout(btn_row)
         return tab
+
+    def _build_tools_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        hint = QLabel("Инструменты обслуживания и принудительных фоновых операций.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        btn_refresh_avatars = QPushButton("Принудительно подгрузить все аватарки")
+        btn_refresh_avatars.clicked.connect(
+            lambda: self._run_tool_action(self._callbacks.get("refresh_all_avatars"))
+        )
+        layout.addWidget(btn_refresh_avatars, 0, Qt.AlignmentFlag.AlignLeft)
+
+        btn_scan_all = QPushButton("Анализ всех чатов/групп")
+        btn_scan_all.clicked.connect(
+            lambda: self._run_tool_action(self._callbacks.get("scan_all_chats"))
+        )
+        layout.addWidget(btn_scan_all, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.tools_status = QLabel("")
+        self.tools_status.setWordWrap(True)
+        self.tools_status.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(self.tools_status)
+        layout.addStretch(1)
+        return tab
+
+    def _run_tool_action(self, callback: Optional[Callable[..., Any]]) -> None:
+        if not callable(callback):
+            self.set_tools_status("Инструмент недоступен в этой сборке.")
+            return
+        try:
+            result = callback()
+        except Exception as exc:
+            self.set_tools_status(str(exc) or "Не удалось выполнить инструмент.")
+            return
+        if isinstance(result, tuple) and len(result) >= 2:
+            self.set_tools_status(str(result[1] or ""))
+        elif isinstance(result, str):
+            self.set_tools_status(result)
+
+    def set_tools_status(self, message: str) -> None:
+        label = getattr(self, "tools_status", None)
+        if label is not None:
+            label.setText(str(message or ""))
 
     def _send_bug_report(self) -> None:
         callback = self._callbacks.get("send_bug_report") if isinstance(self._callbacks, dict) else None

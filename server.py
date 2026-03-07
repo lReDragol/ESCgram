@@ -497,10 +497,49 @@ class ServerCore:
         if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
             return {}
         try:
-            return self._storage.get_chat_statistics(int(chat_id), limit=limit)
+            peer_id = int(chat_id)
+            stats = self._storage.get_chat_statistics(peer_id, limit=limit)
+            return self._attach_chat_statistics_snapshots(peer_id, stats)
         except Exception:
             log.exception("[SERVER] Failed to load chat statistics for %s", chat_id)
             return {}
+
+    def scan_chat_statistics(self, chat_id: str, *, limit: int = 0) -> Dict[str, Any]:
+        if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
+            return {}
+        try:
+            peer_id = int(chat_id)
+            stats = self._storage.get_chat_statistics(peer_id, limit=limit)
+            scanned_at = self._storage.save_chat_statistics_snapshot(peer_id, stats)
+            stats["scanned_at"] = int(scanned_at)
+            return self._attach_chat_statistics_snapshots(peer_id, stats)
+        except Exception:
+            log.exception("[SERVER] Failed to scan chat statistics for %s", chat_id)
+            return {}
+
+    def _attach_chat_statistics_snapshots(self, peer_id: int, stats: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._storage:
+            return stats
+        data = dict(stats or {})
+        try:
+            snapshots = self._storage.get_chat_statistics_snapshots(peer_id, limit=2)
+        except Exception:
+            snapshots = []
+        latest = snapshots[0] if len(snapshots) >= 1 else None
+        previous = snapshots[1] if len(snapshots) >= 2 else None
+        delta: Dict[str, Any] = {}
+        if isinstance(latest, dict) and isinstance(previous, dict):
+            for key in ("total_messages", "media_messages", "deleted_messages", "total_views", "total_forwards", "total_reactions"):
+                try:
+                    delta[key] = int(latest.get(key) or 0) - int(previous.get(key) or 0)
+                except Exception:
+                    continue
+        data["snapshot_meta"] = {
+            "latest": latest,
+            "previous": previous,
+            "delta": delta,
+        }
+        return data
 
     def get_message_statistics(self, chat_id: str, message_id: int) -> Dict[str, Any]:
         if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
@@ -673,6 +712,7 @@ class ServerCore:
         forward_info: Optional[Dict[str, Any]] = None,
         entities: Optional[List[Dict[str, Any]]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        reactions: Optional[List[Dict[str, Any]]] = None,
         sender_name: Optional[str] = None,
     ) -> None:
         ts = int(date_ts or time.time())
@@ -684,6 +724,7 @@ class ServerCore:
             "sender": sender_name or self.get_user_display_name(user_id) or user_id,
             "entities": entities or None,
             "reply_markup": reply_markup or None,
+            "reactions": reactions or None,
             "reply_to": reply_to,
             "forward_info": forward_info,
             "file_name": None,
@@ -714,6 +755,7 @@ class ServerCore:
         forward_info: Optional[Dict[str, Any]] = None,
         entities: Optional[List[Dict[str, Any]]] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
+        reactions: Optional[List[Dict[str, Any]]] = None,
         file_name: Optional[str] = None,
         sender_name: Optional[str] = None,
         file_size: Optional[int] = None,
@@ -732,6 +774,7 @@ class ServerCore:
             "text": text or "",
             "entities": entities or None,
             "reply_markup": reply_markup or None,
+            "reactions": reactions or None,
             "file_path": file_path,
             "thumb_path": thumb_path,
             "ts": ts,

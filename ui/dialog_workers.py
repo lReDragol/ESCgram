@@ -113,6 +113,7 @@ class HistoryWorker(QObject):
                 "is_deleted",
                 "forward_info",
                 "reply_markup",
+                "reactions",
                 "duration",
                 "waveform",
                 "media_group_id",
@@ -224,6 +225,48 @@ class LastDateWorker(QObject):
                 time.sleep(0.1)
                 slept += 0.1
         self.done.emit()
+
+
+class BulkChatStatisticsWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+
+    def __init__(self, server, chat_ids: List[str], *, limit: int = 0):
+        super().__init__()
+        self.server = server
+        self.chat_ids = [str(cid) for cid in list(chat_ids or []) if str(cid or "").strip()]
+        self.limit = int(limit)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    @Slot()
+    def run(self) -> None:
+        total = len(self.chat_ids)
+        scanned = 0
+        failed = 0
+        for idx, chat_id in enumerate(self.chat_ids, start=1):
+            if self._stop:
+                break
+            try:
+                result = self.server.scan_chat_statistics(chat_id, limit=self.limit)
+                if isinstance(result, dict) and result:
+                    scanned += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+            self.progress.emit(idx, total, chat_id)
+        self.finished.emit(
+            {
+                "ok": not self._stop,
+                "total": total,
+                "scanned": scanned,
+                "failed": failed,
+                "stopped": bool(self._stop),
+            }
+        )
 
 
 class ReleaseCheckWorker(QObject):

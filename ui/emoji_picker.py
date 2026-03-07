@@ -18,6 +18,48 @@ _FALLBACK_EMOJIS: Sequence[str] = [
 ]
 
 
+def _is_flag_sequence(value: str) -> bool:
+    if not value:
+        return False
+    for ch in value:
+        code = ord(ch)
+        if 0x1F1E6 <= code <= 0x1F1FF:
+            return True
+    return False
+
+
+def _emoji_priority(value: str, index: int) -> tuple[int, int, int]:
+    first = ord(value[0]) if value else 0
+    if 0x1F600 <= first <= 0x1F64F:
+        bucket = 0
+    elif 0x1F900 <= first <= 0x1F9FF:
+        bucket = 1
+    elif 0x1F300 <= first <= 0x1F5FF:
+        bucket = 2
+    elif 0x1F680 <= first <= 0x1F6FF:
+        bucket = 3
+    else:
+        bucket = 4
+    return (bucket, len(value), index)
+
+
+def _normalize_picker_emoji(values: Sequence[str], *, limit: Optional[int] = None) -> Sequence[str]:
+    max_items = int(limit) if isinstance(limit, int) and int(limit) > 0 else None
+    merged: List[str] = []
+    seen: set[str] = set()
+    for emoji in list(_FALLBACK_EMOJIS) + [str(v or "").strip() for v in values]:
+        value = str(emoji or "").strip()
+        if not value or value in seen:
+            continue
+        if _is_flag_sequence(value):
+            continue
+        seen.add(value)
+        merged.append(value)
+        if max_items is not None and len(merged) >= max_items:
+            break
+    return tuple(merged)
+
+
 def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
     values: List[str] = []
     seen: set[str] = set()
@@ -28,23 +70,27 @@ def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
 
         data = getattr(emoji_lib, "EMOJI_DATA", None)
         if isinstance(data, dict):
-            for key in data.keys():
+            ranked: List[tuple[tuple[int, int, int], str]] = []
+            for index, key in enumerate(data.keys()):
                 value = str(key or "").strip()
                 if not value or value in seen:
                     continue
+                if _is_flag_sequence(value):
+                    continue
                 seen.add(value)
-                values.append(value)
-                if max_items is not None and len(values) >= max_items:
-                    break
+                ranked.append((_emoji_priority(value, index), value))
+            ranked.sort(key=lambda item: item[0])
+            values = [value for _, value in ranked]
     except Exception:
         values = []
 
     if not values:
         values = [str(e) for e in _FALLBACK_EMOJIS if str(e).strip()]
 
+    normalized = list(_normalize_picker_emoji(values, limit=max_items))
     if max_items is not None:
-        values = values[:max_items]
-    return tuple(values)
+        normalized = normalized[:max_items]
+    return tuple(normalized)
 
 
 DEFAULT_EMOJIS: Sequence[str] = load_all_emojis()
