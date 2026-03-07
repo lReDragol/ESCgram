@@ -3,6 +3,7 @@
 from bisect import bisect_left
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
     QProgressBar,
+    QScrollArea,
     QToolButton,
     QSizePolicy,
 )
@@ -611,6 +613,51 @@ class RichTextLabel(QLabel):
         painter.end()
 
 
+def _reply_markup_signature(markup: Optional[Dict[str, Any]]) -> str:
+    try:
+        return json.dumps(markup or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return repr(markup)
+
+
+def _reply_markup_button_prefix(payload: Dict[str, Any]) -> str:
+    if payload.get("url") or payload.get("web_app_url") or payload.get("login_url"):
+        return "↗ "
+    if payload.get("switch_inline_query") is not None or payload.get("switch_inline_query_current_chat") is not None:
+        return "⌕ "
+    if payload.get("request_contact"):
+        return "☎ "
+    if payload.get("request_location"):
+        return "⌖ "
+    if payload.get("request_poll"):
+        return "◉ "
+    if payload.get("request_chat") or payload.get("request_users"):
+        return "👥 "
+    if payload.get("callback_data") is not None:
+        return "• "
+    return ""
+
+
+def _reply_markup_button_tooltip(payload: Dict[str, Any]) -> str:
+    if payload.get("url") or payload.get("web_app_url") or payload.get("login_url"):
+        return "Открыть ссылку"
+    if payload.get("switch_inline_query_current_chat") is not None:
+        return "Подставить inline-запрос в текущий чат"
+    if payload.get("switch_inline_query") is not None:
+        return "Переключить в inline-режим"
+    if payload.get("request_contact"):
+        return "Отправить контакт"
+    if payload.get("request_location"):
+        return "Отправить геопозицию"
+    if payload.get("request_poll"):
+        return "Запрос на отправку опроса"
+    if payload.get("request_chat") or payload.get("request_users"):
+        return "Запрос выбора чата или пользователей"
+    if payload.get("callback_data") is not None:
+        return "Вызвать действие бота"
+    return ""
+
+
 class MessageReplyMarkupWidget(QWidget):
     buttonActivated = Signal(dict)
 
@@ -618,9 +665,55 @@ class MessageReplyMarkupWidget(QWidget):
         super().__init__(parent)
         self._mode = str(mode or "inline").strip().lower()
         self._markup: Optional[Dict[str, Any]] = None
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
+        self._signature = ""
+        self._root = QVBoxLayout(self)
+        self._root.setContentsMargins(0, 0, 0, 0)
+        self._root.setSpacing(0)
+
+        self._frame: Optional[QFrame] = None
+        self._title_label: Optional[QLabel] = None
+        self._scroll: Optional[QScrollArea] = None
+
+        if self._mode == "reply":
+            frame = QFrame(self)
+            frame.setObjectName("botReplyKeyboard")
+            frame.setStyleSheet(
+                "QFrame#botReplyKeyboard{background-color:rgba(255,255,255,0.04);"
+                "border:1px solid rgba(255,255,255,0.06);border-radius:16px;}"
+            )
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(10, 8, 10, 10)
+            frame_layout.setSpacing(8)
+
+            title = QLabel("", frame)
+            title.setStyleSheet("color:#8fb4d9;font-size:11px;font-weight:700;letter-spacing:0.3px;")
+            title.hide()
+            frame_layout.addWidget(title, 0)
+
+            scroll = QScrollArea(frame)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setStyleSheet(
+                "QScrollArea{background:transparent;border:none;}"
+                "QScrollArea > QWidget > QWidget{background:transparent;}"
+            )
+            host = QWidget(scroll)
+            self._layout = QVBoxLayout(host)
+            self._layout.setContentsMargins(0, 0, 0, 0)
+            self._layout.setSpacing(8)
+            scroll.setWidget(host)
+            frame_layout.addWidget(scroll, 1)
+            self._root.addWidget(frame, 1)
+            self._frame = frame
+            self._title_label = title
+            self._scroll = scroll
+            self.setMaximumHeight(220)
+        else:
+            self._layout = QVBoxLayout()
+            self._layout.setContentsMargins(0, 0, 0, 0)
+            self._layout.setSpacing(6)
+            self._root.addLayout(self._layout, 1)
 
     def clear_buttons(self) -> None:
         while self._layout.count():
@@ -635,42 +728,83 @@ class MessageReplyMarkupWidget(QWidget):
                     child_widget = child_item.widget()
                     if child_widget is not None:
                         child_widget.deleteLater()
+        self._signature = ""
+        if self._title_label is not None:
+            self._title_label.clear()
+            self._title_label.hide()
+        if self._scroll is not None:
+            self._scroll.setMaximumHeight(0)
 
     def set_markup(self, markup: Optional[Dict[str, Any]]) -> None:
-        self._markup = dict(markup or {}) if isinstance(markup, dict) else None
+        normalized = dict(markup or {}) if isinstance(markup, dict) else None
+        signature = _reply_markup_signature(normalized)
+        if self._signature == signature and normalized == self._markup:
+            if normalized:
+                self.show()
+            else:
+                self.hide()
+            return
+        self._markup = normalized
         self.clear_buttons()
+        self._signature = signature if normalized else ""
         rows = list((self._markup or {}).get("rows") or [])
+        markup_type = str((self._markup or {}).get("type") or "").strip().lower()
         if not rows:
             self.hide()
             return
-        inline = str((self._markup or {}).get("type") or "").strip().lower() == "inline"
+        inline = markup_type == "inline"
+        placeholder = str((self._markup or {}).get("placeholder") or "").strip()
+        if self._title_label is not None:
+            header_text = placeholder or "Клавиатура бота"
+            self._title_label.setText(header_text.upper())
+            self._title_label.setVisible(bool(header_text))
         css = (
-            "QPushButton{background-color:rgba(89,183,255,0.16);border:1px solid rgba(89,183,255,0.30);"
-            "border-radius:12px;color:#dff1ff;padding:8px 12px;font-size:12px;font-weight:600;}"
+            "QPushButton{background-color:rgba(89,183,255,0.16);border:1px solid rgba(89,183,255,0.32);"
+            "border-radius:11px;color:#dff1ff;padding:7px 11px;font-size:12px;font-weight:600;text-align:center;}"
             "QPushButton:hover{background-color:rgba(89,183,255,0.24);}"
+            "QPushButton:pressed{background-color:rgba(89,183,255,0.30);}"
         ) if inline else (
-            "QPushButton{background-color:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);"
-            "border-radius:12px;color:#dfe7f5;padding:9px 12px;font-size:12px;font-weight:600;}"
-            "QPushButton:hover{background-color:rgba(255,255,255,0.11);}"
+            "QPushButton{background-color:rgba(255,255,255,0.055);border:1px solid rgba(255,255,255,0.08);"
+            "border-radius:13px;color:#dfe7f5;padding:10px 12px;font-size:12px;font-weight:600;text-align:left;}"
+            "QPushButton:hover{background-color:rgba(255,255,255,0.10);}"
+            "QPushButton:pressed{background-color:rgba(255,255,255,0.15);}"
         )
+        built_rows = 0
         for row in rows:
             row_buttons = list(row or [])
             if not row_buttons:
                 continue
+            built_rows += 1
             line = QHBoxLayout()
             line.setContentsMargins(0, 0, 0, 0)
-            line.setSpacing(6)
+            line.setSpacing(8 if not inline else 6)
             for button_data in row_buttons:
                 if not isinstance(button_data, dict):
                     continue
-                text = str(button_data.get("text") or "").strip() or "Кнопка"
+                raw_text = str(button_data.get("text") or "").strip() or "Кнопка"
+                text = f"{_reply_markup_button_prefix(button_data)}{raw_text}".strip()
                 btn = QPushButton(text, self)
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setStyleSheet(css)
+                btn.setAutoDefault(False)
+                btn.setDefault(False)
+                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                btn.setMinimumHeight(34 if inline else 38)
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                tooltip = _reply_markup_button_tooltip(button_data)
+                if tooltip:
+                    btn.setToolTip(tooltip)
+                elif len(raw_text) > 32:
+                    btn.setToolTip(raw_text)
                 payload = dict(button_data)
                 btn.clicked.connect(lambda _checked=False, p=payload: self.buttonActivated.emit(dict(p)))
                 line.addWidget(btn, 1)
             self._layout.addLayout(line)
+        if self._scroll is not None:
+            visible_rows = max(1, min(built_rows, 4))
+            base_height = 10 + (30 if self._title_label is not None and self._title_label.isVisible() else 0)
+            self._scroll.setMaximumHeight((visible_rows * 46) + 6)
+            self.setMaximumHeight(base_height + self._scroll.maximumHeight() + 20)
         self.show()
 
 

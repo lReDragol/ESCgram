@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QRegion
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal, Slot, QRectF
+from PySide6.QtGui import QColor, QPainter, QRegion
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QToolButton,
     QVBoxLayout,
@@ -54,6 +56,80 @@ def _media_volume_ratio(default: float = 1.0) -> float:
         return max(0.0, min(1.0, float(default)))
 
 
+def _fmt_size(path: str) -> str:
+    try:
+        size = int(os.path.getsize(path))
+    except Exception:
+        return ""
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    unit = units[0]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{int(value)} {unit}"
+    return f"{value:.1f} {unit}"
+
+
+class _VoicePreviewWaveform(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._bars = [0.45 for _ in range(52)]
+        self._progress = 0.0
+        self._active = False
+        self.setMinimumHeight(28)
+        self.setMaximumHeight(28)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_seed(self, seed: str) -> None:
+        raw = hashlib.sha256(str(seed or "").encode("utf-8", "ignore")).digest()
+        bars = []
+        for idx in range(52):
+            val = raw[idx % len(raw)] / 255.0
+            bars.append(0.22 + (val * 0.78))
+        self._bars = bars
+        self.update()
+
+    def set_progress(self, position_ms: int, duration_ms: int) -> None:
+        total = max(0, int(duration_ms or 0))
+        current = max(0, min(int(position_ms or 0), total)) if total else 0
+        self._progress = (float(current) / float(total)) if total > 0 else 0.0
+        self.update()
+
+    def set_active(self, active: bool) -> None:
+        active_bool = bool(active)
+        if self._active == active_bool:
+            return
+        self._active = active_bool
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        rect = self.rect().adjusted(0, 2, 0, -2)
+        if rect.width() <= 8 or rect.height() <= 4:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        bars_count = min(len(self._bars), max(12, rect.width() // 5))
+        step = rect.width() / max(1, bars_count)
+        played = int(round(self._progress * bars_count))
+        accent = QColor(111, 201, 255, 230 if self._active else 205)
+        idle = QColor(116, 142, 171, 105)
+        for idx in range(bars_count):
+            value = self._bars[idx % len(self._bars)]
+            width = max(2.0, step - 2.0)
+            height = max(4.0, rect.height() * value)
+            x = rect.left() + (idx * step) + ((step - width) / 2.0)
+            y = rect.center().y() - (height / 2.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent if idx < played else idle)
+            radius = min(1.8, width / 2.0)
+            painter.drawRoundedRect(QRectF(x, y, width, height), radius, radius)
+        painter.end()
+
+
 class InlineMediaPreviewBar(QFrame):
     """Inline media preview shown inside chat (no separate dialog)."""
 
@@ -72,6 +148,7 @@ class InlineMediaPreviewBar(QFrame):
         self._player: Optional[QMediaPlayer] = None
         self._audio: Optional[QAudioOutput] = None
         self._video_widget: Optional[QVideoWidget] = None
+        self._voice_wave: Optional[_VoicePreviewWaveform] = None
 
         self._slider_dragging = False
         self._source_pending = False
@@ -85,21 +162,45 @@ class InlineMediaPreviewBar(QFrame):
         StyleManager.instance().bind_stylesheet(self._hdr, "main.media_preview_header")
         layout.addWidget(self._hdr)
 
+        self._meta = QLabel("", self)
+        self._meta.setWordWrap(True)
+        self._meta.setStyleSheet("color:#8ea8c2;font-size:11px;")
+        layout.addWidget(self._meta)
+
         self._media_container = QVBoxLayout()
         self._media_container.setContentsMargins(0, 0, 0, 0)
         self._media_container.setSpacing(6)
         layout.addLayout(self._media_container)
 
-        controls = QHBoxLayout()
+        controls_frame = QFrame(self)
+        controls_frame.setObjectName("previewControls")
+        controls_frame.setStyleSheet(
+            "QFrame#previewControls{background-color:rgba(255,255,255,0.03);"
+            "border:1px solid rgba(255,255,255,0.05);border-radius:14px;}"
+        )
+        controls = QHBoxLayout(controls_frame)
+        controls.setContentsMargins(10, 8, 10, 8)
         controls.setSpacing(8)
 
         self.btn_play = QToolButton(self)
+        self.btn_play.setObjectName("previewPlayButton")
         self.btn_play.setText("▶")
-        self.btn_play.setFixedWidth(40)
+        self.btn_play.setFixedSize(44, 44)
+        self.btn_play.setStyleSheet(
+            "QToolButton{background-color:rgba(89,183,255,0.18);border:1px solid rgba(89,183,255,0.28);"
+            "border-radius:22px;color:#e9f7ff;font-size:18px;font-weight:700;}"
+            "QToolButton:hover{background-color:rgba(89,183,255,0.28);}"
+        )
         self.btn_play.clicked.connect(self._toggle_play)
 
         self.slider = QSlider(Qt.Orientation.Horizontal, self)
         self.slider.setRange(0, 0)
+        self.slider.setStyleSheet(
+            "QSlider::groove:horizontal{background-color:rgba(255,255,255,0.08);height:4px;border-radius:2px;}"
+            "QSlider::sub-page:horizontal{background-color:rgba(89,183,255,0.78);border-radius:2px;}"
+            "QSlider::handle:horizontal{background-color:#dff3ff;border:1px solid rgba(89,183,255,0.65);"
+            "width:14px;height:14px;margin:-6px 0;border-radius:7px;}"
+        )
         self.slider.sliderPressed.connect(self._on_slider_pressed)
         self.slider.sliderReleased.connect(self._on_slider_released)
 
@@ -111,15 +212,27 @@ class InlineMediaPreviewBar(QFrame):
         controls.addWidget(self.btn_play)
         controls.addWidget(self.slider, 1)
         controls.addWidget(self.lbl_time)
-        layout.addLayout(controls)
+        layout.addWidget(controls_frame)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
 
         self.btn_cancel = QPushButton("Отмена", self)
+        self.btn_cancel.setObjectName("previewCancelButton")
+        self.btn_cancel.setStyleSheet(
+            "QPushButton{background-color:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);"
+            "border-radius:12px;color:#d7e4f3;padding:8px 14px;font-weight:600;}"
+            "QPushButton:hover{background-color:rgba(255,255,255,0.10);}"
+        )
         self.btn_cancel.clicked.connect(self.cancelRequested.emit)
 
         self.btn_send = QPushButton("Отправить", self)
+        self.btn_send.setObjectName("previewSendButton")
+        self.btn_send.setStyleSheet(
+            "QPushButton{background-color:rgba(89,183,255,0.22);border:1px solid rgba(89,183,255,0.32);"
+            "border-radius:12px;color:#e7f5ff;padding:8px 14px;font-weight:700;}"
+            "QPushButton:hover{background-color:rgba(89,183,255,0.30);}"
+        )
         self.btn_send.clicked.connect(self.sendRequested.emit)
 
         actions.addWidget(self.btn_cancel)
@@ -130,6 +243,7 @@ class InlineMediaPreviewBar(QFrame):
         self._status_label.setWordWrap(True)
         StyleManager.instance().bind_stylesheet(self._status_label, "main.media_preview_status")
         layout.addWidget(self._status_label)
+        self._status_label.hide()
 
         self.setVisible(False)
 
@@ -138,13 +252,15 @@ class InlineMediaPreviewBar(QFrame):
         self.file_path = str(file_path or "")
 
         name = os.path.basename(source_name) if source_name else os.path.basename(self.file_path)
+        size_text = _fmt_size(self.file_path)
         if self._kind == "voice":
-            self._hdr.setText(f"Проверьте голосовое перед отправкой: {name}")
+            self._hdr.setText("Голосовое сообщение")
         else:
-            self._hdr.setText(f"Проверьте видео-кружок перед отправкой: {name}")
+            self._hdr.setText("Видео-кружок")
+        self._meta.setText(" • ".join([part for part in (name, size_text, "Локальный предпросмотр перед отправкой") if part]))
 
         self._reset_media_container()
-        self._status_label.clear()
+        self._set_status_text("")
         self.btn_send.setEnabled(True)
         try:
             self.slider.setValue(0)
@@ -152,13 +268,13 @@ class InlineMediaPreviewBar(QFrame):
             pass
 
         if not os.path.isfile(self.file_path):
-            self._status_label.setText("Файл предпросмотра не найден.")
+            self._set_status_text("Файл предпросмотра не найден.")
             self.btn_play.setEnabled(False)
             self.slider.setEnabled(False)
             self.btn_send.setEnabled(False)
             return
         if not HAVE_QTMULTIMEDIA:
-            self._status_label.setText("QtMultimedia недоступен: воспроизведение выключено.")
+            self._set_status_text("QtMultimedia недоступен: воспроизведение выключено.")
             self.btn_play.setEnabled(False)
             self.slider.setEnabled(False)
             return
@@ -168,7 +284,7 @@ class InlineMediaPreviewBar(QFrame):
 
         player = self._ensure_player()
         if not player:
-            self._status_label.setText("Не удалось инициализировать плеер.")
+            self._set_status_text("Не удалось инициализировать плеер.")
             self.btn_play.setEnabled(False)
             self.slider.setEnabled(False)
             self.btn_send.setEnabled(False)
@@ -187,13 +303,21 @@ class InlineMediaPreviewBar(QFrame):
                     self._video_widget.setStyleSheet("background:#111;")
                 except Exception:
                     pass
-                wrap = QHBoxLayout()
+                shell = QFrame(self)
+                shell.setStyleSheet(
+                    "QFrame{background-color:rgba(255,255,255,0.035);border:1px solid rgba(255,255,255,0.06);border-radius:24px;}"
+                )
+                wrap = QHBoxLayout(shell)
+                wrap.setContentsMargins(14, 14, 14, 14)
                 wrap.addStretch(1)
                 wrap.addWidget(self._video_widget)
                 wrap.addStretch(1)
-                holder = QWidget(self)
-                holder.setLayout(wrap)
-                self._media_container.addWidget(holder)
+                badge = QLabel("VIDEO NOTE", shell)
+                badge.setStyleSheet(
+                    "background-color:rgba(89,183,255,0.18);color:#dff3ff;border-radius:10px;padding:4px 8px;font-size:10px;font-weight:700;"
+                )
+                wrap.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+                self._media_container.addWidget(shell)
             try:
                 player.setVideoOutput(self._video_widget)
             except Exception:
@@ -216,13 +340,17 @@ class InlineMediaPreviewBar(QFrame):
             card_layout.addWidget(icon, 0)
             text_col = QVBoxLayout()
             text_col.setContentsMargins(0, 0, 0, 0)
-            text_col.setSpacing(2)
-            title_lbl = QLabel("Голосовое сообщение", card)
+            text_col.setSpacing(4)
+            title_lbl = QLabel(name or "Голосовое сообщение", card)
             title_lbl.setStyleSheet("color:#eef7ff;font-size:13px;font-weight:700;")
-            subtitle_lbl = QLabel("Проверьте аудио перед отправкой", card)
+            subtitle_lbl = QLabel("Проверьте звучание и длительность перед отправкой", card)
             subtitle_lbl.setStyleSheet("color:#8da8c4;font-size:11px;")
+            wave = _VoicePreviewWaveform(card)
+            wave.set_seed(name or self.file_path)
+            self._voice_wave = wave
             text_col.addWidget(title_lbl)
             text_col.addWidget(subtitle_lbl)
+            text_col.addWidget(wave)
             card_layout.addLayout(text_col, 1)
             self._media_container.addWidget(card)
             try:
@@ -231,7 +359,7 @@ class InlineMediaPreviewBar(QFrame):
                 pass
 
         self._source_pending = True
-        self._status_label.setText("Подготовка предпросмотра…")
+        self._set_status_text("Подготовка предпросмотра…")
         QTimer.singleShot(0, self._load_source_if_needed)
 
     def stop(self) -> None:
@@ -245,6 +373,7 @@ class InlineMediaPreviewBar(QFrame):
                 w.setParent(None)
                 w.deleteLater()
         self._video_widget = None
+        self._voice_wave = None
 
     def _ensure_player(self) -> Optional[QMediaPlayer]:
         if not HAVE_QTMULTIMEDIA:
@@ -272,9 +401,9 @@ class InlineMediaPreviewBar(QFrame):
         self._source_pending = False
         try:
             player.setSource(QUrl.fromLocalFile(self.file_path))
-            self._status_label.clear()
+            self._set_status_text("")
         except Exception:
-            self._status_label.setText("Не удалось открыть файл предпросмотра.")
+            self._set_status_text("Не удалось открыть файл предпросмотра.")
             self.btn_play.setEnabled(False)
             self.slider.setEnabled(False)
             self.btn_send.setEnabled(False)
@@ -318,6 +447,8 @@ class InlineMediaPreviewBar(QFrame):
     def _on_duration_changed(self, duration: int) -> None:
         duration = max(0, int(duration or 0))
         self.slider.setRange(0, duration)
+        if self._voice_wave is not None:
+            self._voice_wave.set_progress(self.slider.value(), duration)
         self._update_time_label(self.slider.value(), duration)
 
     @Slot(int)
@@ -328,6 +459,8 @@ class InlineMediaPreviewBar(QFrame):
             self.slider.blockSignals(True)
             self.slider.setValue(max(0, int(position or 0)))
             self.slider.blockSignals(False)
+        if self._voice_wave is not None:
+            self._voice_wave.set_progress(position, duration)
         self._update_time_label(position, duration)
 
     @Slot(object)
@@ -337,6 +470,8 @@ class InlineMediaPreviewBar(QFrame):
             return
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.btn_play.setText("⏸" if playing else "▶")
+        if self._voice_wave is not None:
+            self._voice_wave.set_active(playing)
 
     def _update_time_label(self, pos_ms: int, dur_ms: int) -> None:
         self.lbl_time.setText(f"{_fmt_time(pos_ms)} / {_fmt_time(dur_ms)}")
@@ -349,7 +484,7 @@ class InlineMediaPreviewBar(QFrame):
             pass
         msg = str(error_str or "").strip() or "Ошибка воспроизведения"
         try:
-            self._status_label.setText(msg)
+            self._set_status_text(msg)
         except Exception:
             pass
 
@@ -358,9 +493,14 @@ class InlineMediaPreviewBar(QFrame):
         # Provide a small hint if the backend cannot load the file.
         try:
             if HAVE_QTMULTIMEDIA and status == QMediaPlayer.MediaStatus.InvalidMedia:
-                self._status_label.setText("Файл не поддерживается (InvalidMedia).")
+                self._set_status_text("Файл не поддерживается (InvalidMedia).")
         except Exception:
             pass
+
+    def _set_status_text(self, text: str) -> None:
+        message = str(text or "").strip()
+        self._status_label.setText(message)
+        self._status_label.setVisible(bool(message))
 
     def _stop_player(self) -> None:
         player = self._player

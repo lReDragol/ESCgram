@@ -1206,12 +1206,30 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         chat_id = str(self.current_chat_id or "")
         markup = self._bot_reply_markup_by_chat.get(chat_id) if chat_id else None
-        if isinstance(markup, dict) and str(markup.get("type") or "").strip().lower() == "reply":
+        default_placeholder = str(getattr(self, "_default_input_placeholder", "Сообщение...") or "Сообщение...")
+        placeholder = default_placeholder
+        markup_type = str(markup.get("type") or "").strip().lower() if isinstance(markup, dict) else ""
+        custom_placeholder = str(markup.get("placeholder") or "").strip() if isinstance(markup, dict) else ""
+        if markup_type == "reply":
             bar.set_markup(markup)
             bar.show()
-            return
-        bar.clear_buttons()
-        bar.hide()
+            placeholder = custom_placeholder or "Сообщение боту..."
+        else:
+            bar.clear_buttons()
+            bar.hide()
+            if markup_type == "force_reply":
+                placeholder = custom_placeholder or "Бот ожидает ваш ответ..."
+        try:
+            self.user_input.setPlaceholderText(placeholder)
+        except Exception:
+            pass
+
+    def _consume_one_time_keyboard(self, chat_id: str) -> None:
+        markup = self._bot_reply_markup_by_chat.get(chat_id)
+        if isinstance(markup, dict) and bool(markup.get("one_time_keyboard")):
+            self._bot_reply_markup_by_chat[chat_id] = None
+            if chat_id == str(self.current_chat_id or ""):
+                self._update_bot_keyboard_bar()
 
     def _show_inline_media_preview(
         self,
@@ -1325,6 +1343,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input.setStyleSheet(
             "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
         )
+        self._default_input_placeholder = "Сообщение..."
+        self.user_input.setPlaceholderText(self._default_input_placeholder)
         self.user_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.user_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
@@ -1649,7 +1669,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     @Slot(dict)
     def _handle_reply_markup_action(self, payload: Dict[str, Any]) -> None:
         action = dict(payload or {})
-        url = str(action.get("url") or action.get("web_app_url") or "").strip()
+        url = str(action.get("url") or action.get("web_app_url") or action.get("login_url") or "").strip()
         if url:
             try:
                 QDesktopServices.openUrl(QUrl(url))
@@ -1666,6 +1686,65 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         chat_id = str(action.get("chat_id") or self.current_chat_id or "").strip()
         if not chat_id:
+            return
+        if bool(action.get("request_contact")):
+            profile_getter = getattr(self.tg, "get_self_profile_sync", None)
+            sender = getattr(self.tg, "send_contact_sync", None)
+            if not callable(profile_getter) or not callable(sender):
+                self._toast("Отправка контакта недоступна")
+                return
+            profile = dict(profile_getter() or {})
+            phone = str(profile.get("phone") or "").strip()
+            first_name = str(profile.get("first_name") or profile.get("username") or "Контакт").strip()
+            last_name = str(profile.get("last_name") or "").strip()
+            if not phone:
+                QMessageBox.warning(self, "Контакт", "В текущем аккаунте Telegram нет номера телефона.")
+                return
+            ok = bool(
+                sender(
+                    chat_id=chat_id,
+                    phone_number=phone,
+                    first_name=first_name,
+                    last_name=last_name or None,
+                )
+            )
+            if ok:
+                self._consume_one_time_keyboard(chat_id)
+                self._toast("Контакт отправлен")
+            else:
+                self._toast("Не удалось отправить контакт")
+            return
+        if bool(action.get("request_location")):
+            sender = getattr(self.tg, "send_location_sync", None)
+            if not callable(sender):
+                self._toast("Отправка геопозиции недоступна")
+                return
+            coords_text, ok = QInputDialog.getText(
+                self,
+                "Геопозиция",
+                "Введите широту и долготу через запятую.\nПример: 55.751244, 37.618423",
+            )
+            if not ok:
+                return
+            parts = [part.strip() for part in str(coords_text or "").split(",")]
+            if len(parts) != 2:
+                QMessageBox.warning(self, "Геопозиция", "Нужно указать две координаты: широту и долготу.")
+                return
+            try:
+                latitude = float(parts[0])
+                longitude = float(parts[1])
+            except Exception:
+                QMessageBox.warning(self, "Геопозиция", "Координаты должны быть числами.")
+                return
+            ok_send = bool(sender(chat_id=chat_id, latitude=latitude, longitude=longitude))
+            if ok_send:
+                self._consume_one_time_keyboard(chat_id)
+                self._toast("Геопозиция отправлена")
+            else:
+                self._toast("Не удалось отправить геопозицию")
+            return
+        if action.get("request_poll") or action.get("request_users") or action.get("request_chat"):
+            self._toast("Этот тип bot-кнопки пока не реализован полностью")
             return
         if "callback_data" in action:
             result = self.server.press_inline_button(
@@ -1686,11 +1765,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         text = str(action.get("text") or "").strip()
         if text:
             self.server.gui_send_message(chat_id=chat_id, user_id="me", text=text)
-            markup = self._bot_reply_markup_by_chat.get(chat_id)
-            if isinstance(markup, dict) and bool(markup.get("one_time_keyboard")):
-                self._bot_reply_markup_by_chat[chat_id] = None
-                if chat_id == str(self.current_chat_id or ""):
-                    self._update_bot_keyboard_bar()
+            self._consume_one_time_keyboard(chat_id)
 
     def _on_media_widget_activate(self, payload: Dict[str, Any]) -> bool:
         kind = str(payload.get("kind") or "").strip().lower()

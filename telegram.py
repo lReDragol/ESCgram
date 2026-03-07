@@ -2390,6 +2390,12 @@ class TelegramAdapter:
                 url = getattr(button, "url", None)
                 if url:
                     payload["url"] = str(url)
+                login_url = getattr(button, "login_url", None)
+                if login_url is not None:
+                    login_url_value = getattr(login_url, "url", None)
+                    if login_url_value:
+                        payload["login_url"] = str(login_url_value)
+                        payload.setdefault("url", str(login_url_value))
                 callback_data = getattr(button, "callback_data", None)
                 if callback_data is not None:
                     if isinstance(callback_data, bytes):
@@ -2407,6 +2413,37 @@ class TelegramAdapter:
                     value = getattr(button, attr, None)
                     if value is not None:
                         payload[attr] = bool(value)
+                request_poll = getattr(button, "request_poll", None)
+                if request_poll is not None:
+                    quiz = getattr(request_poll, "quiz", None)
+                    payload["request_poll"] = {"quiz": bool(quiz)} if quiz is not None else True
+                request_chat = getattr(button, "request_chat", None)
+                if request_chat is not None:
+                    try:
+                        payload["request_chat"] = {
+                            "request_id": int(getattr(request_chat, "request_id", 0) or 0),
+                            "chat_is_channel": bool(getattr(request_chat, "chat_is_channel", False)),
+                            "chat_is_forum": bool(getattr(request_chat, "chat_is_forum", False)),
+                            "chat_has_username": bool(getattr(request_chat, "chat_has_username", False)),
+                            "chat_is_created": bool(getattr(request_chat, "chat_is_created", False)),
+                        }
+                    except Exception:
+                        payload["request_chat"] = True
+                request_users = getattr(button, "request_users", None)
+                if request_users is not None:
+                    try:
+                        payload["request_users"] = {
+                            "request_id": int(getattr(request_users, "request_id", 0) or 0),
+                            "max_quantity": int(getattr(request_users, "max_quantity", 0) or 0),
+                            "user_is_bot": getattr(request_users, "user_is_bot", None),
+                            "user_is_premium": getattr(request_users, "user_is_premium", None),
+                        }
+                    except Exception:
+                        payload["request_users"] = True
+                if getattr(button, "callback_game", None) is not None:
+                    payload["callback_game"] = True
+                if getattr(button, "pay", None) is not None:
+                    payload["pay"] = bool(getattr(button, "pay", False))
                 web_app = getattr(button, "web_app", None)
                 if web_app is not None:
                     web_app_url = getattr(web_app, "url", None)
@@ -2870,6 +2907,77 @@ class TelegramAdapter:
                 return False
 
         return bool(self._call(_react(), timeout))
+
+    def send_contact_sync(
+        self,
+        *,
+        chat_id: str,
+        phone_number: str,
+        first_name: str,
+        last_name: str | None = None,
+        reply_to: int | None = None,
+        timeout: float = 30.0,
+    ) -> bool:
+        if not (self._enabled and self._client and self._loop):
+            return False
+        phone = str(phone_number or "").strip()
+        first = str(first_name or "").strip()
+        if not phone or not first:
+            return False
+
+        async def _send() -> bool:
+            try:
+                await self._ensure_me_cached()
+                kwargs: Dict[str, Any] = {
+                    "chat_id": int(chat_id),
+                    "phone_number": phone,
+                    "first_name": first,
+                }
+                if last_name:
+                    kwargs["last_name"] = str(last_name)
+                if reply_to is not None:
+                    kwargs["reply_to_message_id"] = int(reply_to)
+                msg_obj = await self._client.send_contact(**kwargs)
+                if msg_obj is not None:
+                    self._remember_local_outgoing(getattr(msg_obj, "id", None))
+                return True
+            except Exception as exc:
+                log.exception("send_contact failed: %s", exc)
+                return False
+
+        return bool(self._call(_send(), timeout))
+
+    def send_location_sync(
+        self,
+        *,
+        chat_id: str,
+        latitude: float,
+        longitude: float,
+        reply_to: int | None = None,
+        timeout: float = 30.0,
+    ) -> bool:
+        if not (self._enabled and self._client and self._loop):
+            return False
+
+        async def _send() -> bool:
+            try:
+                await self._ensure_me_cached()
+                kwargs: Dict[str, Any] = {
+                    "chat_id": int(chat_id),
+                    "latitude": float(latitude),
+                    "longitude": float(longitude),
+                }
+                if reply_to is not None:
+                    kwargs["reply_to_message_id"] = int(reply_to)
+                msg_obj = await self._client.send_location(**kwargs)
+                if msg_obj is not None:
+                    self._remember_local_outgoing(getattr(msg_obj, "id", None))
+                return True
+            except Exception as exc:
+                log.exception("send_location failed: %s", exc)
+                return False
+
+        return bool(self._call(_send(), timeout))
 
     def mark_chat_read_sync(self, chat_id: str, timeout: float = 15.0) -> bool:
         if not (self._enabled and self._client and self._loop):
