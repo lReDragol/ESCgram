@@ -3887,6 +3887,99 @@ class TelegramAdapter:
                 return []
             raise
 
+    def scan_history_to_storage_sync(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 0,
+        chunk_size: int = 200,
+        timeout: float = 600.0,
+    ) -> int:
+        if not (self._enabled and self._client and self._loop and self._storage):
+            return 0
+        if self._auth_invalid or not self._connected:
+            return 0
+
+        media_root = pathlib.Path(self._media_root) / str(chat_id)
+        media_root.mkdir(parents=True, exist_ok=True)
+
+        async def _scan() -> int:
+            peer_id = int(chat_id)
+            total = 0
+            newest_id: Optional[int] = None
+            newest_date: Optional[int] = None
+            message_batch: List[Dict[str, Any]] = []
+            peer_rows: Dict[int, Dict[str, Any]] = {}
+
+            def _flush() -> None:
+                if peer_rows:
+                    self._storage.upsert_peers(list(peer_rows.values()))
+                    peer_rows.clear()
+                if message_batch:
+                    self._storage.upsert_messages(peer_id, list(message_batch))
+                    message_batch.clear()
+
+            async for m in self._client.get_chat_history(int(chat_id), limit=int(limit or 0)):
+                if newest_id is None:
+                    try:
+                        newest_id = int(getattr(m, "id"))
+                    except Exception:
+                        newest_id = None
+                    try:
+                        newest_date = int(m.date.timestamp()) if getattr(m, "date", None) else None
+                    except Exception:
+                        newest_date = None
+
+                try:
+                    chat_row = self._chat_to_peer_row(getattr(m, "chat", None))
+                    if chat_row and chat_row.get("id") is not None:
+                        peer_rows[int(chat_row["id"])] = chat_row
+                except Exception:
+                    pass
+                for candidate in (
+                    self._user_to_peer_row(getattr(m, "from_user", None)),
+                    self._chat_to_peer_row(getattr(m, "sender_chat", None)),
+                ):
+                    try:
+                        if candidate and candidate.get("id") is not None:
+                            peer_rows[int(candidate["id"])] = candidate
+                    except Exception:
+                        continue
+
+                cached_path = self._find_cached_media_file(media_root, getattr(m, "id", 0))
+                record = self._message_to_storage_dict(peer_id, m, file_path=cached_path)
+                if record:
+                    message_batch.append(record)
+                    total += 1
+                if len(message_batch) >= max(20, int(chunk_size or 200)):
+                    _flush()
+
+            _flush()
+            if newest_id is not None or newest_date is not None:
+                self._storage.update_dialog_last_ts(peer_id, newest_date, top_message_id=newest_id)
+            return total
+
+        try:
+            result = self._call(_scan(), timeout)
+            return int(result or 0)
+        except TimeoutError:
+            self._throttled_warning(
+                "_last_history_timeout_at",
+                8.0,
+                "[TG] scan_history timeout chat=%s limit=%s timeout=%.1f",
+                chat_id,
+                limit,
+                float(timeout),
+            )
+            return 0
+        except Exception as exc:
+            if self._is_auth_issue(exc):
+                self._notify_auth_issue(exc)
+                return 0
+            if "closed database" in str(exc).lower():
+                return 0
+            raise
+
     def download_media_sync(self, chat_id: str, message_id: int, timeout: float = 180.0) -> Optional[str]:
         if not (self._enabled and self._client and self._loop):
             return None

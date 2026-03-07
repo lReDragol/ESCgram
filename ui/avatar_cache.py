@@ -41,6 +41,7 @@ class AvatarCache:
         self._size = max(16, size)
         self._cache: Dict[str, QPixmap] = {}
         self._paths: Dict[str, Optional[str]] = {}
+        self._entity_paths: Dict[str, str] = {}
         self._failed_at: Dict[str, float] = {}
         self._pending: Dict[str, _AvatarMeta] = {}
         self._on_ready = on_ready
@@ -73,7 +74,8 @@ class AvatarCache:
         title = str(info.get("title") or chat_id)
         photo_small = info.get("photo_small_id") or info.get("photo_small")
         cache_key = f"chat:{chat_id}:{photo_small or 'none'}"
-        path = self._paths.get(cache_key)
+        entity_key = f"chat:{chat_id}"
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
         background = self._color(f"chat:{chat_id}")
         initials = self._initials(title)
 
@@ -109,9 +111,10 @@ class AvatarCache:
     def user(self, user_id: str, header: str) -> QPixmap:
         normalized_id = user_id or "unknown"
         cache_key = f"user:{normalized_id}"
+        entity_key = f"user:{normalized_id}"
         background = self._color(cache_key)
         initials = self._initials(header)
-        path = self._paths.get(cache_key)
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
 
         if path:
             pix = self._cache.get(cache_key)
@@ -195,6 +198,7 @@ class AvatarCache:
         normalized = path or ""
         self._paths[cache_key] = normalized
         if normalized:
+            self._entity_paths[f"{kind}:{entity_id}"] = normalized
             self._failed_at.pop(cache_key, None)
         else:
             self._failed_at[cache_key] = time.time()

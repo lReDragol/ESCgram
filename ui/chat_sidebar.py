@@ -1011,6 +1011,7 @@ class ChatSidebarMixin:
 
         data_signature = ("override", mode, tuple(signature_rows))
         if data_signature == getattr(self, "_chat_list_data_signature", None):
+            self._refresh_visible_chat_avatars()
             if current_id:
                 item = self._chat_items_by_id.get(current_id)
                 if item:
@@ -1056,6 +1057,7 @@ class ChatSidebarMixin:
         self._chat_list_data_signature = data_signature
         self._chat_items_by_id = chat_items_by_id
         self._chat_row_widgets_by_id = chat_rows_by_id
+        self._refresh_visible_chat_avatars()
 
     def _history_has_ai_messages(self, chat_id: str) -> bool:
         cache = getattr(self, "_history_ai_cache", None)

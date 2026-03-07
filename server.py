@@ -119,17 +119,38 @@ class ServerCore:
         return self._tg_auth_cached
 
     def list_all_telegram_chats(self, limit: Optional[int] = 400, timeout: float = 20.0) -> List[Dict[str, Any]]:
-        if not self._tg_adapter:
-            return []
-        dialogs = self._tg_adapter.list_all_chats_sync(limit=limit, timeout=timeout)
+        dialogs: List[Dict[str, Any]] = []
+        if self._tg_adapter:
+            try:
+                dialogs = list(self._tg_adapter.list_all_chats_sync(limit=limit, timeout=timeout) or [])
+            except Exception:
+                dialogs = []
+        cached: List[Dict[str, Any]] = []
         if self._storage:
             try:
                 cached = self._storage.get_dialogs_for_ui(limit=limit or 400)
-                if cached:
-                    return cached
             except Exception:
                 log.exception("[SERVER] Failed to load dialogs from storage")
-        return dialogs
+                cached = []
+        if dialogs:
+            merged: Dict[str, Dict[str, Any]] = {}
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                cid = str(row.get("id") or "").strip()
+                if cid:
+                    merged[cid] = dict(row)
+            for row in dialogs:
+                if not isinstance(row, dict):
+                    continue
+                cid = str(row.get("id") or "").strip()
+                if not cid:
+                    continue
+                prev = dict(merged.get(cid, {}))
+                prev.update({k: v for k, v in row.items() if v not in (None, "")})
+                merged[cid] = prev
+            return list(merged.values())
+        return cached
 
     def list_cached_dialogs(self, limit: int = 400) -> List[Dict[str, Any]]:
         if not self._storage:
@@ -509,6 +530,18 @@ class ServerCore:
             return {}
         try:
             peer_id = int(chat_id)
+            if limit <= 0 and self._tg_adapter and self._is_tg_authorized():
+                try:
+                    syncer = getattr(self._tg_adapter, "scan_history_to_storage_sync", None)
+                    if callable(syncer):
+                        syncer(
+                            chat_id=chat_id,
+                            limit=0,
+                            chunk_size=200,
+                            timeout=float(os.getenv("DRAGO_HISTORY_SCAN_TIMEOUT", "600") or 600.0),
+                        )
+                except Exception:
+                    log.exception("[SERVER] Failed to sync full history before statistics scan for %s", chat_id)
             stats = self._storage.get_chat_statistics(peer_id, limit=limit)
             scanned_at = self._storage.save_chat_statistics_snapshot(peer_id, stats)
             stats["scanned_at"] = int(scanned_at)

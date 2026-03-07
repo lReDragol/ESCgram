@@ -593,7 +593,8 @@ class MessageFeedMixin:
             except Exception:
                 pass
 
-        should_scroll = True
+        lock_mode = str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower()
+        should_scroll = not bool(getattr(self, "_loading_history", False)) and lock_mode != "top"
         hook = getattr(self, "_after_media_widget_added", None)
         if callable(hook):
             try:
@@ -702,7 +703,8 @@ class MessageFeedMixin:
                 host(widget, msg_id, chat_id or self.current_chat_id)
             except Exception:
                 pass
-        should_scroll = True
+        lock_mode = str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower()
+        should_scroll = not bool(getattr(self, "_loading_history", False)) and lock_mode != "top"
         hook = getattr(self, "_after_media_widget_added", None)
         if callable(hook):
             try:
@@ -740,11 +742,14 @@ class MessageFeedMixin:
             bar = self.chat_scroll.verticalScrollBar()
             lock_mode = str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower()
             lock_until = float(getattr(self, "_feed_autostick_block_until", 0.0) or 0.0)
-            if lock_mode == "top" and time.monotonic() < lock_until:
-                bar.setValue(bar.minimum())
-                self._update_jump_button_visibility()
-                self._position_jump_button()
-                return
+            if lock_mode == "top":
+                if bar.value() <= (bar.minimum() + 2):
+                    bar.setValue(bar.minimum())
+                    self._update_jump_button_visibility()
+                    self._position_jump_button()
+                    return
+                setattr(self, "_feed_scroll_lock_mode", "")
+                setattr(self, "_feed_autostick_block_until", 0.0)
             if time.monotonic() < lock_until:
                 self._update_jump_button_visibility()
                 self._position_jump_button()
@@ -760,6 +765,15 @@ class MessageFeedMixin:
             pass
 
     def _on_scroll_value_changed(self, _value: int) -> None:
+        try:
+            lock_mode = str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower()
+            if lock_mode == "top":
+                bar = self.chat_scroll.verticalScrollBar()
+                if int(_value) > (bar.minimum() + 2):
+                    setattr(self, "_feed_scroll_lock_mode", "")
+                    setattr(self, "_feed_autostick_block_until", 0.0)
+        except Exception:
+            pass
         if self._is_feed_near_bottom():
             self._clear_jump_indicator()
         self._update_jump_button_visibility()

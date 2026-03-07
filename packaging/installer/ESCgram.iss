@@ -1,5 +1,5 @@
 #define AppName "ESCgram"
-#define AppVersion "0.2.7"
+#define AppVersion "0.2.8"
 #define AppPublisher "Drago"
 #define AppExeName "ESCgram.exe"
 

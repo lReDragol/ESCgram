@@ -11,10 +11,14 @@ import atexit
 import faulthandler
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 _CONFIGURED = False
 _HOOKS_INSTALLED = False
+_CURRENT_LOG_DIR: Optional[Path] = None
+_CURRENT_LOG_FILE: Optional[Path] = None
+_FAULT_HANDLER_STREAM = None
+_QT_MESSAGE_HANDLER_INSTALLED = False
 
 DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -78,6 +82,7 @@ def configure_logging(level: Optional[str] = None, *, log_directory: Optional[st
     if target_dir is None and os.getenv("DRAGO_ENABLE_FILE_LOGS", "1") not in {"0", "false", "False"}:
         target_dir = _resolve_log_dir("logs")
 
+    filename: Optional[Path] = None
     if target_dir:
         filename = Path(log_file) if log_file else target_dir / "log.log"
         handlers["file"] = {
@@ -119,6 +124,11 @@ def configure_logging(level: Optional[str] = None, *, log_directory: Optional[st
     atexit.register(logging.shutdown)
 
     _install_exception_hooks(target_dir)
+    _install_qt_message_handler()
+
+    global _CURRENT_LOG_DIR, _CURRENT_LOG_FILE
+    _CURRENT_LOG_DIR = target_dir
+    _CURRENT_LOG_FILE = filename
 
     try:
         logging.getLogger("logging").info("Logging to %s", str(filename) if target_dir else "console-only")
@@ -164,9 +174,82 @@ def _install_exception_hooks(target_dir: Optional[Path]) -> None:
 
     # Enable faulthandler to capture native crashes.
     try:
+        global _FAULT_HANDLER_STREAM
         crash_dir = target_dir or _resolve_log_dir(None)
         crash_file = crash_dir / "crash.log"
         fh = crash_file.open("a", encoding="utf-8")
+        _FAULT_HANDLER_STREAM = fh
         faulthandler.enable(file=fh, all_threads=True)
     except Exception:
         pass
+
+
+def _install_qt_message_handler() -> None:
+    global _QT_MESSAGE_HANDLER_INSTALLED
+    if _QT_MESSAGE_HANDLER_INSTALLED:
+        return
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+    except Exception:
+        return
+
+    qt_log = logging.getLogger("qt")
+
+    def _handler(_msg_type, _context, message):
+        try:
+            text = str(message or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            qt_log.warning(text)
+
+    try:
+        qInstallMessageHandler(_handler)
+        _QT_MESSAGE_HANDLER_INSTALLED = True
+    except Exception:
+        pass
+
+
+def current_log_dir() -> Optional[Path]:
+    return _CURRENT_LOG_DIR
+
+
+def current_log_files() -> List[Path]:
+    candidates: List[Path] = []
+    collected: set[str] = set()
+    if _CURRENT_LOG_FILE is not None:
+        try:
+            candidates.append(_CURRENT_LOG_FILE)
+            parent = _CURRENT_LOG_FILE.parent
+        except Exception:
+            parent = None
+    else:
+        parent = _CURRENT_LOG_DIR
+    if parent is not None:
+        try:
+            for pattern in ("*.log", "*.log.*"):
+                for path in sorted(parent.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True):
+                    key = str(path.resolve())
+                    if key in collected or not path.is_file():
+                        continue
+                    collected.add(key)
+                    candidates.append(path)
+        except Exception:
+            pass
+    out: List[Path] = []
+    emitted: set[str] = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        out.append(path)
+    if not out and _CURRENT_LOG_DIR is not None:
+        try:
+            return [p for p in sorted(_CURRENT_LOG_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True) if p.is_file()]
+        except Exception:
+            return []
+    return out

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread, QUrl, Slot
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -39,6 +41,8 @@ except Exception:  # pragma: no cover
         return obj is not None
 
 from ui.styles import StyleManager
+
+log = logging.getLogger("settings_window")
 
 
 @dataclass
@@ -111,6 +115,12 @@ class SettingsWindow(QDialog):
         self._ai_tags_worker: Optional[object] = None
         self._style_tab_widget: Optional[StyleEditorTab] = None
         self._style_tab_index: Optional[int] = None
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(self._on_app_about_to_quit)
+        except Exception:
+            pass
 
         root = QVBoxLayout(self)
 
@@ -145,6 +155,7 @@ class SettingsWindow(QDialog):
             self._style_tab_index = tabs.insertTab(target, self._style_tab_widget, "Оформление")
             tabs.setCurrentIndex(self._style_tab_index)
         except Exception:
+            log.exception("Failed to initialize style tab")
             self._style_tab_widget = None
 
     def reject(self) -> None:  # type: ignore[override]
@@ -152,7 +163,24 @@ class SettingsWindow(QDialog):
         if self._thread_is_running(thread):
             QMessageBox.information(self, "Скачивание модели", "Дождитесь завершения скачивания модели.")
             return
+        self._stop_ai_tags_thread()
         super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        thread = getattr(self, "_ai_pull_thread", None)
+        if self._thread_is_running(thread):
+            try:
+                event.ignore()
+            except Exception:
+                pass
+            QMessageBox.information(self, "Скачивание модели", "Дождитесь завершения скачивания модели.")
+            return
+        self._stop_ai_tags_thread()
+        super().closeEvent(event)
+
+    @Slot()
+    def _on_app_about_to_quit(self) -> None:
+        self._stop_ai_tags_thread()
 
     @staticmethod
     def _thread_is_running(thread: Optional[QThread]) -> bool:
@@ -163,6 +191,25 @@ class SettingsWindow(QDialog):
                 return False
         except Exception:
             return False
+
+    def _stop_ai_tags_thread(self) -> None:
+        thread = getattr(self, "_ai_tags_thread", None)
+        worker = getattr(self, "_ai_tags_worker", None)
+        if thread is None:
+            return
+        try:
+            if worker is not None and hasattr(worker, "stop"):
+                worker.stop()
+        except Exception:
+            pass
+        try:
+            if _qt_is_valid(thread) and thread.isRunning():
+                thread.quit()
+                thread.wait(1200)
+        except Exception:
+            pass
+        self._ai_tags_thread = None
+        self._ai_tags_worker = None
         try:
             return bool(thread.isRunning())
         except Exception:
@@ -453,6 +500,7 @@ class SettingsWindow(QDialog):
         try:
             result = callback()
         except Exception as exc:
+            log.exception("Settings tool action failed")
             self.set_tools_status(str(exc) or "Не удалось выполнить инструмент.")
             return
         if isinstance(result, tuple) and len(result) >= 2:
@@ -488,6 +536,7 @@ class SettingsWindow(QDialog):
             else:
                 ok = bool(result)
         except Exception as exc:
+            log.exception("Bug report action failed")
             ok = False
             message = str(exc)
         self.btn_send_bug_report.setEnabled(True)

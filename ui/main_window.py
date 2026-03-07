@@ -5,6 +5,7 @@ import ctypes
 import json
 import mimetypes
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,7 @@ from ui.dialog_workers import (
 from ui.account_workers import AccountProfileWorker
 from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
-from utils.logging_setup import configure_logging
+from utils.logging_setup import configure_logging, current_log_dir, current_log_files
 from ui.message_feed import MessageFeedMixin
 from ui.message_widgets import (
     DEFAULT_BUBBLE_THEME,
@@ -4444,7 +4445,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QTimer.singleShot(60, self._scroll_to_bottom)
         elif bool(getattr(self, "_history_anchor_to_top", False)):
             self._feed_scroll_lock_mode = "top"
-            self._feed_autostick_block_until = time.monotonic() + 1.4
+            self._feed_autostick_block_until = 0.0
             def _scroll_to_history_top() -> None:
                 try:
                     bar = self.chat_scroll.verticalScrollBar()
@@ -4456,15 +4457,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QTimer.singleShot(0, _scroll_to_history_top)
             QTimer.singleShot(60, _scroll_to_history_top)
             QTimer.singleShot(180, _scroll_to_history_top)
-            def _unlock_history_anchor() -> None:
-                setattr(self, "_feed_scroll_lock_mode", "")
-                setattr(self, "_feed_autostick_block_until", 0.0)
-                try:
-                    self._update_jump_button_visibility()
-                    self._position_jump_button()
-                except Exception:
-                    pass
-            QTimer.singleShot(900, _unlock_history_anchor)
         self._history_anchor_to_top = False
         if getattr(self, "_auto_download_enabled", False):
             QTimer.singleShot(180, self._apply_auto_download_to_feed)
@@ -4572,6 +4564,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self._sync_account_card()
             except Exception:
                 pass
+        try:
+            self._refresh_visible_chat_avatars()
+        except Exception:
+            pass
 
     def _refresh_feed_avatars(self, kind: str, entity_id: str) -> None:
         for idx in range(self.chat_history_layout.count()):
@@ -6744,6 +6740,28 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _refresh_all_avatars_from_settings(self) -> tuple[bool, str]:
         if not hasattr(self, "avatar_cache"):
             return False, "Кэш аватарок недоступен."
+        try:
+            remote_rows = self.server.list_all_telegram_chats(limit=2000)
+        except Exception:
+            remote_rows = []
+        for row in list(remote_rows or []):
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid or cid.startswith("__"):
+                continue
+            prev = dict(getattr(self, "all_chats", {}).get(cid, {}) or {})
+            merged = dict(prev)
+            merged.update({
+                "title": row.get("title") or prev.get("title") or cid,
+                "type": row.get("type") or prev.get("type") or "private",
+                "username": row.get("username") or prev.get("username") or "",
+                "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
+                "pinned": bool(row.get("pinned", prev.get("pinned", False))),
+                "last_ts": int(row.get("last_ts") or row.get("last_message_date") or prev.get("last_ts") or 0),
+                "unread_count": max(0, int(row.get("unread_count") or prev.get("unread_count") or 0)),
+            })
+            self.all_chats[cid] = merged
         scheduled = 0
         for chat_id, raw_info in list(getattr(self, "all_chats", {}).items()):
             cid = str(chat_id or "").strip()
@@ -6785,9 +6803,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 pass
         try:
-            rows = self.server.list_cached_dialogs(limit=2000)
+            rows = self.server.list_all_telegram_chats(limit=2000)
         except Exception:
-            rows = []
+            try:
+                rows = self.server.list_cached_dialogs(limit=2000)
+            except Exception:
+                rows = []
         chat_ids = [str(row.get("id") or "").strip() for row in list(rows or []) if isinstance(row, dict)]
         chat_ids = [cid for cid in chat_ids if cid and not cid.startswith("__")]
         if not chat_ids:
@@ -6849,17 +6870,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         return tail.strip()
 
     def _collect_bug_report_logs(self) -> str:
-        logs_root = app_paths.logs_dir()
+        entries: List[str] = []
         try:
-            entries = sorted(
-                [str(p) for p in logs_root.glob("*.log") if p.is_file()],
-                key=lambda p: os.path.getmtime(p),
-                reverse=True,
-            )
+            entries = [str(p) for p in current_log_files() if p.is_file()]
         except Exception:
             entries = []
+        if not entries:
+            logs_root = app_paths.logs_dir()
+            try:
+                entries = sorted(
+                    [str(p) for p in logs_root.iterdir() if p.is_file()],
+                    key=lambda p: os.path.getmtime(p),
+                    reverse=True,
+                )
+            except Exception:
+                entries = []
         parts: List[str] = []
-        for path in entries[:3]:
+        for path in entries[:5]:
             tail = self._read_log_tail(path)
             if not tail:
                 continue
@@ -6876,14 +6903,26 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             comment_text = "Без описания (отправлено из формы баг-репорта)."
         version = str(getattr(self, "_app_version", "") or get_app_version())
         logs_block = self._collect_bug_report_logs()
+        log_dir = current_log_dir() or app_paths.logs_dir()
+        os_label = " ".join(
+            part for part in (
+                platform.system(),
+                platform.release(),
+                platform.version(),
+                platform.machine(),
+            ) if str(part or "").strip()
+        ).strip() or sys.platform
         title = f"[BUG] ESCgram {version} - {time.strftime('%Y-%m-%d %H:%M:%S')}"
         body = (
             "### Описание\n"
             f"{comment_text}\n\n"
             "### Окружение\n"
             f"- Версия: `{version}`\n"
-            f"- OS: `{sys.platform}`\n"
+            f"- OS: `{os_label}`\n"
             f"- Python: `{sys.version.split()[0]}`\n\n"
+            "### Пути\n"
+            f"- Data dir: `{app_paths.get_data_dir()}`\n"
+            f"- Log dir: `{log_dir}`\n\n"
             "### Логи\n"
             f"{logs_block or 'Логи не найдены.'}\n"
         )
