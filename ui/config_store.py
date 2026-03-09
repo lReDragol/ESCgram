@@ -37,6 +37,29 @@ _DEFAULT_AUTO_DOWNLOAD = {
     },
 }
 
+_DEFAULT_TOOLS = {
+    "refresh_all_avatars": {
+        "has_run": False,
+        "last_run_at": 0,
+        "last_ok": False,
+        "last_total": 0,
+        "last_done": 0,
+        "last_failed": 0,
+        "last_stopped": False,
+        "last_message": "",
+    },
+    "scan_all_chats": {
+        "has_run": False,
+        "last_run_at": 0,
+        "last_ok": False,
+        "last_total": 0,
+        "last_done": 0,
+        "last_failed": 0,
+        "last_stopped": False,
+        "last_message": "",
+    },
+}
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "window": {
         "width": 1000,
@@ -83,6 +106,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cross_chat_context": True,
         "cross_chat_limit": 6,
     },
+    "tools": _DEFAULT_TOOLS,
 }
 
 

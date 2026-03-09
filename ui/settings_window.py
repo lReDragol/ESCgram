@@ -5,6 +5,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QSignalBlocker, QTimer, QThread, QUrl, Slot
@@ -100,6 +101,7 @@ class SettingsWindow(QDialog):
         callbacks: Dict[str, Callable[..., Any]],
         ai_state: Optional[Dict[str, Any]] = None,
         ai_callbacks: Optional[Dict[str, Callable[[Dict[str, Any]], None]]] = None,
+        tool_state: Optional[Dict[str, Any]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -108,6 +110,11 @@ class SettingsWindow(QDialog):
         self._callbacks = callbacks or {}
         self._ai_state = ai_state or {}
         self._ai_callbacks = ai_callbacks or {}
+        self._tool_state = {
+            str(key): dict(value)
+            for key, value in dict(tool_state or {}).items()
+            if isinstance(value, dict)
+        }
         self._ai_pull_thread: Optional[QThread] = None
         self._ai_pull_worker: Optional[object] = None
         self._ai_pull_model: str = ""
@@ -474,22 +481,45 @@ class SettingsWindow(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        btn_refresh_avatars = QPushButton("Принудительно подгрузить все аватарки")
-        btn_refresh_avatars.clicked.connect(
+        self.btn_refresh_avatars = QPushButton("Принудительно подгрузить все аватарки")
+        self.btn_refresh_avatars.clicked.connect(
             lambda: self._run_tool_action(self._callbacks.get("refresh_all_avatars"))
         )
-        layout.addWidget(btn_refresh_avatars, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.btn_refresh_avatars, 0, Qt.AlignmentFlag.AlignLeft)
 
-        btn_scan_all = QPushButton("Анализ всех чатов/групп")
-        btn_scan_all.clicked.connect(
+        self.btn_scan_all = QPushButton("Анализ всех чатов/групп")
+        self.btn_scan_all.clicked.connect(
             lambda: self._run_tool_action(self._callbacks.get("scan_all_chats"))
         )
-        layout.addWidget(btn_scan_all, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.btn_scan_all, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.tools_progress_label = QLabel("")
+        self.tools_progress_label.setWordWrap(True)
+        self.tools_progress_label.setStyleSheet("color:#b2c7de;")
+        self.tools_progress_label.hide()
+        layout.addWidget(self.tools_progress_label)
+
+        self.tools_progress = QProgressBar()
+        self.tools_progress.setRange(0, 100)
+        self.tools_progress.setValue(0)
+        self.tools_progress.hide()
+        layout.addWidget(self.tools_progress)
+
+        self.tools_avatar_state = QLabel("")
+        self.tools_avatar_state.setWordWrap(True)
+        self.tools_avatar_state.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(self.tools_avatar_state)
+
+        self.tools_scan_state = QLabel("")
+        self.tools_scan_state.setWordWrap(True)
+        self.tools_scan_state.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(self.tools_scan_state)
 
         self.tools_status = QLabel("")
         self.tools_status.setWordWrap(True)
         self.tools_status.setStyleSheet("color:#8da8c4;")
         layout.addWidget(self.tools_status)
+        self._refresh_tool_state_labels()
         layout.addStretch(1)
         return tab
 
@@ -512,6 +542,80 @@ class SettingsWindow(QDialog):
         label = getattr(self, "tools_status", None)
         if label is not None:
             label.setText(str(message or ""))
+
+    def set_tools_progress(self, message: str, done: int, total: int) -> None:
+        label = getattr(self, "tools_progress_label", None)
+        bar = getattr(self, "tools_progress", None)
+        if label is not None:
+            label.setText(str(message or ""))
+            label.setVisible(bool(message))
+        if bar is None:
+            return
+        total_value = max(0, int(total or 0))
+        done_value = max(0, int(done or 0))
+        if total_value > 0:
+            bar.setRange(0, total_value)
+            bar.setValue(min(done_value, total_value))
+        else:
+            bar.setRange(0, 0)
+        bar.show()
+
+    def clear_tools_progress(self) -> None:
+        label = getattr(self, "tools_progress_label", None)
+        bar = getattr(self, "tools_progress", None)
+        if label is not None:
+            label.clear()
+            label.hide()
+        if bar is not None:
+            bar.reset()
+            bar.hide()
+
+    def set_tools_busy(self, busy: bool) -> None:
+        enabled = not bool(busy)
+        for name in ("btn_refresh_avatars", "btn_scan_all"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def set_tool_state(self, key: str, state: Dict[str, Any]) -> None:
+        if not key:
+            return
+        self._tool_state[str(key)] = dict(state or {})
+        self._refresh_tool_state_labels()
+
+    def _refresh_tool_state_labels(self) -> None:
+        label_map = {
+            "refresh_all_avatars": ("tools_avatar_state", "Подгрузка аватарок"),
+            "scan_all_chats": ("tools_scan_state", "Скан чатов"),
+        }
+        for key, meta in label_map.items():
+            attr_name, title = meta
+            label = getattr(self, attr_name, None)
+            if label is None:
+                continue
+            label.setText(self._format_tool_state_text(title, self._tool_state.get(key)))
+
+    @staticmethod
+    def _format_tool_state_text(title: str, state: Optional[Dict[str, Any]]) -> str:
+        data = dict(state or {})
+        if not bool(data.get("has_run")):
+            return f"{title}: ещё не запускалось."
+        timestamp = 0
+        try:
+            timestamp = int(data.get("last_run_at") or 0)
+        except Exception:
+            timestamp = 0
+        if timestamp > 0:
+            stamp = datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M")
+        else:
+            stamp = "без времени"
+        message = str(data.get("last_message") or "").strip()
+        if not message:
+            done = int(data.get("last_done") or 0)
+            total = int(data.get("last_total") or 0)
+            failed = int(data.get("last_failed") or 0)
+            message = f"{done}/{total}, ошибок {failed}"
+        return f"{title}: {stamp} • {message}"
 
     def _send_bug_report(self) -> None:
         callback = self._callbacks.get("send_bug_report") if isinstance(self._callbacks, dict) else None

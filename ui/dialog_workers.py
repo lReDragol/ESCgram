@@ -189,6 +189,129 @@ class HistoryWorker(QObject):
         self.finished.emit()
 
 
+class ChatProfileLoadWorker(QObject):
+    done = Signal(str, dict, dict)  # chat_id, full_info, sections
+
+    def __init__(
+        self,
+        server,
+        chat_id: str,
+        *,
+        media_limit: int = 90,
+        file_limit: int = 90,
+        link_limit: int = 140,
+        members_limit: int = 100,
+    ) -> None:
+        super().__init__()
+        self.server = server
+        self.chat_id = str(chat_id or "")
+        self.media_limit = int(media_limit)
+        self.file_limit = int(file_limit)
+        self.link_limit = int(link_limit)
+        self.members_limit = int(members_limit)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    @Slot()
+    def run(self) -> None:
+        full: Dict[str, Any] = {}
+        sections: Dict[str, Any] = {}
+        chat_id = str(self.chat_id or "")
+        if not chat_id or self._stop:
+            self.done.emit(chat_id, full, sections)
+            return
+        fetch_full = str(os.getenv("DRAGO_PROFILE_FETCH_FULL", "0") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if fetch_full and not self._stop:
+            try:
+                getter = getattr(self.server, "get_chat_full_info", None)
+                if callable(getter):
+                    raw = getter(chat_id)
+                    if isinstance(raw, dict):
+                        full = dict(raw)
+            except Exception:
+                full = {}
+        if not self._stop:
+            try:
+                getter = getattr(self.server, "get_chat_profile_sections", None)
+                if callable(getter):
+                    raw = getter(
+                        chat_id,
+                        media_limit=max(1, self.media_limit),
+                        file_limit=max(1, self.file_limit),
+                        link_limit=max(1, self.link_limit),
+                        members_limit=max(1, self.members_limit),
+                    )
+                    if isinstance(raw, dict):
+                        sections = dict(raw)
+            except Exception:
+                sections = {}
+        self.done.emit(chat_id, full, sections)
+
+
+class BulkAvatarRefreshWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+
+    def __init__(self, server, rows: List[Dict[str, Any]]) -> None:
+        super().__init__()
+        self.server = server
+        self.rows = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    @Slot()
+    def run(self) -> None:
+        total = len(self.rows)
+        refreshed = 0
+        failed = 0
+        for idx, row in enumerate(self.rows, start=1):
+            if self._stop:
+                break
+            chat_id = str(row.get("id") or "").strip()
+            if not chat_id:
+                failed += 1
+                self.progress.emit(idx, total, "")
+                continue
+            file_id_raw = row.get("photo_small_id") or row.get("photo_small")
+            file_id = str(file_id_raw).strip() if file_id_raw else None
+            chat_type = str(row.get("type") or "").strip().lower()
+            path = None
+            try:
+                if chat_type in {"private", "bot"} and chat_id.lstrip("-").isdigit():
+                    getter = getattr(self.server, "ensure_user_avatar", None)
+                    if callable(getter):
+                        path = getter(chat_id, file_id=file_id)
+                else:
+                    getter = getattr(self.server, "ensure_chat_avatar", None)
+                    if callable(getter):
+                        path = getter(chat_id, file_id=file_id)
+            except Exception:
+                path = None
+            if path:
+                refreshed += 1
+            else:
+                failed += 1
+            self.progress.emit(idx, total, chat_id)
+        self.finished.emit(
+            {
+                "ok": not self._stop,
+                "total": total,
+                "refreshed": refreshed,
+                "failed": failed,
+                "stopped": bool(self._stop),
+            }
+        )
+
+
 class LastDateWorker(QObject):
     tick = Signal(str, int)
     done = Signal()

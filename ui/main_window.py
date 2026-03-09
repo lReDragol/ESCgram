@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent,
     QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property
 )
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -67,7 +67,9 @@ from ui.settings_window import SettingsWindow
 from ui.auto_download import AutoDownloadPolicy
 from ui.config_store import DEFAULT_CONFIG, load_config, save_config
 from ui.dialog_workers import (
+    BulkAvatarRefreshWorker,
     BulkChatStatisticsWorker,
+    ChatProfileLoadWorker,
     DialogsStreamWorker,
     FfmpegInstallWorker,
     GlobalPeerSearchWorker,
@@ -89,6 +91,7 @@ from ui.message_widgets import (
     ReplyPreviewWidget,
     TextMessageWidget,
     set_bubble_theme,
+    set_custom_emoji_provider,
 )
 from ui.media_viewer import MediaViewerDialog
 from ui.media_picker import MediaPickerPopup
@@ -112,6 +115,51 @@ except ImportError:
     sf = None
 
 
+class ChatInputTextEdit(QTextEdit):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._placeholder_text = ""
+
+    def setPlaceholderText(self, text: str) -> None:  # type: ignore[override]
+        self._placeholder_text = str(text or "")
+        super().setPlaceholderText("")
+        self.viewport().update()
+
+    def placeholderText(self) -> str:  # type: ignore[override]
+        return str(self._placeholder_text or "")
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self.toPlainText():
+            return
+        placeholder = str(self._placeholder_text or "").strip()
+        if not placeholder:
+            return
+        painter = QPainter(self.viewport())
+        try:
+            color = self.palette().color(self.foregroundRole())
+            color.setAlpha(120)
+            painter.setPen(color)
+            doc_margin = 0.0
+            try:
+                doc_margin = float(self.document().documentMargin())
+            except Exception:
+                doc_margin = 0.0
+            margins = self.contentsMargins()
+            rect = self.viewport().rect().adjusted(
+                int(margins.left() + doc_margin + 10),
+                0,
+                -int(margins.right() + doc_margin + 10),
+                0,
+            )
+            text_height = int(self.fontMetrics().height())
+            top = rect.top() + max(0, (rect.height() - text_height) // 2) - 1
+            draw_rect = QRect(rect.left(), top, max(0, rect.width()), max(text_height + 4, rect.height()))
+            painter.drawText(draw_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), placeholder)
+        finally:
+            painter.end()
+
+
 class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def __init__(self, server, tg_adapter, config: Optional[Dict[str, Any]] = None):
         # базовая инициализация
@@ -125,6 +173,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self.server = server
         self.tg = tg_adapter
+        set_custom_emoji_provider(self.tg)
         self._prepend_local_ffmpeg_to_path()
 
         # конфиг и фичи
@@ -192,6 +241,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._history_scroll_threshold = 40
         self._history_current_limit = 0
         self._history_auto_scroll_on_finish = True
+        self._history_force_top_on_finish = False
         self._history_load_requested_by_scroll = False
         self._history_scroll_enabled = False
         self.all_chats: Dict[str, Dict[str, Any]] = {}
@@ -242,10 +292,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._media_busy_last_toast_at: float = 0.0
         self._media_active_tmpdir: Optional[str] = None
         self._local_media_seq: int = 0
-        self._input_min_height = 72
+        self._input_min_height = 34
         self._input_max_height = 260
         self._pending_reply_updates: set[int] = set()
         self._media_group_refresh_pending: bool = False
+        self._pending_jump_message_id: Optional[int] = None
+        self._jump_retry_count: int = 0
+        self._chat_profile_thread: Optional[QThread] = None
+        self._chat_profile_worker: Optional[ChatProfileLoadWorker] = None
+        self._chat_profile_seq: int = 0
         self._use_global_context_menu = False
         self._app_version = get_app_version()
         self._update_repo = get_update_repo()
@@ -408,6 +463,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         ai_cfg.setdefault("prompt", defaults.get("prompt", ""))
         ai_cfg.setdefault("cross_chat_context", defaults.get("cross_chat_context", True))
         ai_cfg.setdefault("cross_chat_limit", defaults.get("cross_chat_limit", 6))
+
+        tools_cfg = self._config.setdefault("tools", {})
+        default_tools = DEFAULT_CONFIG.get("tools", {}) if isinstance(DEFAULT_CONFIG.get("tools"), dict) else {}
+        for key, raw_defaults in default_tools.items():
+            if not isinstance(raw_defaults, dict):
+                continue
+            bucket = tools_cfg.setdefault(str(key), {})
+            for item_key, item_value in raw_defaults.items():
+                bucket.setdefault(item_key, item_value)
 
     def _apply_ai_config_from_settings(self, state: Dict[str, Any], *, reset_model: bool = True) -> None:
         model = str(state.get("model") or "").strip()
@@ -986,6 +1050,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                         self._show_message_context_menu(widget, global_pos)
                         return True
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseButtonPress:
+            if (
+                str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower() == "top"
+                and not bool(getattr(self, "_loading_history", False))
+            ):
+                self._feed_scroll_lock_mode = ""
+                self._feed_autostick_block_until = 0.0
             try:
                 button = event.button()
             except Exception:
@@ -1030,6 +1100,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     if mid is not None and int(mid) > 0:
                         self._extend_message_selection_range(int(mid))
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.Wheel:
+            if (
+                str(getattr(self, "_feed_scroll_lock_mode", "") or "").strip().lower() == "top"
+                and not bool(getattr(self, "_loading_history", False))
+            ):
+                self._feed_scroll_lock_mode = ""
+                self._feed_autostick_block_until = 0.0
             if self._selection_drag_active and (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
                 QTimer.singleShot(0, self._extend_selection_to_cursor)
         if viewport is not None and obj is viewport and event.type() == QEvent.Type.MouseButtonRelease:
@@ -1050,7 +1126,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if wrap is None:
             return None
         try:
-            local = viewport.mapTo(wrap, pos)
+            global_pos = viewport.mapToGlobal(pos)
+            local = wrap.mapFromGlobal(global_pos)
             target = wrap.childAt(local)
         except Exception:
             target = None
@@ -1359,8 +1436,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _build_bottom_row(self) -> QHBoxLayout:
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(8, 12, 8, 12)
-        bottom_row.setSpacing(8)
+        bottom_row.setContentsMargins(0, 8, 0, 8)
+        bottom_row.setSpacing(6)
 
         self.btn_attach = QToolButton()
         self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1369,7 +1446,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.btn_attach.clicked.connect(self._pick_files_and_send)
         bottom_row.addWidget(self.btn_attach)
 
-        self.user_input = QTextEdit()
+        self.user_input = ChatInputTextEdit()
         self.user_input.setMinimumHeight(self._input_min_height)
         self.user_input.setMaximumHeight(self._input_max_height)
         self.user_input.setStyleSheet(
@@ -1381,6 +1458,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
         self.user_input.textChanged.connect(self._adjust_input_height)
+        try:
+            self.user_input.document().setDocumentMargin(4.0)
+        except Exception:
+            pass
         bottom_row.addWidget(self.user_input, 1)
 
         self.btn_media = QToolButton()
@@ -1423,10 +1504,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         try:
             doc_h = int(editor.document().size().height())
         except Exception:
-            doc_h = int(editor.fontMetrics().lineSpacing() * 2)
+            doc_h = int(editor.fontMetrics().lineSpacing())
         frame = int(editor.frameWidth() * 2)
         margins = editor.contentsMargins()
-        target = doc_h + frame + int(margins.top()) + int(margins.bottom()) + 10
+        target = doc_h + frame + int(margins.top()) + int(margins.bottom()) + 4
         target = max(int(self._input_min_height), min(int(self._input_max_height), int(target)))
         try:
             editor.setFixedHeight(target)
@@ -2054,6 +2135,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._message_cache.clear()
         self._reply_index.clear()
         self._clear_message_selection()
+        self._stop_chat_profile_loader()
+        self._pending_jump_message_id = None
+        self._jump_retry_count = 0
+        self._history_force_top_on_finish = False
         self.current_chat_id = chat_id
         self._close_chat_details()
         self._apply_chat_activity(chat_id, refresh_delay_ms=0)
@@ -2097,30 +2182,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not chat_id:
             return
         info = self._current_chat_meta()
-        if hasattr(self.server, "get_chat_full_info"):
-            try:
-                full = self.server.get_chat_full_info(chat_id)
-            except Exception:
-                full = None
-            if isinstance(full, dict) and full:
-                info.update(full)
-                self._chat_header_info_cache[chat_id] = dict(full)
-                merged = dict(self.all_chats.get(chat_id, {}))
-                merged.update(full)
-                self.all_chats[chat_id] = merged
-                self._refresh_chat_header()
-        sections: Dict[str, Any] = {}
-        if hasattr(self.server, "get_chat_profile_sections"):
-            try:
-                sections = self.server.get_chat_profile_sections(
-                    chat_id,
-                    media_limit=90,
-                    file_limit=90,
-                    link_limit=140,
-                    members_limit=100,
-                )
-            except Exception:
-                sections = {}
         avatar = None
         try:
             avatar = self.avatar_cache.chat(chat_id, info)
@@ -2130,8 +2191,165 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "show_stats": self._show_current_chat_statistics,
             "mark_read": lambda: self._mark_current_chat_read(local=False),
             "leave_chat": self._leave_current_chat_from_profile,
+            "jump_to_message": self._jump_to_chat_message,
+            "load_profile_section": lambda section, chat=chat_id: self._load_chat_profile_section(chat, section),
         }
-        panel = ChatInfoDialog(info, avatar=avatar, sections=sections, callbacks=callbacks, parent=self, embedded=True)
+        panel = ChatInfoDialog(
+            info,
+            avatar=avatar,
+            sections={},
+            callbacks=callbacks,
+            parent=self,
+            embedded=True,
+        )
+        self._set_chat_details_widget("Профиль", panel)
+
+    def _build_chat_profile_loading_widget(self) -> QWidget:
+        box = QFrame(self)
+        box.setStyleSheet("QFrame{background:transparent;border:none;} QLabel{background:transparent;border:none;}")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(8)
+        title = QLabel("Загрузка профиля…", box)
+        title.setStyleSheet("color:#dfefff;font-size:15px;font-weight:700;")
+        note = QLabel("Подгружаю медиа, файлы, ссылки и участников в фоне.", box)
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8da8c4;font-size:12px;")
+        layout.addWidget(title, 0)
+        layout.addWidget(note, 0)
+        layout.addStretch(1)
+        return box
+
+    def _stop_chat_profile_loader(self) -> None:
+        worker = getattr(self, "_chat_profile_worker", None)
+        thread = getattr(self, "_chat_profile_thread", None)
+        self._chat_profile_worker = None
+        self._chat_profile_thread = None
+        if worker is not None and hasattr(worker, "stop"):
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if thread is not None:
+            try:
+                if _qt_is_valid(thread) and thread.isRunning():
+                    thread.quit()
+                    thread.wait(350)
+            except Exception:
+                pass
+
+    def _start_chat_profile_loader(self, chat_id: str) -> None:
+        cid = str(chat_id or "")
+        if not cid:
+            return
+        self._stop_chat_profile_loader()
+        self._chat_profile_seq += 1
+        seq = int(self._chat_profile_seq)
+        thread = QThread(self)
+        thread.setObjectName("chat_profile_load_thread")
+        worker = ChatProfileLoadWorker(
+            self.server,
+            cid,
+            media_limit=90,
+            file_limit=90,
+            link_limit=140,
+            members_limit=100,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(lambda chat, full, sections, s=seq: self._on_chat_profile_loaded(chat, full, sections, s))
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_chat_profile_worker", None))
+        thread.finished.connect(lambda: setattr(self, "_chat_profile_thread", None))
+        self._chat_profile_worker = worker
+        self._chat_profile_thread = thread
+        thread.start()
+
+    def _load_chat_profile_section(self, chat_id: str, section: str) -> List[Dict[str, Any]]:
+        cid = str(chat_id or "").strip()
+        key = str(section or "").strip().lower()
+        if not cid or not key:
+            return []
+        limits = {
+            "media": 90,
+            "files": 90,
+            "links": 140,
+            "members": 100,
+        }
+        limit = int(limits.get(key, 80) or 80)
+        getter = getattr(self.server, "get_chat_profile_section", None)
+        if callable(getter):
+            try:
+                rows = getter(cid, key, limit=limit) or []
+                return [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+            except Exception:
+                return []
+        getter = getattr(self.server, "get_chat_profile_sections", None)
+        if callable(getter):
+            try:
+                payload = getter(
+                    cid,
+                    media_limit=limit if key == "media" else 1,
+                    file_limit=limit if key == "files" else 1,
+                    link_limit=limit if key == "links" else 1,
+                    members_limit=limit if key == "members" else 1,
+                ) or {}
+                rows = payload.get(key) if isinstance(payload, dict) else []
+                return [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+            except Exception:
+                return []
+        return []
+
+    def _on_chat_profile_loaded(
+        self,
+        chat_id: str,
+        full_info: Dict[str, Any],
+        sections: Dict[str, Any],
+        seq: int,
+    ) -> None:
+        if int(seq) != int(getattr(self, "_chat_profile_seq", 0) or 0):
+            return
+        cid = str(chat_id or "")
+        if not cid:
+            return
+        if cid != str(self.current_chat_id or ""):
+            return
+        host = getattr(self, "_chat_details_host", None)
+        header = getattr(self, "_chat_details_header_label", None)
+        if host is None or not bool(host.isVisible()):
+            return
+        if header is not None and str(header.text() or "").strip().lower() not in {"профиль", "мой профиль"}:
+            return
+        info = self._current_chat_meta()
+        full = dict(full_info or {})
+        if full:
+            info.update(full)
+            self._chat_header_info_cache[cid] = dict(full)
+            merged = dict(self.all_chats.get(cid, {}))
+            merged.update(full)
+            self.all_chats[cid] = merged
+            self._refresh_chat_header()
+        avatar = None
+        try:
+            avatar = self.avatar_cache.chat(cid, info)
+        except Exception:
+            avatar = None
+        callbacks = {
+            "show_stats": self._show_current_chat_statistics,
+            "mark_read": lambda: self._mark_current_chat_read(local=False),
+            "leave_chat": self._leave_current_chat_from_profile,
+            "jump_to_message": self._jump_to_chat_message,
+        }
+        panel = ChatInfoDialog(
+            info,
+            avatar=avatar,
+            sections=dict(sections or {}),
+            callbacks=callbacks,
+            parent=self,
+            embedded=True,
+        )
         self._set_chat_details_widget("Профиль", panel)
 
     def _leave_current_chat_from_profile(self) -> None:
@@ -2204,6 +2422,75 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         panel = MessageStatisticsDialog(data, parent=self, embedded=True)
         self._set_chat_details_widget("Статистика сообщения", panel)
+
+    def _scroll_to_message_widget(self, msg_id: int) -> bool:
+        try:
+            mid = int(msg_id)
+        except Exception:
+            return False
+        if mid <= 0:
+            return False
+        widget = self._message_widgets.get(mid)
+        if widget is None:
+            return False
+        target = getattr(widget, "_row_wrap", None) or widget
+        try:
+            self.chat_scroll.ensureWidgetVisible(target, 0, 120)
+            return True
+        except Exception:
+            return False
+
+    def _jump_to_chat_message(self, message_id: int) -> None:
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0 or not self.current_chat_id:
+            return
+        if self._scroll_to_message_widget(mid):
+            return
+        self._pending_jump_message_id = mid
+        self._jump_retry_count = 0
+        current_limit = int(getattr(self, "_history_current_limit", 0) or 0)
+        min_limit = max(
+            int(getattr(self, "_history_prefetch_limit", 300) or 300),
+            int(getattr(self, "_history_initial_limit", 80) or 80),
+            500,
+        )
+        target_limit = max(current_limit, min_limit)
+        self.load_chat_history_async(reset=False, limit=target_limit, auto_scroll=False)
+        self._toast("Подгружаю историю к сообщению…")
+
+    def _resolve_pending_message_jump(self) -> None:
+        pending = getattr(self, "_pending_jump_message_id", None)
+        if pending is None:
+            return
+        try:
+            target_mid = int(pending)
+        except Exception:
+            self._pending_jump_message_id = None
+            return
+        if self._scroll_to_message_widget(target_mid):
+            self._pending_jump_message_id = None
+            self._jump_retry_count = 0
+            return
+        current_limit = int(getattr(self, "_history_current_limit", 0) or 0)
+        hard_cap = 5000
+        if current_limit >= hard_cap:
+            self._pending_jump_message_id = None
+            self._jump_retry_count = 0
+            self._toast("Сообщение не найдено в локальной истории")
+            return
+        retries = int(getattr(self, "_jump_retry_count", 0) or 0)
+        if retries >= 8:
+            self._pending_jump_message_id = None
+            self._jump_retry_count = 0
+            self._toast("Не удалось быстро перейти к сообщению")
+            return
+        chunk = max(180, int(getattr(self, "_history_chunk_size", 120) or 120))
+        next_limit = min(hard_cap, current_limit + chunk)
+        self._jump_retry_count = retries + 1
+        self.load_chat_history_async(reset=False, limit=next_limit, auto_scroll=False)
 
     @Slot(QPoint)
     def _show_chat_header_menu(self, global_pos: QPoint) -> None:
@@ -3070,6 +3357,19 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return True
         target = getattr(widget, "_row_wrap", None) or widget
         if target is None or not _qt_is_valid(target):
+            return False
+        # mapTo() requires target to be in viewport parent hierarchy.
+        parent = target
+        in_hierarchy = False
+        try:
+            while parent is not None:
+                if parent is viewport:
+                    in_hierarchy = True
+                    break
+                parent = parent.parentWidget() if hasattr(parent, "parentWidget") else None
+        except Exception:
+            in_hierarchy = False
+        if not in_hierarchy:
             return False
         try:
             point = target.mapTo(viewport, QPoint(0, 0))
@@ -4169,6 +4469,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             auto_scroll = False if reset else False
         self._history_auto_scroll_on_finish = bool(auto_scroll)
         self._history_anchor_to_top = bool(reset and not auto_scroll)
+        self._history_force_top_on_finish = bool(reset and not auto_scroll)
         self._feed_scroll_lock_mode = "top" if self._history_anchor_to_top else ""
         self._feed_autostick_block_until = time.monotonic() + (1.2 if self._history_anchor_to_top else 0.0)
 
@@ -4431,6 +4732,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     wrap.setUpdatesEnabled(True)
                 except Exception:
                     pass
+        if getattr(self, "_pending_jump_message_id", None) is not None:
+            self._scroll_to_message_widget(int(self._pending_jump_message_id))
         self._update_bot_keyboard_bar()
 
     @Slot()
@@ -4445,7 +4748,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QTimer.singleShot(60, self._scroll_to_bottom)
         elif bool(getattr(self, "_history_anchor_to_top", False)):
             self._feed_scroll_lock_mode = "top"
-            self._feed_autostick_block_until = 0.0
+            self._feed_autostick_block_until = time.monotonic() + 1.4
             def _scroll_to_history_top() -> None:
                 try:
                     bar = self.chat_scroll.verticalScrollBar()
@@ -4457,6 +4760,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QTimer.singleShot(0, _scroll_to_history_top)
             QTimer.singleShot(60, _scroll_to_history_top)
             QTimer.singleShot(180, _scroll_to_history_top)
+            QTimer.singleShot(420, _scroll_to_history_top)
         self._history_anchor_to_top = False
         if getattr(self, "_auto_download_enabled", False):
             QTimer.singleShot(180, self._apply_auto_download_to_feed)
@@ -4465,6 +4769,22 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         # Enable scroll-triggered paging after initial render settles.
         QTimer.singleShot(220, lambda: setattr(self, "_history_scroll_enabled", True))
+        if getattr(self, "_pending_jump_message_id", None) is not None:
+            QTimer.singleShot(40, self._resolve_pending_message_jump)
+        if bool(getattr(self, "_history_force_top_on_finish", False)):
+            def _force_top() -> None:
+                try:
+                    bar = self.chat_scroll.verticalScrollBar()
+                    bar.setValue(bar.minimum())
+                    self._clear_jump_indicator()
+                    self._position_jump_button()
+                except Exception:
+                    pass
+            QTimer.singleShot(0, _force_top)
+            QTimer.singleShot(80, _force_top)
+            QTimer.singleShot(220, _force_top)
+            QTimer.singleShot(520, _force_top)
+        self._history_force_top_on_finish = False
 
     # ------------------------------------------------------------------ #
     # Telegram dialogs refresh
@@ -6718,9 +7038,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             callbacks=callbacks,
             ai_state=dict(ai_state),
             ai_callbacks={"on_change": self._on_ai_settings_changed},
+            tool_state=self._snapshot_tools_state(),
             parent=self,
         )
         self._settings_window = dlg
+        self._set_settings_tools_busy(self._tools_job_running())
         try:
             dlg.exec()
         finally:
@@ -6737,78 +7059,205 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 pass
 
-    def _refresh_all_avatars_from_settings(self) -> tuple[bool, str]:
-        if not hasattr(self, "avatar_cache"):
-            return False, "Кэш аватарок недоступен."
+    def _set_settings_tools_progress(self, message: str, done: int = 0, total: int = 0) -> None:
+        window = self._active_settings_window()
+        if window is None:
+            return
+        setter = getattr(window, "set_tools_progress", None)
+        if callable(setter):
+            try:
+                setter(str(message or ""), int(done or 0), int(total or 0))
+            except Exception:
+                pass
+
+    def _set_settings_tools_busy(self, busy: bool) -> None:
+        window = self._active_settings_window()
+        if window is None:
+            return
+        setter = getattr(window, "set_tools_busy", None)
+        if callable(setter):
+            try:
+                setter(bool(busy))
+            except Exception:
+                pass
+
+    def _sync_settings_tool_state(self, key: str) -> None:
+        window = self._active_settings_window()
+        if window is None or not key:
+            return
+        setter = getattr(window, "set_tool_state", None)
+        if callable(setter):
+            try:
+                setter(str(key), self._tool_state_snapshot(str(key)))
+            except Exception:
+                pass
+
+    def _snapshot_tools_state(self) -> Dict[str, Dict[str, Any]]:
+        tools_cfg = self._config.get("tools", {})
+        if not isinstance(tools_cfg, dict):
+            return {}
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for key, value in tools_cfg.items():
+            if isinstance(value, dict):
+                snapshot[str(key)] = dict(value)
+        return snapshot
+
+    def _tool_state_snapshot(self, key: str) -> Dict[str, Any]:
+        tools_cfg = self._config.get("tools", {})
+        if not isinstance(tools_cfg, dict):
+            return {}
+        value = tools_cfg.get(str(key))
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    def _persist_tool_state(
+        self,
+        key: str,
+        *,
+        ok: bool,
+        message: str,
+        total: int,
+        done: int,
+        failed: int,
+        stopped: bool = False,
+    ) -> None:
+        tools_cfg = self._config.setdefault("tools", {})
+        state = tools_cfg.setdefault(str(key), {})
+        state.update(
+            {
+                "has_run": True,
+                "last_run_at": int(time.time()),
+                "last_ok": bool(ok),
+                "last_total": max(0, int(total or 0)),
+                "last_done": max(0, int(done or 0)),
+                "last_failed": max(0, int(failed or 0)),
+                "last_stopped": bool(stopped),
+                "last_message": str(message or "").strip(),
+            }
+        )
         try:
-            remote_rows = self.server.list_all_telegram_chats(limit=2000)
+            save_config(self._config)
+        except Exception:
+            log.exception("Failed to save tools state for %s", key)
+        self._sync_settings_tool_state(str(key))
+
+    def _tools_job_running(self) -> bool:
+        for attr_name in ("_bulk_avatar_thread", "_bulk_stats_thread"):
+            thread = getattr(self, attr_name, None)
+            if thread is None:
+                continue
+            try:
+                if _qt_is_valid(thread) and thread.isRunning():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _load_tool_chat_rows(self, *, limit: int = 2000) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+
+        def _merge_row(raw_row: Dict[str, Any]) -> None:
+            if not isinstance(raw_row, dict):
+                return
+            cid = str(raw_row.get("id") or "").strip()
+            if not cid or cid.startswith("__"):
+                return
+            prev = dict(merged.get(cid, {}))
+            prev.update({key: value for key, value in raw_row.items() if value not in (None, "")})
+            prev["id"] = cid
+            merged[cid] = prev
+
+        try:
+            cached_rows = self.server.list_cached_dialogs(limit=limit)
+        except Exception:
+            cached_rows = []
+        for row in list(cached_rows or []):
+            _merge_row(row)
+
+        for cid, info in list(getattr(self, "all_chats", {}).items()):
+            row = dict(info or {})
+            row.setdefault("id", cid)
+            _merge_row(row)
+
+        try:
+            remote_rows = self.server.list_all_telegram_chats(limit=limit)
         except Exception:
             remote_rows = []
         for row in list(remote_rows or []):
-            if not isinstance(row, dict):
-                continue
-            cid = str(row.get("id") or "").strip()
-            if not cid or cid.startswith("__"):
-                continue
-            prev = dict(getattr(self, "all_chats", {}).get(cid, {}) or {})
-            merged = dict(prev)
-            merged.update({
-                "title": row.get("title") or prev.get("title") or cid,
-                "type": row.get("type") or prev.get("type") or "private",
-                "username": row.get("username") or prev.get("username") or "",
-                "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
-                "pinned": bool(row.get("pinned", prev.get("pinned", False))),
-                "last_ts": int(row.get("last_ts") or row.get("last_message_date") or prev.get("last_ts") or 0),
-                "unread_count": max(0, int(row.get("unread_count") or prev.get("unread_count") or 0)),
-            })
-            self.all_chats[cid] = merged
-        scheduled = 0
-        for chat_id, raw_info in list(getattr(self, "all_chats", {}).items()):
-            cid = str(chat_id or "").strip()
-            if not cid or cid.startswith("__"):
-                continue
-            info = dict(raw_info or {})
-            try:
-                self.avatar_cache.chat(cid, info)
-                scheduled += 1
-            except Exception:
-                continue
+            _merge_row(row)
+
+        rows: List[Dict[str, Any]] = []
+        all_chats = getattr(self, "all_chats", None)
+        if not isinstance(all_chats, dict):
+            self.all_chats = {}
+            all_chats = self.all_chats
+        for cid, row in merged.items():
+            prev = dict(all_chats.get(cid, {}) or {})
+            normalized = dict(prev)
+            normalized.update(
+                {
+                    "id": cid,
+                    "title": row.get("title") or prev.get("title") or cid,
+                    "type": row.get("type") or prev.get("type") or "private",
+                    "username": row.get("username") or prev.get("username") or "",
+                    "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
+                    "pinned": bool(row.get("pinned", prev.get("pinned", False))),
+                    "last_ts": int(row.get("last_ts") or row.get("last_message_date") or prev.get("last_ts") or 0),
+                    "unread_count": max(0, int(row.get("unread_count") or prev.get("unread_count") or 0)),
+                }
+            )
+            all_chats[cid] = normalized
+            rows.append(normalized)
+        return rows
+
+    def _refresh_all_avatars_from_settings(self) -> tuple[bool, str]:
+        if not hasattr(self, "avatar_cache"):
+            return False, "Кэш аватарок недоступен."
+        if self._tools_job_running():
+            message = "Уже выполняется другая операция Tools."
+            self._set_settings_tools_status(message)
+            return False, message
+        rows = self._load_tool_chat_rows(limit=2000)
+        if not rows:
+            message = "Нет чатов для подгрузки аватарок."
+            self._set_settings_tools_status(message)
+            return False, message
         try:
-            refresh_payload = getattr(self, "_chat_list_avatar_payload", None)
-            if callable(refresh_payload):
-                for cid, row_widget in list(getattr(self, "_chat_row_widgets_by_id", {}).items()):
-                    info = dict(getattr(self, "all_chats", {}).get(cid, {}) or {})
-                    title = str(info.get("title_display") or info.get("title") or cid)
-                    pixmap, avatar_key = refresh_payload(cid, info, title)
-                    if row_widget and hasattr(row_widget, "set_avatar_cached") and pixmap is not None:
-                        row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
+            thread = QThread(self)
+            thread.setObjectName("bulk_avatar_refresh_thread")
+            worker = BulkAvatarRefreshWorker(self.server, rows=rows)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_bulk_avatar_progress)
+            worker.finished.connect(self._on_bulk_avatar_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_bulk_avatar_worker", None))
+            thread.finished.connect(lambda: setattr(self, "_bulk_avatar_thread", None))
+            self._bulk_avatar_worker = worker
+            self._bulk_avatar_thread = thread
+            thread.start()
         except Exception:
-            pass
-        try:
-            self._refresh_chat_header()
-        except Exception:
-            pass
-        message = f"Запущена принудительная подгрузка аватарок: {scheduled}"
+            log.exception("Failed to start bulk avatar refresh")
+            self._bulk_avatar_worker = None
+            self._bulk_avatar_thread = None
+            message = "Не удалось запустить подгрузку аватарок."
+            self._set_settings_tools_status(message)
+            return False, message
+        self._set_settings_tools_busy(True)
+        self._set_settings_tools_progress(f"Подгрузка аватарок: 0/{len(rows)}", 0, len(rows))
+        message = f"Запущена принудительная подгрузка аватарок: {len(rows)}"
         self._set_settings_tools_status(message)
         return True, message
 
     def _scan_all_chats_from_settings(self) -> tuple[bool, str]:
-        thread = getattr(self, "_bulk_stats_thread", None)
-        if thread is not None:
-            try:
-                if _qt_is_valid(thread) and thread.isRunning():
-                    msg = "Скан уже выполняется."
-                    self._set_settings_tools_status(msg)
-                    return False, msg
-            except Exception:
-                pass
-        try:
-            rows = self.server.list_all_telegram_chats(limit=2000)
-        except Exception:
-            try:
-                rows = self.server.list_cached_dialogs(limit=2000)
-            except Exception:
-                rows = []
+        if self._tools_job_running():
+            msg = "Уже выполняется другая операция Tools."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        rows = self._load_tool_chat_rows(limit=2000)
         chat_ids = [str(row.get("id") or "").strip() for row in list(rows or []) if isinstance(row, dict)]
         chat_ids = [cid for cid in chat_ids if cid and not cid.startswith("__")]
         if not chat_ids:
@@ -6836,13 +7285,60 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             msg = "Не удалось запустить общий анализ."
             self._set_settings_tools_status(msg)
             return False, msg
+        self._set_settings_tools_busy(True)
+        self._set_settings_tools_progress(f"Анализ: 0/{len(chat_ids)}", 0, len(chat_ids))
         msg = f"Запущен анализ чатов: {len(chat_ids)}"
         self._set_settings_tools_status(msg)
         return True, msg
 
     @Slot(int, int, str)
+    def _on_bulk_avatar_progress(self, done: int, total: int, chat_id: str) -> None:
+        cid = str(chat_id or "").strip()
+        if cid and hasattr(self, "avatar_cache"):
+            info = dict(getattr(self, "all_chats", {}).get(cid, {}) or {})
+            title = str(info.get("title_display") or info.get("title") or cid)
+            chat_type = str(info.get("type") or "").strip().lower()
+            try:
+                if chat_type in {"private", "user", "bot"} and cid.lstrip("-").isdigit():
+                    self.avatar_cache.user(cid, title)
+                else:
+                    self.avatar_cache.chat(cid, info)
+            except Exception:
+                pass
+        msg = f"Подгрузка аватарок: {int(done)}/{int(total)}"
+        if cid:
+            msg += f" • {cid}"
+        self._set_settings_tools_progress(msg, int(done), int(total))
+        self._set_settings_tools_status(msg)
+
+    @Slot(dict)
+    def _on_bulk_avatar_finished(self, payload: Dict[str, Any]) -> None:
+        data = dict(payload or {})
+        refreshed = int(data.get("refreshed") or 0)
+        total = int(data.get("total") or 0)
+        failed = int(data.get("failed") or 0)
+        stopped = bool(data.get("stopped"))
+        if stopped:
+            msg = f"Подгрузка остановлена: {refreshed}/{total}, ошибок {failed}"
+        else:
+            msg = f"Подгрузка завершена: {refreshed}/{total}, ошибок {failed}"
+        self._set_settings_tools_progress(msg, total if total > 0 and not stopped else refreshed, total)
+        self._set_settings_tools_status(msg)
+        self._persist_tool_state(
+            "refresh_all_avatars",
+            ok=bool(data.get("ok")) and not stopped and failed == 0,
+            message=msg,
+            total=total,
+            done=refreshed,
+            failed=failed,
+            stopped=stopped,
+        )
+        self._set_settings_tools_busy(False)
+
+    @Slot(int, int, str)
     def _on_bulk_stats_progress(self, done: int, total: int, chat_id: str) -> None:
         msg = f"Анализ: {int(done)}/{int(total)} • {str(chat_id or '')}"
+        self._set_settings_tools_progress(msg, int(done), int(total))
         self._set_settings_tools_status(msg)
 
     @Slot(dict)
@@ -6855,7 +7351,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             msg = f"Анализ остановлен: {scanned}/{total}, ошибок {failed}"
         else:
             msg = f"Анализ завершён: {scanned}/{total}, ошибок {failed}"
+        self._set_settings_tools_progress(msg, total if total > 0 and not bool(data.get("stopped")) else scanned, total)
         self._set_settings_tools_status(msg)
+        self._persist_tool_state(
+            "scan_all_chats",
+            ok=bool(data.get("ok")) and not bool(data.get("stopped")) and failed == 0,
+            message=msg,
+            total=total,
+            done=scanned,
+            failed=failed,
+            stopped=bool(data.get("stopped")),
+        )
+        self._set_settings_tools_busy(False)
 
     @staticmethod
     def _read_log_tail(path: str, *, max_lines: int = 260, max_chars: int = 40000) -> str:
@@ -7047,6 +7554,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._hist_worker = None
         self._hist_thread = None
         self._loading_history = False
+        self._stop_chat_profile_loader()
 
         ts_thread = getattr(self, "_ts_thread", None)
         ts_worker = getattr(self, "_ts_worker", None)

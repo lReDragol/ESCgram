@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
+import threading
 from functools import partial
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QPoint, Qt, Signal, QUrl
-from PySide6.QtGui import QPixmap, QDesktopServices
+from PySide6.QtCore import QObject, QPoint, QSize, Qt, Signal, Slot, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QLineEdit,
     QScrollArea,
     QSizePolicy,
     QTabWidget,
@@ -142,6 +145,11 @@ class _StatsSection(QWidget):
         layout.addLayout(self.body)
 
 
+class _ChatInfoAsyncBus(QObject):
+    sectionLoaded = Signal(str, object, str)
+    previewLoaded = Signal(str, int, str, object)
+
+
 class ChatInfoDialog(QDialog):
     def __init__(
         self,
@@ -158,6 +166,28 @@ class ChatInfoDialog(QDialog):
         self._sections = dict(sections or {})
         self._callbacks = dict(callbacks or {})
         self._embedded = bool(embedded)
+        self._tabs: Optional[QTabWidget] = None
+        self._tab_layouts: Dict[int, QVBoxLayout] = {}
+        self._tab_builders: Dict[int, Any] = {}
+        self._tab_loaded: set[int] = set()
+        self._tab_titles: Dict[int, str] = {}
+        self._tab_sections: Dict[int, str] = {1: "media", 2: "files", 3: "links", 4: "members"}
+        self._section_loaded: set[str] = {
+            key for key in ("media", "files", "links", "members") if key in self._sections
+        }
+        self._section_loading: set[str] = set()
+        self._section_errors: Dict[str, str] = {}
+        self._section_threads: Dict[str, threading.Thread] = {}
+        self._async_bus = _ChatInfoAsyncBus(self)
+        self._async_bus.sectionLoaded.connect(self._on_section_loaded)
+        self._async_bus.previewLoaded.connect(self._on_preview_loaded)
+        self._media_preview_generation: int = 0
+        self._media_preview_request_seq: int = 0
+        self._media_preview_queue: List[Dict[str, Any]] = []
+        self._media_preview_targets: Dict[str, QLabel] = {}
+        self._media_preview_inflight: Dict[int, int] = {}
+        self._media_preview_cache: Dict[str, QPixmap] = {}
+        self._media_preview_batch_size: int = 5
 
         self.setWindowTitle("Профиль чата")
         if not self._embedded:
@@ -166,10 +196,12 @@ class ChatInfoDialog(QDialog):
             self.setMinimumSize(0, 0)
         self.setStyleSheet(
             "QDialog{background-color:#0f1b27;color:#dfe7f5;}"
-            "QLabel{color:#dfe7f5;}"
+            "QLabel{color:#dfe7f5;background-color:transparent;border:none;}"
             "QTabWidget::pane{border:1px solid rgba(255,255,255,0.08);border-radius:10px;top:-1px;background:#102033;}"
             "QTabBar::tab{background:rgba(255,255,255,0.04);color:#b9cce3;padding:8px 12px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;}"
             "QTabBar::tab:selected{background:rgba(89,183,255,0.22);color:#f4f7ff;}"
+            "QLineEdit{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.10);border-radius:9px;padding:7px 10px;color:#e6f0ff;}"
+            "QLineEdit:focus{border:1px solid rgba(89,183,255,0.58);}"
             "QPushButton{background:rgba(255,255,255,0.05);color:#dfe7f5;border:none;border-radius:8px;padding:7px 10px;}"
             "QPushButton:hover{background:rgba(255,255,255,0.10);}"
         )
@@ -199,13 +231,30 @@ class ChatInfoDialog(QDialog):
         root.addLayout(header)
 
         tabs = QTabWidget(self)
-        tabs.addTab(self._wrap_scroll(self._build_overview_tab()), "Обзор")
-        tabs.addTab(self._build_media_tab(), "Медиа")
-        tabs.addTab(self._build_files_tab(), "Файлы")
-        tabs.addTab(self._build_links_tab(), "Ссылки")
-        tabs.addTab(self._wrap_scroll(self._build_members_tab()), "Участники")
-        tabs.addTab(self._wrap_scroll(self._build_actions_tab()), "Действия")
+        self._tabs = tabs
         root.addWidget(tabs, 1)
+
+        self._tab_builders = {
+            0: lambda: self._wrap_scroll(self._build_overview_tab()),
+            1: self._build_media_tab,
+            2: self._build_files_tab,
+            3: self._build_links_tab,
+            4: lambda: self._wrap_scroll(self._build_members_tab()),
+            5: lambda: self._wrap_scroll(self._build_actions_tab()),
+        }
+        titles = ["Обзор", "Медиа", "Файлы", "Ссылки", "Участники", "Действия"]
+        for idx, title in enumerate(titles):
+            self._tab_titles[idx] = title
+            container = QWidget(self)
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+            self._tab_layouts[idx] = container_layout
+            tabs.addTab(container, title)
+
+        self._set_lazy_tab_widget(0, self._wrap_scroll(self._build_overview_tab()))
+        self._tab_loaded.add(0)
+        tabs.currentChanged.connect(self._ensure_lazy_tab_loaded)
 
         if not self._embedded:
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
@@ -214,6 +263,10 @@ class ChatInfoDialog(QDialog):
             root.addWidget(buttons)
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        try:
+            QTimer.singleShot(0, lambda: self._ensure_lazy_tab_loaded(int(tabs.currentIndex())))
+        except Exception:
+            pass
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         scroll = QScrollArea(self)
@@ -221,6 +274,33 @@ class ChatInfoDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(widget)
         return scroll
+
+    def _set_lazy_tab_widget(self, index: int, widget: QWidget) -> None:
+        layout = self._tab_layouts.get(int(index))
+        if layout is None:
+            return
+        self._clear_layout(layout)
+        widget.setParent(self)
+        layout.addWidget(widget, 1)
+
+    def _ensure_lazy_tab_loaded(self, index: int) -> None:
+        idx = int(index)
+        section = self._tab_sections.get(idx, "")
+        if idx in self._tab_loaded:
+            if section:
+                self._request_section(section)
+            return
+        builder = self._tab_builders.get(idx)
+        if not callable(builder):
+            return
+        try:
+            widget = builder()
+        except Exception:
+            widget = self._make_empty_tab("Не удалось загрузить вкладку.")
+        self._set_lazy_tab_widget(idx, widget)
+        self._tab_loaded.add(idx)
+        if section:
+            self._request_section(section)
 
     @staticmethod
     def _format_ts(ts: Any) -> str:
@@ -272,6 +352,105 @@ class ChatInfoDialog(QDialog):
         layout.addWidget(lbl)
         layout.addStretch(1)
         return tab
+
+    def _make_loading_tab(self, text: str) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        title = QLabel(text)
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#dfe7f5;font-weight:600;")
+        note = QLabel("Данные подгружаются в фоне. Интерфейс останется доступным.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8da8c4;")
+        layout.addWidget(title)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        return tab
+
+    def _make_error_tab(self, text: str, *, section: Optional[str] = None) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        title = QLabel(text)
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#ffb6bd;font-weight:600;")
+        layout.addWidget(title)
+        if section:
+            retry_btn = QPushButton("Повторить", tab)
+            retry_btn.clicked.connect(lambda: self._retry_section(section))
+            layout.addWidget(retry_btn, 0)
+        layout.addStretch(1)
+        return tab
+
+    def _retry_section(self, section: str) -> None:
+        key = str(section or "").strip().lower()
+        if not key:
+            return
+        self._section_errors.pop(key, None)
+        self._section_loaded.discard(key)
+        self._request_section(key, force=True)
+
+    def _request_section(self, section: str, *, force: bool = False) -> None:
+        key = str(section or "").strip().lower()
+        if not key:
+            return
+        if not force and (key in self._section_loaded or key in self._section_loading):
+            return
+        loader = self._callbacks.get("load_profile_section")
+        if not callable(loader):
+            self._section_loaded.add(key)
+            return
+        self._section_loading.add(key)
+        self._section_errors.pop(key, None)
+        self._refresh_section_tab(key)
+
+        def _run() -> None:
+            payload: List[Dict[str, Any]] = []
+            error = ""
+            try:
+                raw = loader(key)
+                payload = [dict(row) for row in list(raw or []) if isinstance(row, dict)]
+            except Exception as exc:
+                error = str(exc or "Не удалось загрузить данные")
+            try:
+                self._async_bus.sectionLoaded.emit(key, payload, error)
+            except Exception:
+                return
+
+        worker = threading.Thread(target=_run, daemon=True, name=f"profile-section-{key}")
+        self._section_threads[key] = worker
+        worker.start()
+
+    def _on_section_loaded(self, section: str, payload: object, error: str) -> None:
+        key = str(section or "").strip().lower()
+        self._section_loading.discard(key)
+        self._section_threads.pop(key, None)
+        if error:
+            self._section_errors[key] = str(error)
+            self._refresh_section_tab(key)
+            return
+        rows = [dict(row) for row in list(payload or []) if isinstance(row, dict)]
+        self._sections[key] = rows
+        self._section_loaded.add(key)
+        self._section_errors.pop(key, None)
+        self._refresh_section_tab(key)
+
+    def _refresh_section_tab(self, section: str) -> None:
+        key = str(section or "").strip().lower()
+        tab_index = next((idx for idx, value in self._tab_sections.items() if value == key), None)
+        if tab_index is None or int(tab_index) not in self._tab_loaded:
+            return
+        builder = self._tab_builders.get(int(tab_index))
+        if not callable(builder):
+            return
+        try:
+            widget = builder()
+        except Exception:
+            widget = self._make_error_tab("Не удалось обновить вкладку.", section=key)
+        self._set_lazy_tab_widget(int(tab_index), widget)
 
     def _build_overview_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -325,103 +504,515 @@ class ChatInfoDialog(QDialog):
         layout.addStretch(1)
         return tab
 
-    def _create_cards_tab(self, rows: List[Dict[str, Any]], *, mode: str) -> QWidget:
-        if not rows:
-            if mode == "media":
-                return self._make_empty_tab("Медиа из этого чата появится здесь после загрузки истории.")
-            if mode == "files":
-                return self._make_empty_tab("Файлы из этого чата появятся здесь после загрузки истории.")
-            if mode == "links":
-                return self._make_empty_tab("Ссылки из сообщений этого чата появятся здесь.")
-            return self._make_empty_tab("Пока нет данных.")
+    @staticmethod
+    def _month_group_label(ts: Any) -> str:
+        try:
+            value = int(ts or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            return "Без даты"
+        try:
+            dt = datetime.fromtimestamp(value)
+            months = (
+                "январь",
+                "февраль",
+                "март",
+                "апрель",
+                "май",
+                "июнь",
+                "июль",
+                "август",
+                "сентябрь",
+                "октябрь",
+                "ноябрь",
+                "декабрь",
+            )
+            month = months[max(1, min(12, int(dt.month))) - 1]
+            return f"{month.capitalize()} {int(dt.year)}"
+        except Exception:
+            return "Без даты"
 
-        container = QWidget(self)
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+    @staticmethod
+    def _drop_duplicates(rows: List[Dict[str, Any]], *, mode: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
         for row in rows:
-            card = QFrame(container)
-            card.setStyleSheet("QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(0, 6, 0, 10)
-            card_layout.setSpacing(6)
-
+            if not isinstance(row, dict):
+                continue
             if mode == "links":
-                url = str(row.get("url") or "")
-                top = QLabel(url)
-                top.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                top.setStyleSheet("color:#59b7ff;font-weight:600;")
-                card_layout.addWidget(top)
-                context = str(row.get("context") or "").strip()
-                if context:
-                    context_lbl = QLabel(context)
-                    context_lbl.setWordWrap(True)
-                    context_lbl.setStyleSheet("color:#b5c7dc;")
-                    card_layout.addWidget(context_lbl)
-                meta = QLabel(
-                    f"Сообщение #{int(row.get('id') or 0)} • {self._format_ts(row.get('date'))}"
-                )
-                meta.setStyleSheet("color:#8da8c4;font-size:11px;")
-                card_layout.addWidget(meta)
-                actions = QHBoxLayout()
-                open_btn = QPushButton("Открыть ссылку", card)
-                open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl(url)))
-                actions.addWidget(open_btn, 0)
-                actions.addStretch(1)
-                card_layout.addLayout(actions)
+                url = str(row.get("url") or "").strip().lower()
+                key = f"url:{url}" if url else f"mid:{int(row.get('id') or 0)}"
             else:
-                file_name = str(row.get("file_name") or "").strip()
-                msg_text = str(row.get("text") or "").strip()
-                title = file_name or msg_text or f"Сообщение #{int(row.get('id') or 0)}"
-                top = QLabel(title)
-                top.setWordWrap(True)
-                top.setStyleSheet("color:#f4f7ff;font-weight:600;")
-                card_layout.addWidget(top)
+                path = str(row.get("file_path") or "").strip().lower()
+                file_name = str(row.get("file_name") or "").strip().lower()
+                file_size = int(row.get("file_size") or 0)
+                if path:
+                    key = f"path:{path}"
+                elif file_name:
+                    key = f"name:{file_name}|{file_size}"
+                else:
+                    key = f"mid:{int(row.get('id') or 0)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(row))
+        return out
 
-                typ = str(row.get("type") or "file")
-                meta_parts = [
-                    f"#{int(row.get('id') or 0)}",
-                    typ,
-                    self._format_ts(row.get("date")),
-                    self._format_size(row.get("file_size")),
+    @staticmethod
+    def _clear_layout(layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            child = item.widget()
+            if child is not None:
+                child.setParent(None)
+                child.deleteLater()
+
+    def _section_row_matches(self, row: Dict[str, Any], mode: str, query: str) -> bool:
+        q = str(query or "").strip().lower()
+        if not q:
+            return True
+        fields: List[str] = []
+        if mode == "links":
+            fields.extend([str(row.get("url") or ""), str(row.get("context") or "")])
+        else:
+            fields.extend(
+                [
+                    str(row.get("file_name") or ""),
+                    str(row.get("text") or ""),
+                    str(row.get("type") or ""),
+                    str(row.get("mime") or ""),
+                    str(row.get("file_path") or ""),
                 ]
-                meta = QLabel(" • ".join([part for part in meta_parts if part]))
-                meta.setStyleSheet("color:#8da8c4;font-size:11px;")
-                card_layout.addWidget(meta)
-                file_path = str(row.get("file_path") or "").strip()
-                if file_path:
-                    path_lbl = QLabel(file_path)
-                    path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                    path_lbl.setStyleSheet("color:#9fb3cc;font-size:11px;")
-                    card_layout.addWidget(path_lbl)
-                    actions = QHBoxLayout()
-                    open_btn = QPushButton("Открыть файл", card)
-                    open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl.fromLocalFile(file_path)))
-                    actions.addWidget(open_btn, 0)
-                    actions.addStretch(1)
-                    card_layout.addLayout(actions)
-            layout.addWidget(card)
-        layout.addStretch(1)
+            )
+        haystack = " ".join(fields).lower()
+        return q in haystack
 
-        scroll = QScrollArea(self)
+    def _build_section_preview(self, row: Dict[str, Any], *, mode: str, parent: QWidget) -> QLabel:
+        preview = QLabel(parent)
+        preview.setFixedSize(56, 56)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setStyleSheet(
+            "background-color:rgba(255,255,255,0.06);"
+            "border:1px solid rgba(255,255,255,0.08);"
+            "border-radius:8px;"
+            "color:#9fc0de;"
+            "font-size:12px;"
+            "font-weight:700;"
+        )
+        if mode == "links":
+            preview.setText("URL")
+            return preview
+        kind = str(row.get("type") or "").strip().lower()
+        fpath = str(row.get("file_path") or "").strip()
+        if mode == "media" and fpath and os.path.isfile(fpath):
+            pix = QPixmap(fpath)
+            if not pix.isNull():
+                preview.setPixmap(
+                    pix.scaled(
+                        preview.size(),
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                preview.setStyleSheet("border-radius:8px;")
+                return preview
+        if mode == "files":
+            ext = os.path.splitext(str(row.get("file_name") or "").strip())[1].lstrip(".").upper()
+            preview.setText(ext[:4] if ext else "FILE")
+            return preview
+        label = "MEDIA"
+        if kind in {"video", "video_note"}:
+            label = "VIDEO"
+        elif kind in {"animation", "gif"}:
+            label = "GIF"
+        elif kind in {"image", "photo"}:
+            label = "IMG"
+        elif kind == "sticker":
+            label = "STK"
+        preview.setText(label)
+        return preview
+
+    def _add_section_item(self, layout: QVBoxLayout, row: Dict[str, Any], *, mode: str) -> None:
+        card = QFrame(self)
+        card.setStyleSheet(
+            "QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}"
+            "QPushButton{padding:5px 8px;border-radius:8px;}"
+        )
+        root = QVBoxLayout(card)
+        root.setContentsMargins(0, 6, 0, 8)
+        root.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(10)
+        head.addWidget(self._build_section_preview(row, mode=mode, parent=card), 0)
+
+        content = QVBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(3)
+
+        if mode == "links":
+            title_text = str(row.get("url") or "Ссылка")
+            subtitle_text = str(row.get("context") or "").strip()
+        else:
+            title_text = str(row.get("file_name") or row.get("text") or "").strip()
+            if not title_text:
+                title_text = f"Сообщение #{int(row.get('id') or 0)}"
+            subtitle_text = str(row.get("text") or "").strip()
+        title = QLabel(title_text)
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#dff0ff;font-size:13px;font-weight:600;background:transparent;")
+        content.addWidget(title)
+
+        if subtitle_text and mode != "links":
+            subtitle = QLabel(subtitle_text[:180])
+            subtitle.setWordWrap(True)
+            subtitle.setStyleSheet("color:#9eb7d4;font-size:12px;background:transparent;")
+            content.addWidget(subtitle)
+        elif subtitle_text and mode == "links":
+            subtitle = QLabel(subtitle_text[:180])
+            subtitle.setWordWrap(True)
+            subtitle.setStyleSheet("color:#8ca8c8;font-size:11px;background:transparent;")
+            content.addWidget(subtitle)
+
+        meta_parts = [self._format_ts(row.get("date")), f"#{int(row.get('id') or 0)}"]
+        if mode != "links":
+            kind = str(row.get("type") or "").strip()
+            if kind:
+                meta_parts.append(kind)
+            size_text = self._format_size(row.get("file_size"))
+            if size_text != "n/a":
+                meta_parts.append(size_text)
+        meta = QLabel(" • ".join([part for part in meta_parts if part]))
+        meta.setStyleSheet("color:#7f99b7;font-size:11px;background:transparent;")
+        content.addWidget(meta)
+        head.addLayout(content, 1)
+        root.addLayout(head)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(66, 0, 0, 0)
+        actions.setSpacing(6)
+        if mode == "links":
+            url = str(row.get("url") or "").strip()
+            open_btn = QPushButton("Открыть ссылку", card)
+            open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl(url)))
+            actions.addWidget(open_btn, 0)
+        else:
+            fpath = str(row.get("file_path") or "").strip()
+            if fpath:
+                open_btn = QPushButton("Открыть файл", card)
+                open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl.fromLocalFile(fpath)))
+                actions.addWidget(open_btn, 0)
+        jump_btn = QPushButton("К сообщению", card)
+        try:
+            msg_id = int(row.get("id") or 0)
+        except Exception:
+            msg_id = 0
+        jump_btn.setEnabled(msg_id > 0)
+        if msg_id > 0:
+            jump_btn.clicked.connect(partial(self._call_with_message, "jump_to_message", msg_id))
+        actions.addWidget(jump_btn, 0)
+        actions.addStretch(1)
+        root.addLayout(actions)
+        layout.addWidget(card, 0)
+
+    def _call_with_message(self, key: str, message_id: int) -> None:
+        cb = self._callbacks.get(key)
+        if not callable(cb):
+            return
+        try:
+            cb(int(message_id))
+        except Exception:
+            pass
+
+    def _build_media_tile(self, row: Dict[str, Any], parent: QWidget) -> QWidget:
+        tile = QFrame(parent)
+        tile.setStyleSheet(
+            "QFrame{background-color:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;}"
+            "QPushButton{padding:4px 7px;border-radius:7px;font-size:11px;}"
+        )
+        layout = QVBoxLayout(tile)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+
+        preview = QLabel(tile)
+        preview.setFixedSize(96, 96)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setStyleSheet("background:#0f1f30;border-radius:8px;")
+        fpath = str(row.get("file_path") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}:
+                preview.setText("IMG")
+                self._queue_media_preview(preview, fpath)
+            else:
+                preview.setText("MEDIA")
+        else:
+            kind = str(row.get("type") or "media").strip().upper()
+            preview.setText(kind[:5])
+        layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
+
+        stamp = QLabel(self._format_ts(row.get("date")))
+        stamp.setStyleSheet("color:#7d97b5;font-size:11px;")
+        stamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(stamp, 0)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(4)
+        if fpath:
+            open_btn = QPushButton("Откр.", tile)
+            open_btn.clicked.connect(partial(QDesktopServices.openUrl, QUrl.fromLocalFile(fpath)))
+            actions.addWidget(open_btn, 0)
+        try:
+            msg_id = int(row.get("id") or 0)
+        except Exception:
+            msg_id = 0
+        jump_btn = QPushButton("К сообщ.", tile)
+        jump_btn.setEnabled(msg_id > 0)
+        if msg_id > 0:
+            jump_btn.clicked.connect(partial(self._call_with_message, "jump_to_message", msg_id))
+        actions.addWidget(jump_btn, 0)
+        layout.addLayout(actions)
+        return tile
+
+    @staticmethod
+    def _decode_preview_image(path: str, size: QSize) -> Optional[QImage]:
+        try:
+            if not path or not os.path.isfile(path):
+                return None
+            width = max(48, int(size.width() or 0))
+            height = max(48, int(size.height() or 0))
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            reader.setScaledSize(QSize(width, height))
+            img = reader.read()
+            if img.isNull():
+                return None
+            return img
+        except Exception:
+            return None
+
+    def _start_media_preview_pass(self) -> None:
+        self._media_preview_generation += 1
+        self._media_preview_queue = []
+        self._media_preview_targets = {}
+        self._media_preview_inflight.setdefault(self._media_preview_generation, 0)
+
+    def _queue_media_preview(self, preview: QLabel, fpath: str) -> None:
+        if preview is None or not fpath:
+            return
+        size = preview.size()
+        cache_key = f"{fpath}|{int(size.width())}x{int(size.height())}"
+        cached = self._media_preview_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            preview.setPixmap(cached)
+            preview.setText("")
+            return
+        generation = int(self._media_preview_generation)
+        self._media_preview_request_seq += 1
+        token = f"{generation}:{self._media_preview_request_seq}"
+        preview.setProperty("media_preview_token", token)
+        self._media_preview_targets[token] = preview
+        self._media_preview_queue.append(
+            {
+                "token": token,
+                "generation": generation,
+                "path": fpath,
+                "cache_key": cache_key,
+                "size": QSize(size),
+            }
+        )
+
+    def _pump_media_preview_queue(self) -> None:
+        current_generation = int(self._media_preview_generation)
+        inflight = int(self._media_preview_inflight.get(current_generation, 0) or 0)
+        while self._media_preview_queue and inflight < int(self._media_preview_batch_size):
+            job = dict(self._media_preview_queue.pop(0))
+            generation = int(job.get("generation") or 0)
+            if generation != current_generation:
+                continue
+            token = str(job.get("token") or "")
+            fpath = str(job.get("path") or "")
+            cache_key = str(job.get("cache_key") or "")
+            size = job.get("size")
+            if not token or not fpath or not isinstance(size, QSize):
+                continue
+            self._media_preview_inflight[current_generation] = inflight + 1
+            inflight += 1
+
+            def _run(token_value: str, generation_value: int, path_value: str, cache_key_value: str, size_value: QSize) -> None:
+                image = self._decode_preview_image(path_value, size_value)
+                try:
+                    self._async_bus.previewLoaded.emit(token_value, generation_value, cache_key_value, image)
+                except Exception:
+                    return
+
+            threading.Thread(
+                target=_run,
+                args=(token, generation, fpath, cache_key, QSize(size)),
+                daemon=True,
+                name=f"profile-preview-{generation}-{token.split(':')[-1]}",
+            ).start()
+
+    @Slot(str, int, str, object)
+    def _on_preview_loaded(self, token: str, generation: int, cache_key: str, image: object) -> None:
+        gen = int(generation or 0)
+        inflight = max(0, int(self._media_preview_inflight.get(gen, 0) or 0) - 1)
+        if inflight:
+            self._media_preview_inflight[gen] = inflight
+        else:
+            self._media_preview_inflight.pop(gen, None)
+
+        preview = self._media_preview_targets.pop(str(token or ""), None)
+        if isinstance(image, QImage) and not image.isNull():
+            pix = QPixmap.fromImage(image)
+            if not pix.isNull():
+                self._media_preview_cache[str(cache_key or "")] = pix
+                if preview is not None and preview.parent() is not None:
+                    current_token = str(preview.property("media_preview_token") or "")
+                    if current_token == str(token or ""):
+                        preview.setPixmap(
+                            pix.scaled(
+                                preview.size(),
+                                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
+                        )
+                        preview.setText("")
+        if gen == int(self._media_preview_generation):
+            QTimer.singleShot(0, self._pump_media_preview_queue)
+
+    def _create_cards_tab(self, rows: List[Dict[str, Any]], *, mode: str) -> QWidget:
+        deduped = self._drop_duplicates(rows, mode=mode)
+        deduped.sort(key=lambda item: (int(item.get("date") or 0), int(item.get("id") or 0)), reverse=True)
+        initial_limit = 15 if mode == "media" else 36
+        show_more_step = 15 if mode == "media" else 72
+        state = {"limit": initial_limit}
+
+        tab = QWidget(self)
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        search = QLineEdit(tab)
+        if mode == "media":
+            search.setPlaceholderText("Поиск по медиа...")
+        elif mode == "files":
+            search.setPlaceholderText("Поиск по файлам...")
+        else:
+            search.setPlaceholderText("Поиск по ссылкам...")
+        root.addWidget(search, 0)
+
+        scroll = QScrollArea(tab)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        root.addWidget(scroll, 1)
+
+        container = QWidget(scroll)
+        items_layout = QVBoxLayout(container)
+        items_layout.setContentsMargins(0, 0, 0, 0)
+        items_layout.setSpacing(2)
         scroll.setWidget(container)
-        return scroll
+
+        def _render(query: str = "") -> None:
+            self._clear_layout(items_layout)
+            if not deduped:
+                items_layout.addWidget(self._make_empty_tab("Пока нет данных."), 0)
+                return
+            filtered = [row for row in deduped if self._section_row_matches(row, mode, query)]
+            if not filtered:
+                empty = QLabel("Ничего не найдено")
+                empty.setStyleSheet("color:#8da8c4;padding:8px 4px;")
+                items_layout.addWidget(empty, 0)
+                items_layout.addStretch(1)
+                return
+            visible_limit = max(6, int(state.get("limit", initial_limit) or initial_limit))
+            visible_rows = filtered[:visible_limit]
+            if mode == "media":
+                self._start_media_preview_pass()
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                for row in visible_rows:
+                    grouped.setdefault(self._month_group_label(row.get("date")), []).append(row)
+                for group_name, group_rows in grouped.items():
+                    header = QLabel(group_name)
+                    header.setStyleSheet("color:#dfefff;font-weight:700;padding:8px 2px 2px 2px;")
+                    items_layout.addWidget(header, 0)
+                    grid_wrap = QWidget(container)
+                    grid = QGridLayout(grid_wrap)
+                    grid.setContentsMargins(0, 0, 0, 0)
+                    grid.setHorizontalSpacing(8)
+                    grid.setVerticalSpacing(8)
+                    columns = 3
+                    for idx, row in enumerate(group_rows):
+                        r = idx // columns
+                        c = idx % columns
+                        grid.addWidget(self._build_media_tile(row, grid_wrap), r, c)
+                    items_layout.addWidget(grid_wrap, 0)
+                if len(filtered) > len(visible_rows):
+                    more_btn = QPushButton(f"Показать ещё ({len(filtered) - len(visible_rows)})", container)
+                    more_btn.clicked.connect(lambda: _show_more(search.text()))
+                    items_layout.addWidget(more_btn, 0)
+                items_layout.addStretch(1)
+                QTimer.singleShot(0, self._pump_media_preview_queue)
+                return
+            prev_group = ""
+            for row in visible_rows:
+                group = self._month_group_label(row.get("date"))
+                if group != prev_group:
+                    prev_group = group
+                    header = QLabel(group)
+                    header.setStyleSheet("color:#dfefff;font-weight:700;padding:8px 2px 2px 2px;")
+                    items_layout.addWidget(header, 0)
+                self._add_section_item(items_layout, row, mode=mode)
+            if len(filtered) > len(visible_rows):
+                more_btn = QPushButton(f"Показать ещё ({len(filtered) - len(visible_rows)})", container)
+                more_btn.clicked.connect(lambda: _show_more(search.text()))
+                items_layout.addWidget(more_btn, 0)
+            items_layout.addStretch(1)
+
+        def _show_more(query: str) -> None:
+            state["limit"] = int(state.get("limit", initial_limit) or initial_limit) + show_more_step
+            _render(query)
+
+        def _on_search_changed(text: str) -> None:
+            state["limit"] = initial_limit
+            _render(text)
+
+        search.textChanged.connect(_on_search_changed)
+        _render("")
+        return tab
 
     def _build_media_tab(self) -> QWidget:
+        if "media" in self._section_errors:
+            return self._make_error_tab(str(self._section_errors.get("media") or "Не удалось загрузить медиа."), section="media")
+        if "media" in self._section_loading or "media" not in self._section_loaded:
+            return self._make_loading_tab("Загружаю медиа…")
         rows = [row for row in list(self._sections.get("media") or []) if isinstance(row, dict)]
         return self._create_cards_tab(rows, mode="media")
 
     def _build_files_tab(self) -> QWidget:
+        if "files" in self._section_errors:
+            return self._make_error_tab(str(self._section_errors.get("files") or "Не удалось загрузить файлы."), section="files")
+        if "files" in self._section_loading or "files" not in self._section_loaded:
+            return self._make_loading_tab("Загружаю файлы…")
         rows = [row for row in list(self._sections.get("files") or []) if isinstance(row, dict)]
         return self._create_cards_tab(rows, mode="files")
 
     def _build_links_tab(self) -> QWidget:
+        if "links" in self._section_errors:
+            return self._make_error_tab(str(self._section_errors.get("links") or "Не удалось загрузить ссылки."), section="links")
+        if "links" in self._section_loading or "links" not in self._section_loaded:
+            return self._make_loading_tab("Загружаю ссылки…")
         rows = [row for row in list(self._sections.get("links") or []) if isinstance(row, dict)]
         return self._create_cards_tab(rows, mode="links")
 
     def _build_members_tab(self) -> QWidget:
+        if "members" in self._section_errors:
+            return self._make_error_tab(str(self._section_errors.get("members") or "Не удалось загрузить участников."), section="members")
+        if "members" in self._section_loading or "members" not in self._section_loaded:
+            return self._make_loading_tab("Загружаю участников…")
         members = [row for row in list(self._sections.get("members") or []) if isinstance(row, dict)]
         if not members:
             return self._make_empty_tab("Список участников появится после синхронизации чата.")
@@ -779,6 +1370,19 @@ class ChatStatisticsDialog(QDialog):
             root.addWidget(buttons)
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    @staticmethod
+    def _format_ts(ts: Any) -> str:
+        try:
+            value = int(ts or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            return "неизвестно"
+        try:
+            return datetime.fromtimestamp(value).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(value)
 
     def _stats_tab(self) -> tuple[QScrollArea, QVBoxLayout]:
         scroll = QScrollArea(self)
