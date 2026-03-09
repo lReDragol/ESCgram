@@ -1,5 +1,5 @@
 #define AppName "ESCgram"
-#define AppVersion "0.2.11"
+#define AppVersion "0.2.12"
 #define AppPublisher "Drago"
 #define AppExeName "ESCgram.exe"
 #define AppUninstallKey "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A1B5F40B-6E07-4C2F-9C2C-1B89B85E3F6B}_is1"

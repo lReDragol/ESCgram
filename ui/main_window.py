@@ -84,6 +84,7 @@ from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
 from utils.logging_setup import configure_logging, current_log_dir, current_log_files
 from ui.message_feed import MessageFeedMixin
+import ui.message_widgets as message_widgets_module
 from ui.message_widgets import (
     DEFAULT_BUBBLE_THEME,
     ChatItemWidget,
@@ -91,7 +92,6 @@ from ui.message_widgets import (
     ReplyPreviewWidget,
     TextMessageWidget,
     set_bubble_theme,
-    set_custom_emoji_provider,
 )
 from ui.media_viewer import MediaViewerDialog
 from ui.media_picker import MediaPickerPopup
@@ -173,7 +173,12 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         self.server = server
         self.tg = tg_adapter
-        set_custom_emoji_provider(self.tg)
+        try:
+            custom_emoji_provider = getattr(message_widgets_module, "set_custom_emoji_provider", None)
+            if callable(custom_emoji_provider):
+                custom_emoji_provider(self.tg)
+        except Exception:
+            pass
         self._prepend_local_ffmpeg_to_path()
 
         # конфиг и фичи
