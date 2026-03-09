@@ -21,7 +21,7 @@ def _acquire_single_instance_lock() -> Optional[QLockFile]:
         return None
     lock = QLockFile(lock_path)
     # Auto-recover if previous process crashed and left stale lock file.
-    lock.setStaleLockTime(120000)
+    lock.setStaleLockTime(15000)
     try:
         if lock.tryLock(0):
             return lock

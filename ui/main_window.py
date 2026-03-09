@@ -4442,12 +4442,30 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     # ------------------------------------------------------------------ #
     # History loading
 
-    def _stop_history_worker(self) -> None:
-        if self._hist_worker and self._hist_thread:
+    def _stop_history_worker(self, *, wait_ms: int = 900, force_terminate: bool = False) -> None:
+        thread = getattr(self, "_hist_thread", None)
+        worker = getattr(self, "_hist_worker", None)
+        if worker is not None and hasattr(worker, "stop"):
             try:
-                self._hist_worker.stop()
-                self._hist_thread.quit()
-                self._hist_thread.wait(900)
+                worker.stop()
+            except Exception:
+                pass
+        if thread is not None:
+            try:
+                if _qt_is_valid(thread) and thread.isRunning():
+                    thread.quit()
+                    if not thread.wait(max(0, int(wait_ms or 0))):
+                        log.warning(
+                            "History thread did not stop within %sms",
+                            int(wait_ms or 0),
+                        )
+                        if force_terminate:
+                            try:
+                                thread.terminate()
+                                thread.wait(1500)
+                                log.warning("History thread was force-terminated during shutdown")
+                            except Exception:
+                                log.exception("Failed to force-terminate history thread")
             except Exception:
                 pass
         self._hist_worker = None
@@ -7538,21 +7556,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._dialogs_threads.clear()
         self._dialogs_stream_active = False
 
-        hist_worker = getattr(self, "_hist_worker", None)
-        if hist_worker is not None and hasattr(hist_worker, "stop"):
-            try:
-                hist_worker.stop()
-            except Exception:
-                pass
-        hist_thread = getattr(self, "_hist_thread", None)
-        if _thread_is_running(hist_thread):
-            try:
-                hist_thread.quit()
-                hist_thread.wait(1500)
-            except Exception:
-                pass
-        self._hist_worker = None
-        self._hist_thread = None
+        self._stop_history_worker(wait_ms=10000, force_terminate=True)
         self._loading_history = False
         self._stop_chat_profile_loader()
 
