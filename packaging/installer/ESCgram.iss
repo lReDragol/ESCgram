@@ -1,5 +1,5 @@
 #define AppName "ESCgram"
-#define AppVersion "0.2.12"
+#define AppVersion "0.2.13"
 #define AppPublisher "Drago"
 #define AppExeName "ESCgram.exe"
 #define AppUninstallKey "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A1B5F40B-6E07-4C2F-9C2C-1B89B85E3F6B}_is1"
@@ -37,6 +37,8 @@ const
   InstallModeUpdate = 0;
   InstallModeUninstall = 1;
   InstallModeAnotherDir = 2;
+  PublicTelegramApiId = '2040';
+  PublicTelegramApiHash = 'b18441a1ff607e10a989891a5462e627';
 
 var
   ExistingInstallPage: TWizardPage;
@@ -49,10 +51,14 @@ var
   ExistingUninstallCmd: String;
   DataDirPage: TInputDirWizardPage;
   ApiPage: TInputQueryWizardPage;
+  ApiPublicCheck: TNewCheckBox;
 
 function _JsonEscape(const S: String): String; forward;
+function _JsonUnescape(const S: String): String; forward;
 function _GetSelectedInstallMode: Integer; forward;
 function _RunExistingUninstaller: Boolean; forward;
+procedure _ApplyPublicTelegramApiSelection; forward;
+procedure _OnApiPublicCheckClick(Sender: TObject); forward;
 
 function _FindCharFrom(const S: String; const Ch: Char; const StartPos: Integer): Integer;
 var
@@ -70,10 +76,37 @@ begin
 end;
 
 function _ReadBootstrapDataDir: String;
+var
+  BootstrapPath: String;
+  Content: String;
+  KeyToken: String;
+  KeyPos: Integer;
+  ValueStart: Integer;
+  ValueEnd: Integer;
+  RawValue: String;
 begin
-  // Keep installer parser simple and robust across Inno compiler variants.
-  // Data dir for upgrades is passed explicitly via /DATADIR by auto-update flow.
   Result := '';
+  BootstrapPath := ExpandConstant('{userappdata}\\DragoGUI\\bootstrap.json');
+  if not FileExists(BootstrapPath) then
+    Exit;
+  if not LoadStringFromFile(BootstrapPath, Content) then
+    Exit;
+
+  KeyToken := '"data_dir"';
+  KeyPos := Pos(KeyToken, Content);
+  if KeyPos <= 0 then
+    Exit;
+  ValueStart := _FindCharFrom(Content, '"', KeyPos + Length(KeyToken));
+  if ValueStart <= 0 then
+    Exit;
+  ValueEnd := _FindCharFrom(Content, '"', ValueStart + 1);
+  while (ValueEnd > 0) and (Content[ValueEnd - 1] = '\') do
+    ValueEnd := _FindCharFrom(Content, '"', ValueEnd + 1);
+  if ValueEnd <= ValueStart then
+    Exit;
+
+  RawValue := Copy(Content, ValueStart + 1, ValueEnd - ValueStart - 1);
+  Result := Trim(_JsonUnescape(RawValue));
 end;
 
 function _TryReadInstalledString(const ValueName: String; var Value: String): Boolean;
@@ -164,6 +197,30 @@ begin
   SaveStringToFile(BootstrapPath, Payload, False);
 end;
 
+procedure _ApplyPublicTelegramApiSelection;
+begin
+  if (ApiPage = nil) or (ApiPublicCheck = nil) then
+    Exit;
+  if ApiPublicCheck.Checked then
+  begin
+    ApiPage.Values[0] := PublicTelegramApiId;
+    ApiPage.Values[1] := PublicTelegramApiHash;
+    ApiPage.Edits[0].ReadOnly := True;
+    ApiPage.Edits[1].ReadOnly := True;
+    Exit;
+  end;
+  ApiPage.Values[0] := '';
+  ApiPage.Values[1] := '';
+  ApiPage.Edits[0].ReadOnly := False;
+  ApiPage.Edits[1].ReadOnly := False;
+  ApiPage.Edits[0].SetFocus;
+end;
+
+procedure _OnApiPublicCheckClick(Sender: TObject);
+begin
+  _ApplyPublicTelegramApiSelection;
+end;
+
 procedure InitializeWizard;
 var
   DefaultDataDir: String;
@@ -245,6 +302,16 @@ begin
   );
   ApiPage.Add('API ID:', False);
   ApiPage.Add('API Hash:', True);
+
+  ApiPublicCheck := TNewCheckBox.Create(ApiPage);
+  ApiPublicCheck.Parent := ApiPage.Surface;
+  ApiPublicCheck.Left := 0;
+  ApiPublicCheck.Top := ApiPage.Edits[1].Top + ApiPage.Edits[1].Height + ScaleY(8);
+  ApiPublicCheck.Width := ApiPage.SurfaceWidth;
+  ApiPublicCheck.Caption := 'Использовать публичные официальные Telegram API (по умолчанию)';
+  ApiPublicCheck.Checked := True;
+  ApiPublicCheck.OnClick := @_OnApiPublicCheckClick;
+  _ApplyPublicTelegramApiSelection;
 end;
 
 function _GetSelectedInstallMode: Integer;
@@ -312,6 +379,13 @@ begin
   Result := S;
   StringChangeEx(Result, '\', '\\', True);
   StringChangeEx(Result, '"', '\"', True);
+end;
+
+function _JsonUnescape(const S: String): String;
+begin
+  Result := S;
+  StringChangeEx(Result, '\"', '"', True);
+  StringChangeEx(Result, '\\', '\', True);
 end;
 
 function _RunExistingUninstaller: Boolean;
@@ -412,6 +486,8 @@ begin
   if PageID = ExistingInstallPage.ID then
     Result := not ExistingInstallFound
   else if PageID = wpSelectDir then
+    Result := ExistingInstallFound and (_GetSelectedInstallMode = InstallModeUpdate)
+  else if PageID = DataDirPage.ID then
     Result := ExistingInstallFound and (_GetSelectedInstallMode = InstallModeUpdate)
   else if PageID = ApiPage.ID then
     Result := _LooksLikeUpgradeInstall or _ConfigExistsForSelectedDataDir;

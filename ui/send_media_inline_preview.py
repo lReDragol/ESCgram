@@ -209,9 +209,23 @@ class InlineMediaPreviewBar(QFrame):
         self.lbl_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         StyleManager.instance().bind_stylesheet(self.lbl_time, "main.media_preview_time")
 
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(int(round(_media_volume_ratio() * 100.0)))
+        self.volume_slider.setFixedWidth(110)
+        self.volume_slider.setToolTip("Громкость")
+        self.volume_slider.setStyleSheet(
+            "QSlider::groove:horizontal{background-color:rgba(255,255,255,0.08);height:4px;border-radius:2px;}"
+            "QSlider::sub-page:horizontal{background-color:rgba(141,213,255,0.72);border-radius:2px;}"
+            "QSlider::handle:horizontal{background-color:#eef8ff;border:1px solid rgba(141,213,255,0.70);"
+            "width:12px;height:12px;margin:-5px 0;border-radius:6px;}"
+        )
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+
         controls.addWidget(self.btn_play)
         controls.addWidget(self.slider, 1)
         controls.addWidget(self.lbl_time)
+        controls.addWidget(self.volume_slider, 0)
         layout.addWidget(controls_frame)
 
         actions = QHBoxLayout()
@@ -475,6 +489,16 @@ class InlineMediaPreviewBar(QFrame):
 
     def _update_time_label(self, pos_ms: int, dur_ms: int) -> None:
         self.lbl_time.setText(f"{_fmt_time(pos_ms)} / {_fmt_time(dur_ms)}")
+
+    @Slot(int)
+    def _on_volume_changed(self, value: int) -> None:
+        audio = self._audio
+        if audio is None:
+            return
+        try:
+            audio.setVolume(max(0.0, min(1.0, float(value) / 100.0)))
+        except Exception:
+            pass
 
     @Slot(object, str)
     def _on_player_error(self, error: object, error_str: str) -> None:

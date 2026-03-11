@@ -8,13 +8,14 @@ import json
 import os
 import re
 import shutil
+import threading
 from urllib.parse import quote as _url_quote, unquote as _url_unquote
 from html import escape
 from typing import Optional, Dict, Any, Callable, List, Sequence, Tuple
 from weakref import WeakSet
 from utils import app_paths
 
-from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot, QTimer
+from PySide6.QtCore import Qt, QUrl, Signal, QPointF, QRectF, QSize, QThread, Slot, QTimer, QObject
 from PySide6.QtGui import QDesktopServices, QPainter, QColor, QMouseEvent, QPainterPath, QPen, QLinearGradient
 from PySide6.QtWidgets import (
     QApplication,
@@ -73,6 +74,107 @@ def _style_sheet(key: str, default: str, mapping: Optional[Dict[str, Any]] = Non
 
 def _bubble_radius() -> int:
     return int(_STYLE_MGR.metric("message_widgets.metrics.body_radius", 14) or 14)
+
+
+class _CustomEmojiBus(QObject):
+    resolved = Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__(None)
+
+
+_CUSTOM_EMOJI_PROVIDER: Any = None
+_CUSTOM_EMOJI_BUS = _CustomEmojiBus()
+_CUSTOM_EMOJI_LOCK = threading.Lock()
+_CUSTOM_EMOJI_CACHE: Dict[int, Dict[str, Any]] = {}
+_CUSTOM_EMOJI_PENDING: set[int] = set()
+_MESSAGE_WIDGET_THREADS: set[QThread] = set()
+
+
+def set_custom_emoji_provider(provider: Any) -> None:
+    global _CUSTOM_EMOJI_PROVIDER
+    _CUSTOM_EMOJI_PROVIDER = provider
+
+
+def _custom_emoji_cache_dir() -> str:
+    root = app_paths.media_dir() / "custom_emoji_cache" / "thumbs"
+    root.mkdir(parents=True, exist_ok=True)
+    return str(root)
+
+
+def _custom_emoji_path(custom_id: int, ext: str) -> str:
+    safe_ext = str(ext or ".webp").strip() or ".webp"
+    if not safe_ext.startswith("."):
+        safe_ext = f".{safe_ext}"
+    return os.path.join(_custom_emoji_cache_dir(), f"{int(custom_id)}{safe_ext}")
+
+
+def _custom_emoji_asset(custom_id: int) -> Dict[str, Any]:
+    with _CUSTOM_EMOJI_LOCK:
+        return dict(_CUSTOM_EMOJI_CACHE.get(int(custom_id), {}))
+
+
+def _cache_custom_emoji_asset(custom_id: int, payload: Dict[str, Any]) -> None:
+    data = dict(payload or {})
+    path = str(data.get("path") or "").strip()
+    if path:
+        data["url"] = QUrl.fromLocalFile(path).toString()
+    with _CUSTOM_EMOJI_LOCK:
+        _CUSTOM_EMOJI_CACHE[int(custom_id)] = data
+
+
+def _queue_custom_emoji_fetch(custom_id: int) -> None:
+    cid = int(custom_id or 0)
+    if cid <= 0:
+        return
+    provider = _CUSTOM_EMOJI_PROVIDER
+    if provider is None or not hasattr(provider, "get_custom_emoji_items_sync"):
+        return
+    with _CUSTOM_EMOJI_LOCK:
+        cached = _CUSTOM_EMOJI_CACHE.get(cid)
+        if cached and str(cached.get("path") or "").strip():
+            return
+        if cid in _CUSTOM_EMOJI_PENDING:
+            return
+        _CUSTOM_EMOJI_PENDING.add(cid)
+
+    def _run() -> None:
+        payload: Dict[str, Any] = {"custom_emoji_id": cid}
+        try:
+            rows = list(provider.get_custom_emoji_items_sync([cid], timeout=12.0) or [])
+        except Exception:
+            rows = []
+        if rows:
+            item = dict(rows[0] or {})
+            payload.update(item)
+            thumb_file_id = str(item.get("thumb_file_id") or item.get("file_id") or "").strip()
+            mime = str(item.get("mime") or "").strip().lower()
+            ext = ".webp"
+            if item.get("is_video"):
+                ext = ".jpg"
+            elif "png" in mime:
+                ext = ".png"
+            elif "jpg" in mime or "jpeg" in mime:
+                ext = ".jpg"
+            target = _custom_emoji_path(cid, ext)
+            if os.path.isfile(target):
+                payload["path"] = target
+            elif thumb_file_id and hasattr(provider, "download_file_id_sync"):
+                try:
+                    downloaded = provider.download_file_id_sync(thumb_file_id, file_name=target, timeout=20.0)
+                except Exception:
+                    downloaded = None
+                if downloaded and os.path.isfile(str(downloaded)):
+                    payload["path"] = str(downloaded)
+        _cache_custom_emoji_asset(cid, payload)
+        with _CUSTOM_EMOJI_LOCK:
+            _CUSTOM_EMOJI_PENDING.discard(cid)
+        try:
+            _CUSTOM_EMOJI_BUS.resolved.emit(cid)
+        except Exception:
+            return
+
+    threading.Thread(target=_run, daemon=True, name=f"custom-emoji-{cid}").start()
 
 # ---------------------------- темы пузырей -----------------------------
 
@@ -243,6 +345,7 @@ class _RichSpan:
     end: int
     url: Optional[str] = None
     language: Optional[str] = None
+    custom_emoji_id: Optional[int] = None
 
 
 def _span_overlaps(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
@@ -268,6 +371,7 @@ def _normalize_entity_spans(text: str, entities: Sequence[Dict[str, Any]]) -> Li
         url = ent.get("url")
         language = ent.get("language")
         user_id = ent.get("user_id")
+        custom_emoji_id = ent.get("custom_emoji_id")
 
         if etype == "mention":
             snippet = text[start:end].lstrip("@")
@@ -304,7 +408,20 @@ def _normalize_entity_spans(text: str, entities: Sequence[Dict[str, Any]]) -> Li
                     url = href
                 etype = "text_link"
 
-        spans.append(_RichSpan(type=etype, start=start, end=end, url=str(url) if url else None, language=str(language) if language else None))
+        try:
+            custom_id_value = int(custom_emoji_id or 0) if etype == "custom_emoji" else None
+        except Exception:
+            custom_id_value = None
+        spans.append(
+            _RichSpan(
+                type=etype,
+                start=start,
+                end=end,
+                url=str(url) if url else None,
+                language=str(language) if language else None,
+                custom_emoji_id=custom_id_value,
+            )
+        )
     return spans
 
 
@@ -406,10 +523,12 @@ def _render_entities_html(
     reveal_spoilers: bool,
     search_query: str = "",
     search_active: bool = False,
+    custom_emoji_assets: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[str, bool]:
     spans = _normalize_entity_spans(text, entities)
     spans.extend(_autolink_spans(text, spans))
     spans.extend(_search_spans(text, search_query, active=search_active))
+    assets = dict(custom_emoji_assets or {})
 
     has_spoilers = any(s.type == "spoiler" for s in spans)
 
@@ -424,9 +543,9 @@ def _render_entities_html(
         if t == "strikethrough":
             return "<s>"
         if t == "code":
-            return '<span style="font-family:Consolas,Monaco,monospace;background-color:rgba(110,120,140,0.22);padding:1px 4px;border-radius:4px;">'
+            return '<span style="font-family:\'Cascadia Mono\',\'Consolas\',\'Courier New\';font-weight:400;background-color:rgba(110,120,140,0.22);padding:1px 4px;border-radius:4px;">'
         if t == "pre":
-            return '<pre style="font-family:Consolas,Monaco,monospace;background-color:rgba(110,120,140,0.18);padding:8px 10px;border-radius:8px;white-space:pre-wrap;">'
+            return '<pre style="font-family:\'Cascadia Mono\',\'Consolas\',\'Courier New\';font-weight:400;background-color:rgba(110,120,140,0.18);padding:8px 10px;border-radius:8px;white-space:pre-wrap;">'
         if t in {"hashtag", "mention"}:
             return f'<span style="color:{ACCENT_LINK_COLOR};font-weight:600;">'
         if t == "bot_command":
@@ -494,6 +613,24 @@ def _render_entities_html(
         if idx == len(text):
             break
         ch = text[idx]
+        custom_span = next(
+            (span for span in spans if span.type == "custom_emoji" and span.start <= idx < span.end),
+            None,
+        )
+        if custom_span is not None and ch == "\uFFFC":
+            asset = assets.get(int(custom_span.custom_emoji_id or 0), {})
+            image_url = str(asset.get("url") or "").strip()
+            alt = str(asset.get("emoji") or "").strip() or "✦"
+            if image_url:
+                parts.append(
+                    f'<img src="{escape(image_url, quote=True)}" width="20" height="20" '
+                    'style="vertical-align:middle;"/>'
+                )
+            else:
+                parts.append(escape(alt))
+            continue
+        if custom_span is not None and ch in {"\u200d", "\ufe0f", "\u2060"}:
+            continue
         if ch == "\n":
             parts.append("<br/>")
         else:
@@ -523,10 +660,12 @@ class RichTextLabel(QLabel):
         self._search_active = False
         self._spoiler_phase = 0.0
         self._spoiler_flash = 0.0
+        self._custom_emoji_ids: set[int] = set()
         self._spoiler_timer = QTimer(self)
         self._spoiler_timer.setInterval(48)
         self._spoiler_timer.timeout.connect(self._tick_spoiler_animation)
         self.linkActivated.connect(self._on_link_activated)
+        _CUSTOM_EMOJI_BUS.resolved.connect(self._on_custom_emoji_resolved)
         self.set_message(text)
 
     def _on_link_activated(self, href: str) -> None:
@@ -545,9 +684,23 @@ class RichTextLabel(QLabel):
         QDesktopServices.openUrl(QUrl(str(href)))
 
     def set_message(self, text: str, *, entities: Optional[List[Dict[str, Any]]] = None) -> None:
-        normalized = str(text or "").replace("\ufffc", "✦")
+        normalized = str(text or "")
         self._raw_text = normalized
         self._entities = list(entities) if isinstance(entities, list) else None
+        self._custom_emoji_ids = set()
+        if self._entities:
+            for entity in self._entities:
+                if not isinstance(entity, dict):
+                    continue
+                if str(entity.get("type") or "").strip().lower() != "custom_emoji":
+                    continue
+                try:
+                    custom_id = int(entity.get("custom_emoji_id") or 0)
+                except Exception:
+                    custom_id = 0
+                if custom_id > 0:
+                    self._custom_emoji_ids.add(custom_id)
+                    _queue_custom_emoji_fetch(custom_id)
         self._spoilers_revealed = False
         self._render_current()
 
@@ -562,12 +715,14 @@ class RichTextLabel(QLabel):
 
     def _render_current(self) -> None:
         if self._entities or self._search_query:
+            custom_assets = {cid: _custom_emoji_asset(cid) for cid in self._custom_emoji_ids}
             html, has_spoilers = _render_entities_html(
                 self._raw_text,
                 self._entities or [],
                 reveal_spoilers=self._spoilers_revealed,
                 search_query=self._search_query,
                 search_active=self._search_active,
+                custom_emoji_assets=custom_assets,
             )
             self._has_spoilers = bool(has_spoilers)
             self.setText(html)
@@ -587,6 +742,16 @@ class RichTextLabel(QLabel):
         else:
             html = _prepare_rich_text(text)
         self.setText(html)
+
+    @Slot(int)
+    def _on_custom_emoji_resolved(self, custom_id: int) -> None:
+        try:
+            cid = int(custom_id or 0)
+        except Exception:
+            return
+        if cid <= 0 or cid not in self._custom_emoji_ids:
+            return
+        self._render_current()
 
     @Slot()
     def _tick_spoiler_animation(self) -> None:
@@ -2039,6 +2204,30 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             self._set_download_state("idle")
 
     # ---------- helpers ----------
+    def _track_bg_thread(self, thread: Optional[QThread]) -> None:
+        if thread is None:
+            return
+        try:
+            if thread not in self._bg_threads:
+                self._bg_threads.append(thread)
+        except Exception:
+            pass
+        _MESSAGE_WIDGET_THREADS.add(thread)
+        try:
+            thread.finished.connect(
+                lambda th=thread, owner=self: (
+                    owner._bg_threads.remove(th)
+                    if th in getattr(owner, "_bg_threads", [])
+                    else None
+                )
+            )
+        except Exception:
+            pass
+        try:
+            thread.finished.connect(lambda th=thread: _MESSAGE_WIDGET_THREADS.discard(th))
+        except Exception:
+            _MESSAGE_WIDGET_THREADS.discard(thread)
+
     @staticmethod
     def _normalize_kind(kind: str) -> str:
         k = (kind or "").lower()
@@ -2393,7 +2582,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             except Exception:
                 pass
 
-        thread = QThread(self)
+        thread = QThread()
         try:
             thread.setObjectName(f"voice_decode_thread_{int(self.msg_id or 0)}")
         except Exception:
@@ -2407,12 +2596,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         thread.finished.connect(thread.deleteLater)
         self._voice_decode_thread = thread
         self._voice_decode_worker = worker
-        # Register for cleanup on dispose.
-        try:
-            self._bg_threads.append(thread)
-            thread.finished.connect(lambda: self._bg_threads.remove(thread) if thread in self._bg_threads else None)
-        except Exception:
-            pass
+        self._track_bg_thread(thread)
         thread.start()
 
     def _play_audio_path(self, path: str) -> None:
@@ -3141,15 +3325,34 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
                 self.server.cancel_media_download(self.download_job_id)
             except Exception:
                 pass
-        if getattr(self, "player", None):
+        player = getattr(self, "player", None)
+        if player is not None:
             try:
-                self.player.stop()
+                player.pause()
+            except Exception:
+                pass
+            try:
+                player.setSource(QUrl())
             except Exception:
                 pass
         for th in list(self._bg_threads):
             try:
+                if th.parent() is self:
+                    th.setParent(None)
+            except Exception:
+                pass
+            try:
+                if hasattr(th, "requestInterruption"):
+                    th.requestInterruption()
+            except Exception:
+                pass
+            try:
                 th.quit()
-                th.wait(2000)
+            except Exception:
+                pass
+            try:
+                if not th.isRunning():
+                    th.deleteLater()
             except Exception:
                 pass
         self._bg_threads.clear()

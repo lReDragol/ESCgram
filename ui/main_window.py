@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Iterable
 from utils import app_paths
 
 from PySide6.QtCore import (
-    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent,
+    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl,
     QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property
 )
 from PySide6.QtGui import QColor, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter
@@ -115,6 +115,9 @@ except ImportError:
     sf = None
 
 
+_ORPHAN_QT_THREADS: set[QThread] = set()
+
+
 class ChatInputTextEdit(QTextEdit):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -140,21 +143,20 @@ class ChatInputTextEdit(QTextEdit):
             color = self.palette().color(self.foregroundRole())
             color.setAlpha(120)
             painter.setPen(color)
-            doc_margin = 0.0
             try:
-                doc_margin = float(self.document().documentMargin())
+                cursor = self.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                caret_rect = self.cursorRect(cursor)
             except Exception:
-                doc_margin = 0.0
-            margins = self.contentsMargins()
-            rect = self.viewport().rect().adjusted(
-                int(margins.left() + doc_margin + 10),
-                0,
-                -int(margins.right() + doc_margin + 10),
-                0,
+                caret_rect = QRect(10, 0, 10, int(self.fontMetrics().height()))
+            left = max(8, int(caret_rect.left()))
+            top = max(0, int(caret_rect.top()))
+            draw_rect = QRect(
+                left,
+                top,
+                max(0, self.viewport().width() - left - 8),
+                max(int(caret_rect.height()), int(self.fontMetrics().height()) + 4),
             )
-            text_height = int(self.fontMetrics().height())
-            top = rect.top() + max(0, (rect.height() - text_height) // 2) - 1
-            draw_rect = QRect(rect.left(), top, max(0, rect.width()), max(text_height + 4, rect.height()))
             painter.drawText(draw_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), placeholder)
         finally:
             painter.end()
@@ -276,6 +278,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._pending_media_preview: Optional[Dict[str, Any]] = None
         self._avatar_size = 40
         self._pending_account_revert: Optional[str] = None
+        self._startup_auth_retries: int = 0
+        self._startup_auth_retry_reason: str = ""
         self._media_popup: Optional[MediaPickerPopup] = None
         self._settings_window: Optional[SettingsWindow] = None
         self._active_account_user_id: str = ""
@@ -300,6 +304,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._input_min_height = 34
         self._input_max_height = 260
         self._pending_reply_updates: set[int] = set()
+        self._pending_local_deletes: set[int] = set()
+        self._pending_delete_echo_counts: Dict[tuple[str, int], int] = {}
         self._media_group_refresh_pending: bool = False
         self._pending_jump_message_id: Optional[int] = None
         self._jump_retry_count: int = 0
@@ -325,6 +331,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._ffmpeg_install_worker: Optional[FfmpegInstallWorker] = None
         self._voice_deps_thread: Optional[QThread] = None
         self._voice_deps_worker: Optional[VoiceDepsInstallWorker] = None
+        self._orphan_threads: set[QThread] = set()
         self._tray_icon: Optional[QSystemTrayIcon] = None
         self._tray_menu: Optional[QMenu] = None
         self._tray_quit_requested: bool = False
@@ -572,6 +579,31 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             if output is not None:
                 try:
                     output.setVolume(ratio)
+                except Exception:
+                    pass
+
+    def _stop_active_media_playback(self) -> None:
+        for widget in list(getattr(self, "_message_widgets", {}).values()):
+            if widget is None:
+                continue
+            for attr in ("player", "_player"):
+                player = getattr(widget, attr, None)
+                if player is None:
+                    continue
+                try:
+                    player.pause()
+                except Exception:
+                    pass
+                try:
+                    player.setSource(QUrl())
+                except Exception:
+                    pass
+        preview = getattr(self, "_media_preview_bar", None)
+        if preview is not None:
+            stopper = getattr(preview, "stop", None)
+            if callable(stopper):
+                try:
+                    stopper()
                 except Exception:
                     pass
 
@@ -953,6 +985,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.pump_thread.started.connect(self.pump.run)
         self.pump.gui_ai_message.connect(self._on_ai_msg)
         self.pump.gui_user_echo.connect(self._on_user_echo)
+        self.pump.gui_message_sent.connect(self._on_gui_message_sent)
         self.pump.gui_peer_message.connect(self._on_peer_message)
         self.pump.gui_media.connect(self._on_gui_media)
         self.pump.gui_media_progress.connect(self._on_media_progress)
@@ -1011,7 +1044,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if self.tg.is_authorized_sync():
             QTimer.singleShot(1000, self.refresh_telegram_chats_async)
         else:
-            QTimer.singleShot(0, self._ensure_authorized)
+            QTimer.singleShot(0, lambda: self._ensure_authorized(prompt_reason="startup"))
 
         self._shortcut_find = QShortcut(QKeySequence.Find, self)
         self._shortcut_find.activated.connect(self.show_message_search)
@@ -1864,12 +1897,22 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if action.get("request_poll") or action.get("request_users") or action.get("request_chat"):
             self._toast("Этот тип bot-кнопки пока не реализован полностью")
             return
-        if "callback_data" in action:
+        try:
+            inline_message_id = int(action.get("message_id") or 0)
+        except Exception:
+            inline_message_id = 0
+        try:
+            inline_row = int(action.get("row") or 0)
+            inline_col = int(action.get("col") or 0)
+        except Exception:
+            inline_row = -1
+            inline_col = -1
+        if inline_message_id > 0 and inline_row >= 0 and inline_col >= 0:
             result = self.server.press_inline_button(
                 chat_id,
-                int(action.get("message_id") or 0),
-                int(action.get("row") or 0),
-                int(action.get("col") or 0),
+                inline_message_id,
+                inline_row,
+                inline_col,
             )
             if bool(result.get("ok")):
                 text = str(result.get("text") or "").strip()
@@ -1930,9 +1973,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._chat_list_refresh_pending = True
         # Coalesce frequent updates to avoid expensive full chat-list rebuilds on bursts.
         now = time.monotonic()
-        min_gap = 0.30
+        if bool(getattr(self, "_dialogs_stream_active", False)):
+            min_gap = 0.90
+        else:
+            min_gap = 0.30
         elapsed = now - float(getattr(self, "_chat_list_last_refresh_at", 0.0) or 0.0)
         effective_delay = max(0, int(delay_ms))
+        if bool(getattr(self, "_dialogs_stream_active", False)):
+            effective_delay = max(effective_delay, 220)
         if elapsed < min_gap:
             effective_delay = max(effective_delay, int((min_gap - elapsed) * 1000))
         try:
@@ -2137,6 +2185,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._cancel_pending_media_preview(toast=False)
         except Exception:
             pass
+        try:
+            self._stop_active_media_playback()
+        except Exception:
+            pass
         self._message_cache.clear()
         self._reply_index.clear()
         self._clear_message_selection()
@@ -2150,7 +2202,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._refresh_chat_header()
         self._update_bot_keyboard_bar()
         self.update_ai_controls_state()
-        self.load_chat_history_async()
+        self.load_chat_history_async(auto_scroll=True)
 
     def _current_chat_meta(self) -> Dict[str, Any]:
         chat_id = str(self.current_chat_id or "")
@@ -2773,14 +2825,19 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             can_update=False,
             in_progress=True,
         )
-        thread = QThread(self)
+        thread = QThread()
+        thread.setObjectName("update_check_thread")
         worker = ReleaseCheckWorker(repo=self._update_repo, current_version=self._app_version)
+        self._orphan_threads.add(thread)
+        _ORPHAN_QT_THREADS.add(thread)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_update_check_finished)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda th=thread: self._orphan_threads.discard(th))
+        thread.finished.connect(lambda th=thread: _ORPHAN_QT_THREADS.discard(th))
         self._update_thread = thread
         self._update_worker = worker
         thread.start()
@@ -2834,8 +2891,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         )
         file_name = os.path.basename(self._update_download_url.split("?", 1)[0]) or "ESCgram-update.bin"
         output_path = str(app_paths.temp_dir() / file_name)
-        thread = QThread(self)
+        thread = QThread()
+        thread.setObjectName("update_download_thread")
         worker = UpdateDownloadWorker(url=self._update_download_url, output_path=output_path)
+        self._orphan_threads.add(thread)
+        _ORPHAN_QT_THREADS.add(thread)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_update_download_progress)
@@ -2843,6 +2903,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda th=thread: self._orphan_threads.discard(th))
+        thread.finished.connect(lambda th=thread: _ORPHAN_QT_THREADS.discard(th))
         self._update_download_thread = thread
         self._update_download_worker = worker
         thread.start()
@@ -3868,6 +3930,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self._message_widgets.pop(old_mid, None)
             except Exception:
                 pass
+        was_selected = bool(old_mid is not None and old_mid in self._selected_message_ids)
         try:
             setattr(widget, "_message_id", mid)
         except Exception:
@@ -3897,6 +3960,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self._selected_message_ids.discard(int(old_mid))
             except Exception:
                 pass
+        if was_selected:
+            try:
+                self._selected_message_ids.add(mid)
+            except Exception:
+                pass
+        if old_mid is not None and old_mid != mid:
+            cached = self._message_cache.pop(int(old_mid), None)
+            if isinstance(cached, dict) and mid not in self._message_cache:
+                cached["id"] = mid
+                self._message_cache[mid] = cached
 
     def _find_pending_local_text_widget(self, text: str) -> Optional[QWidget]:
         target = str(text or "").strip()
@@ -4053,6 +4126,34 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             reply_to=reply_to,
             reply_preview=reply_preview,
         )
+
+    @Slot(str, int, int)
+    def _on_gui_message_sent(self, chat_id: str, local_id: int, message_id: int) -> None:
+        try:
+            local_mid = int(local_id)
+            server_mid = int(message_id)
+        except Exception:
+            return
+        if local_mid >= 0 or server_mid <= 0:
+            return
+
+        widget = self._message_widgets.get(local_mid)
+        if widget is not None:
+            self._promote_local_widget_message_id(widget, msg_id=server_mid, timestamp=int(time.time()))
+
+        if local_mid in self._pending_local_deletes:
+            self._pending_local_deletes.discard(local_mid)
+            try:
+                ok_send = bool(self.server.delete_messages(chat_id=chat_id, message_ids=[server_mid]))
+            except Exception:
+                ok_send = False
+            if ok_send:
+                self._remember_delete_echo(chat_id, [server_mid])
+                self._on_gui_messages_deleted(chat_id, [server_mid])
+                if chat_id == str(self.current_chat_id or ""):
+                    self._toast("Сообщение удалено")
+            elif chat_id == str(self.current_chat_id or ""):
+                self._toast("Не удалось удалить сообщение")
 
     @Slot(str, dict)
     def _on_peer_message(self, chat_id: str, payload: dict) -> None:
@@ -4357,6 +4458,16 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 continue
             cached = self._message_cache.get(key)
             was_deleted = bool(cached.get("is_deleted")) if isinstance(cached, dict) else False
+            echo_key = (str(chat_id or "").strip(), key)
+            suppress_repeat_removal = False
+            if was_deleted:
+                pending_echo_count = int(self._pending_delete_echo_counts.get(echo_key, 0) or 0)
+                if pending_echo_count > 0:
+                    suppress_repeat_removal = True
+                    if pending_echo_count <= 1:
+                        self._pending_delete_echo_counts.pop(echo_key, None)
+                    else:
+                        self._pending_delete_echo_counts[echo_key] = pending_echo_count - 1
             if isinstance(cached, dict):
                 cached["is_deleted"] = True
             elif keep_deleted:
@@ -4385,7 +4496,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 if key in bucket:
                     self._reply_index[parent_id] = [x for x in bucket if x != key]
             if chat_id == current:
-                if keep_deleted and was_deleted:
+                if keep_deleted and was_deleted and not suppress_repeat_removal:
                     self._message_cache.pop(key, None)
                     self._remove_message_widget(key)
                     continue
@@ -4443,6 +4554,17 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if not chat_id:
             return
         self._apply_chat_activity(chat_id, ts=int(ts or 0), refresh_delay_ms=120)
+
+    def _remember_delete_echo(self, chat_id: str, message_ids: List[int]) -> None:
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return
+        for mid in message_ids:
+            try:
+                key = (cid, int(mid))
+            except Exception:
+                continue
+            self._pending_delete_echo_counts[key] = int(self._pending_delete_echo_counts.get(key, 0) or 0) + 1
 
     # ------------------------------------------------------------------ #
     # History loading
@@ -4519,8 +4641,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._stop_history_worker()
 
         if chat_id.lstrip("-").isdigit():
-            self._hist_thread = QThread(self)
+            self._hist_thread = QThread()
             self._hist_thread.setObjectName("history_thread")
+            self._orphan_threads.add(self._hist_thread)
+            _ORPHAN_QT_THREADS.add(self._hist_thread)
             self._hist_worker = HistoryWorker(
                 self.server,
                 chat_id,
@@ -4535,6 +4659,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._hist_worker.finished.connect(self._hist_thread.quit)
             self._hist_worker.finished.connect(self._hist_worker.deleteLater)
             self._hist_thread.finished.connect(self._hist_thread.deleteLater)
+            self._hist_thread.finished.connect(lambda th=self._hist_thread: self._orphan_threads.discard(th))
+            self._hist_thread.finished.connect(lambda th=self._hist_thread: _ORPHAN_QT_THREADS.discard(th))
             self._hist_thread.start()
             return
 
@@ -5159,11 +5285,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         chat_id = str(self.current_chat_id or "")
         if not chat_id:
             return
+        keep_deleted = bool(getattr(self, "_keep_deleted_messages", True))
         try:
             mid = int(message_id)
         except Exception:
             return
         if mid <= 0:
+            if str(chat_id or "").lstrip("-").isdigit():
+                self._pending_local_deletes.add(mid)
+                if not keep_deleted:
+                    self._purge_messages_locally(chat_id, [mid], purge_storage=False)
+                self._toast("Удаление будет завершено после отправки")
+                return
             self._purge_messages_locally(chat_id, [mid], purge_storage=False)
             self._toast("Локальное сообщение удалено")
             return
@@ -5178,6 +5311,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         except Exception:
             ok_send = False
         if ok_send:
+            self._remember_delete_echo(chat_id, [mid])
             self._on_gui_messages_deleted(chat_id, [mid])
             self._toast("Сообщение удалено")
             return
@@ -5187,14 +5321,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         chat_id = str(self.current_chat_id or "")
         if not chat_id:
             return
+        keep_deleted = bool(getattr(self, "_keep_deleted_messages", True))
         mids_all = sorted({int(mid) for mid in self._selected_message_ids})
         if not mids_all:
             self._toast("Нет выбранных сообщений")
             return
         local_mids = [mid for mid in mids_all if mid <= 0]
         mids = [mid for mid in mids_all if mid > 0]
+        has_pending_local_delete = False
         if local_mids:
-            self._purge_messages_locally(chat_id, local_mids, purge_storage=False)
+            if str(chat_id or "").lstrip("-").isdigit():
+                for local_mid in local_mids:
+                    self._pending_local_deletes.add(int(local_mid))
+                has_pending_local_delete = True
+                if not keep_deleted:
+                    self._purge_messages_locally(chat_id, local_mids, purge_storage=False)
+            else:
+                self._purge_messages_locally(chat_id, local_mids, purge_storage=False)
         deleteds = [mid for mid in mids if bool((self._message_cache.get(mid) or {}).get("is_deleted"))]
         if deleteds:
             self._purge_messages_locally(chat_id, deleteds, purge_storage=True)
@@ -5205,9 +5348,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             ok_send = False
         if ok_send:
             if mids:
+                self._remember_delete_echo(chat_id, mids)
                 self._on_gui_messages_deleted(chat_id, mids)
             self._clear_message_selection()
-            self._toast("Выбранные сообщения удалены")
+            if has_pending_local_delete and mids:
+                self._toast("Часть сообщений будет удалена после отправки")
+            elif has_pending_local_delete:
+                self._toast("Удаление будет завершено после отправки")
+            else:
+                self._toast("Выбранные сообщения удалены")
             return
         self._toast("Не удалось удалить выбранные сообщения")
 
@@ -6880,16 +7029,57 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     # ------------------------------------------------------------------ #
     # Utility helpers
 
-    def _ensure_authorized(self) -> None:
+    def _ensure_authorized(self, prompt_reason: str = "manual") -> None:
         if self.tg.is_authorized_sync():
+            self._startup_auth_retries = 0
+            self._startup_auth_retry_reason = ""
+            self._refresh_account_profile_async()
             self.refresh_telegram_chats_async()
             return
+        # A just-started/switched Telegram client may still be warming up.
+        # Delay auth prompt a bit unless user explicitly requested adding a new account.
+        if prompt_reason != "add_account":
+            auth_invalid = bool(getattr(self.tg, "_auth_invalid", False))
+            pending_new_session = bool(getattr(self.tg, "_pending_session_name", None))
+            has_known_session = False
+            if hasattr(self.tg, "list_accounts"):
+                try:
+                    has_known_session = bool(self.tg.list_accounts())
+                except Exception:
+                    has_known_session = False
+            if not has_known_session and hasattr(self.tg, "current_session_name"):
+                try:
+                    current = str(self.tg.current_session_name() or "").strip()
+                except Exception:
+                    current = ""
+                checker = getattr(self.tg, "_session_exists", None)
+                if current and callable(checker):
+                    try:
+                        has_known_session = bool(checker(current))
+                    except Exception:
+                        has_known_session = False
+
+            reason_prev = str(getattr(self, "_startup_auth_retry_reason", "") or "")
+            if reason_prev != prompt_reason:
+                self._startup_auth_retries = 0
+            self._startup_auth_retry_reason = prompt_reason
+            retries = int(getattr(self, "_startup_auth_retries", 0) or 0)
+            if has_known_session and not auth_invalid and not pending_new_session and retries < 5:
+                self._startup_auth_retries = retries + 1
+                QTimer.singleShot(1200, lambda: self._ensure_authorized(prompt_reason=prompt_reason))
+                return
+            self._startup_auth_retries = 0
+            self._startup_auth_retry_reason = ""
+
         dlg = AuthDialog(self.tg, self)
         dlg.login_success.connect(self._handle_login_success)
         dlg.exec()
         if not self.tg.is_authorized_sync() and self._pending_account_revert:
             try:
-                self.tg.switch_account(self._pending_account_revert)
+                if hasattr(self.tg, "cancel_pending_account_session"):
+                    self.tg.cancel_pending_account_session(self._pending_account_revert)
+                else:
+                    self.tg.switch_account(self._pending_account_revert)
             except Exception:
                 log.warning("Failed to revert to previous account", exc_info=True)
             finally:
@@ -6899,6 +7089,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _handle_login_success(self) -> None:
         self._pending_account_revert = None
+        self._startup_auth_retries = 0
+        self._startup_auth_retry_reason = ""
         self._refresh_account_profile_async()
         self.refresh_telegram_chats_async()
 
@@ -6967,6 +7159,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 timer.stop()
             except Exception:
                 pass
+        try:
+            self._stop_active_media_playback()
+        except Exception:
+            pass
         self.history = load_history()
         self.all_chats.clear()
         self.current_chat_id = None
@@ -6992,7 +7188,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._pending_account_revert = None
         self._reset_state_after_account_change()
         self._sync_account_card()
-        self._ensure_authorized()
+        self._ensure_authorized(prompt_reason="switch")
 
     def _handle_account_add_requested(self) -> None:
         try:
@@ -7009,7 +7205,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         self._reset_state_after_account_change()
         self._sync_account_card()
-        self._ensure_authorized()
+        self._ensure_authorized(prompt_reason="add_account")
 
     def _account_avatar_pixmap(self, meta: Dict[str, Any]) -> Optional[QPixmap]:
         avatar_cache = getattr(self, "avatar_cache", None)
@@ -7561,7 +7757,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._dialogs_threads.clear()
         self._dialogs_stream_active = False
 
-        self._stop_history_worker(wait_ms=10000, force_terminate=True)
+        self._stop_history_worker(wait_ms=20000, force_terminate=True)
         self._loading_history = False
         self._stop_chat_profile_loader()
 
@@ -7583,20 +7779,32 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._stop_global_search_worker()
 
         update_thread = getattr(self, "_update_thread", None)
+        update_worker = getattr(self, "_update_worker", None)
+        if update_worker is not None and hasattr(update_worker, "stop"):
+            try:
+                update_worker.stop()
+            except Exception:
+                pass
         if _thread_is_running(update_thread):
             try:
                 update_thread.quit()
-                update_thread.wait(1200)
+                update_thread.wait(10000)
             except Exception:
                 pass
         self._update_worker = None
         self._update_thread = None
 
         update_dl_thread = getattr(self, "_update_download_thread", None)
+        update_dl_worker = getattr(self, "_update_download_worker", None)
+        if update_dl_worker is not None and hasattr(update_dl_worker, "stop"):
+            try:
+                update_dl_worker.stop()
+            except Exception:
+                pass
         if _thread_is_running(update_dl_thread):
             try:
                 update_dl_thread.quit()
-                update_dl_thread.wait(1200)
+                update_dl_thread.wait(5000)
             except Exception:
                 pass
         self._update_download_worker = None

@@ -8,6 +8,7 @@ class EventPump(QObject):
     gui_user_echo = Signal(str, str, str, object)     # chat_id, text, user_id, payload
     gui_info = Signal(str)
     gui_touch_dialog = Signal(str, int)       # chat_id, ts
+    gui_message_sent = Signal(str, int, int)  # chat_id, local_id, message_id
     gui_media = Signal(str, dict)             # chat_id, payload
     gui_media_progress = Signal(str, dict)    # chat_id, payload
     gui_peer_message = Signal(str, dict)      # chat_id, payload
@@ -42,6 +43,12 @@ class EventPump(QObject):
                 self.gui_info.emit(str(evt.get("text", "")))
             elif t == "gui_touch_dialog":
                 self.gui_touch_dialog.emit(str(evt.get("chat_id", "")), int(evt.get("ts") or 0))
+            elif t == "gui_message_sent":
+                self.gui_message_sent.emit(
+                    str(evt.get("chat_id", "")),
+                    int(evt.get("local_id") or 0),
+                    int(evt.get("message_id") or 0),
+                )
             elif t == "gui_media":
                 self.gui_media.emit(str(evt.get("chat_id", "")), dict(evt))
             elif t == "gui_media_progress":

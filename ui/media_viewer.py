@@ -37,6 +37,22 @@ def _fmt_time(ms: int) -> str:
     return f"{mm}:{ss:02d}"
 
 
+def _media_volume_ratio(default: float = 1.0) -> float:
+    raw = str(os.getenv("DRAGO_MEDIA_VOLUME", "") or "").strip()
+    if not raw:
+        return max(0.0, min(1.0, float(default)))
+    try:
+        if "." in raw:
+            val = float(raw)
+            if val <= 1.0:
+                return max(0.0, min(1.0, val))
+            return max(0.0, min(1.0, val / 100.0))
+        val_i = int(raw)
+        return max(0.0, min(1.0, float(val_i) / 100.0))
+    except Exception:
+        return max(0.0, min(1.0, float(default)))
+
+
 class MediaViewerDialog(QDialog):
     def __init__(self, *, media_path: str, kind: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -160,10 +176,22 @@ class MediaViewerDialog(QDialog):
         self._time_label = QLabel("0:00 / 0:00", self._content)
         self._time_label.setStyleSheet("color:#9fb0c8; font-size:12px;")
         controls.addWidget(self._time_label, 0)
+
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal, self._content)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setValue(int(round(_media_volume_ratio() * 100.0)))
+        self._volume_slider.setFixedWidth(116)
+        self._volume_slider.setToolTip("Громкость")
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        controls.addWidget(self._volume_slider, 0)
         self._content_layout.addLayout(controls)
 
         player = QMediaPlayer(self)
         audio = QAudioOutput(self)
+        try:
+            audio.setVolume(_media_volume_ratio())
+        except Exception:
+            pass
         player.setAudioOutput(audio)
         player.setVideoOutput(video)
         player.durationChanged.connect(self._on_duration_changed)
@@ -279,3 +307,12 @@ class MediaViewerDialog(QDialog):
 
     def _on_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         self._btn_play.setText("⏸" if state == QMediaPlayer.PlaybackState.PlayingState else "▶")
+
+    def _on_volume_changed(self, value: int) -> None:
+        audio = self._audio_output
+        if audio is None:
+            return
+        try:
+            audio.setVolume(max(0.0, min(1.0, float(value) / 100.0)))
+        except Exception:
+            pass

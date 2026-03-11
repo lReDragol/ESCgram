@@ -79,12 +79,30 @@ class AccountManagerDialog(QDialog):
     def _update_buttons(self) -> None:
         item = self.list_widget.currentItem()
         if not item:
+            self.btn_use.setText("Использовать")
             self.btn_use.setEnabled(False)
             self.btn_delete.setEnabled(False)
             return
         is_active = bool(item.data(Qt.ItemDataRole.UserRole + 1))
-        self.btn_use.setEnabled(not is_active)
+        active_needs_login = is_active and (not self._is_active_session_authorized())
+        self.btn_use.setText("Войти" if active_needs_login else "Использовать")
+        self.btn_use.setEnabled((not is_active) or active_needs_login)
         self.btn_delete.setEnabled(not is_active)
+
+    def _is_active_session_authorized(self) -> bool:
+        checker = getattr(self.tg, "is_authorized_sync", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(timeout=0.8))
+        except TypeError:
+            try:
+                return bool(checker())
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return not bool(getattr(self.tg, "_auth_invalid", False))
 
     def _emit_add(self) -> None:
         self.account_add_requested.emit()

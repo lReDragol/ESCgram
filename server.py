@@ -84,6 +84,10 @@ class ServerCore:
         self._history_timeout_warn_at: float = 0.0
         self._local_echo_lock = threading.Lock()
         self._local_echo_seq: int = 0
+        self._profile_scan_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="profile-sections")
+        self._profile_scan_shutdown = False
+        self._profile_scan_lock = threading.Lock()
+        self._profile_scan_inflight: set[int] = set()
 
     # ---------------------------------------------------------------------
     #                        Telegram bridge (локальный)
@@ -415,10 +419,45 @@ class ServerCore:
         if not callable(getter):
             return None
         try:
-            return getter(chat_id=chat_id)
+            try:
+                timeout = float(os.getenv("DRAGO_PROFILE_FULL_INFO_TIMEOUT", "8.0") or 8.0)
+            except Exception:
+                timeout = 8.0
+            try:
+                return getter(chat_id=chat_id, timeout=timeout)
+            except TypeError:
+                return getter(chat_id=chat_id)
         except Exception:
             log.exception("[SERVER] Failed to load chat profile for %s", chat_id)
             return None
+
+    def _schedule_profile_sections_scan(self, peer_id: int, *, full_scan: bool = False) -> None:
+        if not self._storage or self._profile_scan_shutdown:
+            return
+        pid = int(peer_id)
+        with self._profile_scan_lock:
+            if pid in self._profile_scan_inflight:
+                return
+            self._profile_scan_inflight.add(pid)
+
+        def _run() -> None:
+            try:
+                self._storage.refresh_chat_profile_sections_cache(
+                    pid,
+                    chunk_size=420,
+                    full_scan=bool(full_scan),
+                )
+            except Exception:
+                log.exception("[SERVER] Failed to refresh profile sections cache for %s", pid)
+            finally:
+                with self._profile_scan_lock:
+                    self._profile_scan_inflight.discard(pid)
+
+        try:
+            self._profile_scan_executor.submit(_run)
+        except Exception:
+            with self._profile_scan_lock:
+                self._profile_scan_inflight.discard(pid)
 
     def get_chat_profile_sections(
         self,
@@ -431,76 +470,157 @@ class ServerCore:
     ) -> Dict[str, Any]:
         if not str(chat_id or "").lstrip("-").isdigit():
             return {}
-        peer_id = int(chat_id)
         out: Dict[str, Any] = {
             "media": [],
             "files": [],
             "links": [],
             "members": [],
         }
-        if self._storage:
+        out["media"] = self.get_chat_profile_section(chat_id, "media", limit=media_limit)
+        out["files"] = self.get_chat_profile_section(chat_id, "files", limit=file_limit)
+        out["links"] = self.get_chat_profile_section(chat_id, "links", limit=link_limit)
+        out["members"] = self.get_chat_profile_section(chat_id, "members", limit=members_limit)
+        return out
+
+    def get_chat_profile_section(self, chat_id: str, section: str, *, limit: int = 80) -> List[Dict[str, Any]]:
+        if not (self._storage and str(chat_id or "").lstrip("-").isdigit()):
+            return []
+        section_key = str(section or "").strip().lower()
+        if section_key not in {"media", "files", "links", "members"}:
+            return []
+        peer_id = int(chat_id)
+        target_limit = max(1, int(limit or 80))
+
+        latest_message_id = 0
+        last_scanned_id = 0
+        try:
+            latest_message_id = int(self._storage.get_chat_latest_message_id(peer_id))
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return []
+        except Exception:
+            latest_message_id = 0
+        try:
+            scan_state = self._storage.get_chat_profile_scan_state(peer_id)
+            last_scanned_id = int(scan_state.get("last_message_id") or 0)
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return []
+        except Exception:
+            last_scanned_id = 0
+
+        if section_key == "members":
+            return self._load_profile_members(chat_id, peer_id, limit=target_limit)
+
+        rows: List[Dict[str, Any]] = []
+        used_cache = False
+        try:
+            rows = self._storage.get_cached_chat_profile_section(peer_id, section_key, limit=target_limit)
+            used_cache = bool(rows)
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return []
+            log.exception("[SERVER] Failed to load cached profile section %s for %s", section_key, chat_id)
+        except Exception:
+            log.exception("[SERVER] Failed to load cached profile section %s for %s", section_key, chat_id)
+
+        if not used_cache:
             try:
-                out["media"] = self._storage.get_chat_shared_media(peer_id, limit=max(1, int(media_limit)))
+                if section_key == "media":
+                    rows = self._storage.get_chat_shared_media(peer_id, limit=target_limit)
+                elif section_key == "files":
+                    rows = self._storage.get_chat_shared_files(peer_id, limit=target_limit)
+                elif section_key == "links":
+                    rows = self._storage.get_chat_links(peer_id, limit=target_limit)
+            except RuntimeError as exc:
+                if "Storage not connected" in str(exc):
+                    return []
+                log.exception("[SERVER] Failed to load profile section %s for %s", section_key, chat_id)
             except Exception:
-                log.exception("[SERVER] Failed to load shared media for %s", chat_id)
-            try:
-                out["files"] = self._storage.get_chat_shared_files(peer_id, limit=max(1, int(file_limit)))
-            except Exception:
-                log.exception("[SERVER] Failed to load shared files for %s", chat_id)
-            try:
-                out["links"] = self._storage.get_chat_links(peer_id, limit=max(1, int(link_limit)))
-            except Exception:
-                log.exception("[SERVER] Failed to load links for %s", chat_id)
-            try:
-                out["members"] = self._storage.get_chat_members_activity(peer_id, limit=max(1, int(members_limit)))
-            except Exception:
-                log.exception("[SERVER] Failed to load local members activity for %s", chat_id)
+                log.exception("[SERVER] Failed to load profile section %s for %s", section_key, chat_id)
+
+        if latest_message_id > 0 and latest_message_id > last_scanned_id:
+            self._schedule_profile_sections_scan(peer_id, full_scan=False)
+        elif latest_message_id > 0 and not used_cache:
+            self._schedule_profile_sections_scan(peer_id, full_scan=True)
+        return [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+
+    def _load_profile_members(self, chat_id: str, peer_id: int, *, limit: int) -> List[Dict[str, Any]]:
+        if not self._storage:
+            return []
+        try:
+            local_rows = self._storage.get_chat_members_activity(peer_id, limit=max(1, int(limit)))
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return []
+            log.exception("[SERVER] Failed to load local members activity for %s", chat_id)
+            local_rows = []
+        except Exception:
+            log.exception("[SERVER] Failed to load local members activity for %s", chat_id)
+            local_rows = []
 
         tg_members: List[Dict[str, Any]] = []
-        if self._tg_adapter:
+        enable_remote_members = str(os.getenv("DRAGO_PROFILE_REMOTE_MEMBERS", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if enable_remote_members and self._tg_adapter:
             getter = getattr(self._tg_adapter, "get_chat_members_preview_sync", None)
             if callable(getter):
+                remote_limit = min(max(1, int(limit)), 50)
                 try:
-                    tg_members = list(getter(chat_id=chat_id, limit=max(1, int(members_limit))) or [])
+                    timeout = float(os.getenv("DRAGO_PROFILE_MEMBERS_TIMEOUT", "8.0") or 8.0)
+                except Exception:
+                    timeout = 8.0
+                try:
+                    tg_members = list(getter(chat_id=chat_id, limit=remote_limit, timeout=timeout) or [])
+                except TypeError:
+                    try:
+                        tg_members = list(getter(chat_id=chat_id, limit=remote_limit) or [])
+                    except Exception:
+                        log.exception("[SERVER] Failed to load Telegram members preview for %s", chat_id)
                 except Exception:
                     log.exception("[SERVER] Failed to load Telegram members preview for %s", chat_id)
-        if tg_members:
-            local_map: Dict[int, Dict[str, Any]] = {}
-            for row in list(out.get("members") or []):
-                try:
-                    local_map[int(row.get("id"))] = dict(row)
-                except Exception:
-                    continue
-            merged: List[Dict[str, Any]] = []
-            seen: set[int] = set()
-            for row in tg_members:
-                try:
-                    uid = int(row.get("id") or 0)
-                except Exception:
-                    uid = 0
-                if uid <= 0:
-                    continue
-                seen.add(uid)
-                local = local_map.get(uid, {})
-                merged.append(
-                    {
-                        "id": uid,
-                        "name": str(row.get("name") or local.get("name") or uid),
-                        "username": str(row.get("username") or local.get("username") or ""),
-                        "type": str(row.get("type") or local.get("type") or ""),
-                        "status": str(row.get("status") or ""),
-                        "messages": int(local.get("messages") or 0),
-                        "last_date": int(local.get("last_date") or 0),
-                        "deleted_messages": int(local.get("deleted_messages") or 0),
-                    }
-                )
-            for uid, local in local_map.items():
-                if uid in seen:
-                    continue
-                merged.append(dict(local))
-            merged.sort(key=lambda item: int(item.get("messages") or 0), reverse=True)
-            out["members"] = merged[: max(1, int(members_limit))]
-        return out
+        if not tg_members:
+            return [dict(row) for row in list(local_rows or []) if isinstance(row, dict)]
+
+        local_map: Dict[int, Dict[str, Any]] = {}
+        for row in list(local_rows or []):
+            try:
+                local_map[int(row.get("id"))] = dict(row)
+            except Exception:
+                continue
+        merged: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in tg_members:
+            try:
+                uid = int(row.get("id") or 0)
+            except Exception:
+                uid = 0
+            if uid <= 0:
+                continue
+            seen.add(uid)
+            local = local_map.get(uid, {})
+            merged.append(
+                {
+                    "id": uid,
+                    "name": str(row.get("name") or local.get("name") or uid),
+                    "username": str(row.get("username") or local.get("username") or ""),
+                    "type": str(row.get("type") or local.get("type") or ""),
+                    "status": str(row.get("status") or ""),
+                    "messages": int(local.get("messages") or 0),
+                    "last_date": int(local.get("last_date") or 0),
+                    "deleted_messages": int(local.get("deleted_messages") or 0),
+                }
+            )
+        for uid, local in local_map.items():
+            if uid in seen:
+                continue
+            merged.append(dict(local))
+        merged.sort(key=lambda item: int(item.get("messages") or 0), reverse=True)
+        return merged[: max(1, int(limit))]
 
     def leave_chat(self, chat_id: str) -> bool:
         if not self._tg_adapter:
@@ -521,6 +641,11 @@ class ServerCore:
             peer_id = int(chat_id)
             stats = self._storage.get_chat_statistics(peer_id, limit=limit)
             return self._attach_chat_statistics_snapshots(peer_id, stats)
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return {}
+            log.exception("[SERVER] Failed to load chat statistics for %s", chat_id)
+            return {}
         except Exception:
             log.exception("[SERVER] Failed to load chat statistics for %s", chat_id)
             return {}
@@ -546,6 +671,11 @@ class ServerCore:
             scanned_at = self._storage.save_chat_statistics_snapshot(peer_id, stats)
             stats["scanned_at"] = int(scanned_at)
             return self._attach_chat_statistics_snapshots(peer_id, stats)
+        except RuntimeError as exc:
+            if "Storage not connected" in str(exc):
+                return {}
+            log.exception("[SERVER] Failed to scan chat statistics for %s", chat_id)
+            return {}
         except Exception:
             log.exception("[SERVER] Failed to scan chat statistics for %s", chat_id)
             return {}
@@ -646,16 +776,23 @@ class ServerCore:
         reply_to: Optional[int] = None,
         *,
         entities: Optional[List[Dict[str, Any]]] = None,
-    ) -> bool:
+    ) -> Optional[int]:
         if not self._tg_adapter:
-            return False
+            return None
         sender = getattr(self._tg_adapter, "send_text_sync", None)
         if not callable(sender):
-            return False
+            return None
         try:
-            return bool(sender(chat_id=chat_id, text=text, reply_to=reply_to, entities=entities))
+            result = sender(chat_id=chat_id, text=text, reply_to=reply_to, entities=entities)
         except TypeError:
-            return bool(sender(chat_id=chat_id, text=text, reply_to=reply_to))
+            result = sender(chat_id=chat_id, text=text, reply_to=reply_to)
+        if isinstance(result, bool):
+            return None
+        try:
+            message_id = int(result) if result is not None else 0
+        except Exception:
+            message_id = 0
+        return message_id if message_id > 0 else None
 
     def ensure_chat_avatar(self, chat_id: str, *, file_id: Optional[str] = None, size: str = "small") -> Optional[str]:
         if not self._tg_adapter:
@@ -869,7 +1006,22 @@ class ServerCore:
         # Do not block GUI thread on Telegram round-trip.
         def _send_task() -> None:
             try:
-                self.send_text_to_telegram(chat_id=chat_id, text=text, reply_to=reply_to, entities=entities)
+                message_id = self.send_text_to_telegram(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_to=reply_to,
+                    entities=entities,
+                )
+                if message_id:
+                    self.events.put(
+                        {
+                            "type": "gui_message_sent",
+                            "chat_id": chat_id,
+                            "local_id": int(local_id),
+                            "message_id": int(message_id),
+                            "ts": int(time.time()),
+                        }
+                    )
             except Exception:
                 log.exception("[SERVER] Failed to send text to Telegram chat %s", chat_id)
 
@@ -878,7 +1030,22 @@ class ServerCore:
         except Exception:
             # Last-resort sync fallback.
             try:
-                self.send_text_to_telegram(chat_id=chat_id, text=text, reply_to=reply_to, entities=entities)
+                message_id = self.send_text_to_telegram(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_to=reply_to,
+                    entities=entities,
+                )
+                if message_id:
+                    self.events.put(
+                        {
+                            "type": "gui_message_sent",
+                            "chat_id": chat_id,
+                            "local_id": int(local_id),
+                            "message_id": int(message_id),
+                            "ts": int(time.time()),
+                        }
+                    )
             except Exception:
                 log.exception("[SERVER] Failed to send text to Telegram chat %s", chat_id)
         if user_id != "me" and self.should_use_ai_for_gui(chat_id):
@@ -1028,6 +1195,12 @@ class ServerCore:
         log.debug("[SERVER] start() called (no websocket server; host=%s port=%s)", host, port)
 
     def stop(self) -> None:
+        if getattr(self, "_profile_scan_executor", None) and not self._profile_scan_shutdown:
+            try:
+                self._profile_scan_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self._profile_scan_executor.shutdown(wait=False)
+            self._profile_scan_shutdown = True
         if getattr(self, "_ai_executor", None) and not self._ai_executor_shutdown:
             try:
                 self._ai_executor.shutdown(wait=False, cancel_futures=True)

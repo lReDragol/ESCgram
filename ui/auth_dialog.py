@@ -302,12 +302,27 @@ class AuthDialog(QDialog):
             self.btn_phone_login.setEnabled(True)
 
     def _back_to_phone_start(self) -> None:
+        try:
+            resetter = getattr(self.tg, "reset_phone_login_state", None)
+            if callable(resetter):
+                resetter()
+        except Exception:
+            pass
         self._set_phone_step(self.PHONE_STEP_START)
         self.ed_phone_code.clear()
         self.ed_phone_code_password.clear()
         self.lbl_phone_code_password.setVisible(False)
         self.ed_phone_code_password.setVisible(False)
         self.lbl_phone_status.setText("")
+
+    def reject(self) -> None:  # type: ignore[override]
+        try:
+            resetter = getattr(self.tg, "reset_phone_login_state", None)
+            if callable(resetter):
+                resetter()
+        except Exception:
+            pass
+        super().reject()
 
     def _on_tab_changed(self, index: int) -> None:
         if not self._telegram_enabled:

@@ -77,25 +77,48 @@ def configure_logging(level: Optional[str] = None, *, log_directory: Optional[st
     target_dir: Optional[Path] = None
 
     if log_directory or log_file or os.getenv("DRAGO_LOG_DIR"):
-        target_dir = _resolve_log_dir(log_directory or Path(log_file).parent if log_file else None)
+        log_dir_hint = log_directory or (str(Path(log_file).parent) if log_file else None)
+        target_dir = _resolve_log_dir(log_dir_hint)
 
     if target_dir is None and os.getenv("DRAGO_ENABLE_FILE_LOGS", "1") not in {"0", "false", "False"}:
         target_dir = _resolve_log_dir("logs")
 
     filename: Optional[Path] = None
+    mirror_filename: Optional[Path] = None
     if target_dir:
         filename = Path(log_file) if log_file else target_dir / "log.log"
         handlers["file"] = {
             "class": "logging.handlers.RotatingFileHandler",
             "level": resolved_level,
             "formatter": "default",
-            "filters": ["dedup"],
             "filename": str(filename),
             "maxBytes": 5 * 1024 * 1024,
             "backupCount": 5,
             "encoding": "utf-8",
         }
         root_handlers.append("file")
+
+    # Source runs should always keep a stable project-root log file:
+    # <project>/logs/log.log (many diagnostics and bug reports rely on it).
+    if not bool(getattr(sys, "frozen", False)):
+        try:
+            project_root = Path(__file__).resolve().parents[1]
+            mirror_filename = (project_root / "logs" / "log.log").resolve()
+            mirror_filename.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            mirror_filename = None
+        if mirror_filename is not None:
+            if filename is None or str(mirror_filename) != str(Path(filename).resolve()):
+                handlers["file_project"] = {
+                    "class": "logging.handlers.RotatingFileHandler",
+                    "level": resolved_level,
+                    "formatter": "default",
+                    "filename": str(mirror_filename),
+                    "maxBytes": 5 * 1024 * 1024,
+                    "backupCount": 5,
+                    "encoding": "utf-8",
+                }
+                root_handlers.append("file_project")
 
     logging.config.dictConfig(
         {
@@ -128,10 +151,13 @@ def configure_logging(level: Optional[str] = None, *, log_directory: Optional[st
 
     global _CURRENT_LOG_DIR, _CURRENT_LOG_FILE
     _CURRENT_LOG_DIR = target_dir
-    _CURRENT_LOG_FILE = filename
+    _CURRENT_LOG_FILE = filename or mirror_filename
 
     try:
-        logging.getLogger("logging").info("Logging to %s", str(filename) if target_dir else "console-only")
+        target_msg = str(filename) if filename else ("console-only" if mirror_filename is None else str(mirror_filename))
+        if mirror_filename is not None and filename is not None and str(mirror_filename) != str(filename):
+            target_msg = f"{filename} (mirror: {mirror_filename})"
+        logging.getLogger("logging").info("Logging to %s", target_msg)
     except Exception:
         pass
 

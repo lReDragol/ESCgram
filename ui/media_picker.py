@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -30,6 +31,63 @@ from ui.sticker_workers import (
     StickerThumbWorker,
 )
 from utils import app_paths
+
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # pragma: no cover - fallback for unexpected runtime envs
+    def _qt_is_valid(obj: object) -> bool:
+        return obj is not None
+
+
+_PICKER_THREADS: set[QThread] = set()
+
+
+def _thread_is_running(thread: Optional[QThread]) -> bool:
+    if thread is None:
+        return False
+    try:
+        if not _qt_is_valid(thread):
+            return False
+    except Exception:
+        return False
+    try:
+        return bool(thread.isRunning())
+    except Exception:
+        return False
+
+
+_EMOJI_SECTION_TITLES = {
+    "smileys": "Смайлики и люди",
+    "nature": "Животные и природа",
+    "food": "Еда и напитки",
+    "activity": "Активности",
+    "travel": "Путешествия",
+    "objects": "Объекты",
+    "symbols": "Символы",
+}
+
+
+def _emoji_section_key(value: str) -> str:
+    first = ord(value[0]) if value else 0
+    if 0x1F600 <= first <= 0x1F64F or 0x1F900 <= first <= 0x1FAAF or 0x1F466 <= first <= 0x1F64F:
+        return "smileys"
+    if 0x1F980 <= first <= 0x1F9AE or 0x1F331 <= first <= 0x1F43F:
+        return "nature"
+    if 0x1F950 <= first <= 0x1F96F or 0x1F32D <= first <= 0x1F37F:
+        return "food"
+    if 0x1F3A0 <= first <= 0x1F3FF:
+        return "activity"
+    if 0x1F680 <= first <= 0x1F6FF or 0x1F300 <= first <= 0x1F320:
+        return "travel"
+    if 0x1F4A0 <= first <= 0x1F5FF:
+        return "objects"
+    try:
+        name = unicodedata.name(value[0], "")
+    except Exception:
+        name = ""
+    if "HEART" in name or "ARROW" in name or "STAR" in name or "SIGN" in name:
+        return "symbols"
+    return "objects"
 
 
 class MediaPickerPopup(QFrame):
@@ -69,16 +127,18 @@ class MediaPickerPopup(QFrame):
         self._gif_buttons: Dict[str, QToolButton] = {}
         self._gifs_thread: Optional[QThread] = None
         self._gifs_worker: Optional[SavedGifsWorker] = None
+        self._worker_threads: set[QThread] = set()
 
         self._recent_stickers: List[Dict[str, Any]] = []
         self._current_stickers: List[Dict[str, Any]] = []
         self._sticker_buttons: Dict[str, QToolButton] = {}
         self._recent_emojis: List[str] = []
-        # Rendering thousands of emoji buttons blocks UI; keep it responsive with a curated window.
+        # Keep large catalog by default (user expects close to Telegram coverage),
+        # but still clamp upper bound to avoid UI stalls on weak machines.
         try:
-            emoji_limit = max(240, min(1200, int(os.getenv("DRAGO_EMOJI_PICKER_LIMIT", "640") or 640)))
+            emoji_limit = max(640, min(5000, int(os.getenv("DRAGO_EMOJI_PICKER_LIMIT", "2400") or 2400)))
         except Exception:
-            emoji_limit = 640
+            emoji_limit = 2400
         self._emoji_catalog: Sequence[str] = tuple(load_all_emojis(limit=emoji_limit))
         self._recent_gifs: List[Dict[str, Any]] = []
 
@@ -108,6 +168,14 @@ class MediaPickerPopup(QFrame):
         super().hideEvent(event)
         self._cancel_thumb_worker()
         self._cancel_gif_thumb_worker()
+
+    def _track_worker_thread(self, thread: QThread) -> None:
+        if thread is None:
+            return
+        self._worker_threads.add(thread)
+        thread.finished.connect(lambda th=thread: self._worker_threads.discard(th))
+        _PICKER_THREADS.add(thread)
+        thread.finished.connect(lambda th=thread: _PICKER_THREADS.discard(th))
 
     # ------------------------------------------------------------------ #
     # Popup positioning
@@ -196,23 +264,34 @@ class MediaPickerPopup(QFrame):
                 btn = self._make_emoji_button(emoji)
                 grid.addWidget(btn, row + (idx // cols), idx % cols)
             row += (len(self._recent_emojis) + cols - 1) // cols
-            all_lbl = QLabel("Все эмодзи")
-            all_lbl.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
-            grid.addWidget(all_lbl, row, 0, 1, cols)
-            row += 1
+        sections: Dict[str, List[str]] = {}
+        for emoji in merged:
+            if emoji in self._recent_emojis:
+                continue
+            key = _emoji_section_key(emoji)
+            sections.setdefault(key, []).append(emoji)
 
-        start_index = len(self._recent_emojis)
-        for idx, emoji in enumerate(merged[start_index:]):
-            btn = self._make_emoji_button(emoji)
-            grid.addWidget(btn, row + (idx // cols), idx % cols)
-        grid.setRowStretch(row + ((max(0, len(merged) - start_index) + cols - 1) // cols) + 1, 1)
+        for section_key in ("smileys", "nature", "food", "activity", "travel", "objects", "symbols"):
+            rows = sections.get(section_key) or []
+            if not rows:
+                continue
+            label = QLabel(str(_EMOJI_SECTION_TITLES.get(section_key) or section_key))
+            label.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
+            grid.addWidget(label, row, 0, 1, cols)
+            row += 1
+            for idx, emoji in enumerate(rows):
+                btn = self._make_emoji_button(emoji)
+                grid.addWidget(btn, row + (idx // cols), idx % cols)
+            row += (len(rows) + cols - 1) // cols
+
+        grid.setRowStretch(row + 1, 1)
         status = getattr(self, "_emoji_status", None)
         if status is not None:
             if self._recent_emojis:
                 status.setText(f"Недавние из Telegram: {len(self._recent_emojis)}")
             else:
                 total = len(merged)
-                shown = max(0, len(merged[start_index:]))
+                shown = max(0, len(merged))
                 status.setText(f"Недавние не найдены, показано эмодзи: {shown}/{total}")
 
     def _make_emoji_button(self, emoji: str) -> QToolButton:
@@ -301,7 +380,7 @@ class MediaPickerPopup(QFrame):
         # Cancel previous workers if any.
         for thread_attr in ("_recent_thread", "_sets_thread"):
             thread = getattr(self, thread_attr, None)
-            if thread is not None and thread.isRunning():
+            if _thread_is_running(thread):
                 try:
                     thread.quit()
                     thread.wait(200)
@@ -309,7 +388,8 @@ class MediaPickerPopup(QFrame):
                     pass
 
         # Recent stickers
-        recent_thread = QThread(self)
+        recent_thread = QThread()
+        self._track_worker_thread(recent_thread)
         recent_worker = RecentStickersWorker(self.tg)
         recent_worker.moveToThread(recent_thread)
         recent_thread.started.connect(recent_worker.run)
@@ -317,12 +397,14 @@ class MediaPickerPopup(QFrame):
         recent_worker.done.connect(recent_thread.quit)
         recent_worker.done.connect(recent_worker.deleteLater)
         recent_thread.finished.connect(recent_thread.deleteLater)
+        recent_thread.finished.connect(lambda: setattr(self, "_recent_thread", None))
         self._recent_thread = recent_thread
         self._recent_worker = recent_worker
         recent_thread.start()
 
         # Sticker sets
-        sets_thread = QThread(self)
+        sets_thread = QThread()
+        self._track_worker_thread(sets_thread)
         sets_worker = StickerSetsWorker(self.tg)
         sets_worker.moveToThread(sets_thread)
         sets_thread.started.connect(sets_worker.run)
@@ -330,6 +412,7 @@ class MediaPickerPopup(QFrame):
         sets_worker.done.connect(sets_thread.quit)
         sets_worker.done.connect(sets_worker.deleteLater)
         sets_thread.finished.connect(sets_thread.deleteLater)
+        sets_thread.finished.connect(lambda: setattr(self, "_sets_thread", None))
         self._sets_thread = sets_thread
         self._sets_worker = sets_worker
         sets_thread.start()
@@ -404,7 +487,7 @@ class MediaPickerPopup(QFrame):
         self.sticker_status.setText("Загружаю набор…")
 
         thread = getattr(self, "_items_thread", None)
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             try:
                 thread.quit()
                 thread.wait(200)
@@ -412,7 +495,8 @@ class MediaPickerPopup(QFrame):
                 pass
         self._items_worker = None
 
-        thread = QThread(self)
+        thread = QThread()
+        self._track_worker_thread(thread)
         worker = StickerSetItemsWorker(self.tg, set_id=set_id, access_hash=access_hash)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -420,6 +504,7 @@ class MediaPickerPopup(QFrame):
         worker.done.connect(thread.quit)
         worker.done.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_items_thread", None))
         self._items_thread = thread
         self._items_worker = worker
         thread.start()
@@ -505,7 +590,7 @@ class MediaPickerPopup(QFrame):
             tasks.append((fid, out_path))
         if not tasks:
             return
-        self._thumb_tasks = list(tasks)
+        self._thumb_tasks = list(tasks[:48])
         self._start_next_thumb_batch()
 
     def _start_next_thumb_batch(self) -> None:
@@ -514,12 +599,13 @@ class MediaPickerPopup(QFrame):
         if not self.isVisible():
             return
         thread = getattr(self, "_thumb_thread", None)
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             return
-        batch = self._thumb_tasks[:24]
-        self._thumb_tasks = self._thumb_tasks[24:]
+        batch = self._thumb_tasks[:12]
+        self._thumb_tasks = self._thumb_tasks[12:]
 
-        thread = QThread(self)
+        thread = QThread()
+        self._track_worker_thread(thread)
         worker = StickerThumbWorker(self.tg, batch)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -528,6 +614,7 @@ class MediaPickerPopup(QFrame):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_thumb_thread", None))
         self._thumb_thread = thread
         self._thumb_worker = worker
         thread.start()
@@ -548,7 +635,7 @@ class MediaPickerPopup(QFrame):
                 worker.stop()
             except Exception:
                 pass
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             try:
                 thread.quit()
                 thread.wait(200)
@@ -595,7 +682,7 @@ class MediaPickerPopup(QFrame):
                 worker.stop()
             except Exception:
                 pass
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             try:
                 thread.quit()
                 thread.wait(200)
@@ -608,12 +695,13 @@ class MediaPickerPopup(QFrame):
         if not self.isVisible():
             return
         thread = getattr(self, "_gif_thumb_thread", None)
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             return
         batch = self._gif_thumb_tasks[:12]
         self._gif_thumb_tasks = self._gif_thumb_tasks[12:]
 
-        thread = QThread(self)
+        thread = QThread()
+        self._track_worker_thread(thread)
         worker = StickerThumbWorker(self.tg, batch)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -622,6 +710,7 @@ class MediaPickerPopup(QFrame):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_gif_thumb_thread", None))
         self._gif_thumb_thread = thread
         self._gif_thumb_worker = worker
         thread.start()
@@ -694,11 +783,12 @@ class MediaPickerPopup(QFrame):
                 self.gif_status.setText("Telegram недоступен или нет авторизации")
             return
         thread = getattr(self, "_gifs_thread", None)
-        if thread is not None and thread.isRunning():
+        if _thread_is_running(thread):
             return
         if hasattr(self, "gif_status"):
             self.gif_status.setText("Загружаю историю GIF…")
-        thread = QThread(self)
+        thread = QThread()
+        self._track_worker_thread(thread)
         worker = SavedGifsWorker(self.tg, limit=30)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -706,6 +796,7 @@ class MediaPickerPopup(QFrame):
         worker.done.connect(thread.quit)
         worker.done.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_gifs_thread", None))
         self._gifs_thread = thread
         self._gifs_worker = worker
         thread.start()

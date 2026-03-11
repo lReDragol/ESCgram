@@ -26,6 +26,9 @@ class _AvatarMeta:
     background: QColor
 
 
+_AVATAR_RETRY_BACKOFF_SEC = 20.0
+
+
 class AvatarCache:
     """Resolve and cache avatar pixmaps without blocking the GUI thread."""
 
@@ -35,7 +38,7 @@ class AvatarCache:
         size: int = 40,
         *,
         on_ready: Optional[Callable[[str, str], None]] = None,
-        max_workers: int = 6,
+        max_workers: int = 2,
     ) -> None:
         self._server = server
         self._size = max(16, size)
@@ -71,11 +74,18 @@ class AvatarCache:
         return self._cache[key]
 
     def chat(self, chat_id: str, info: Dict[str, Any]) -> QPixmap:
-        title = str(info.get("title") or chat_id)
+        ctype = str(info.get("type") or "").strip().lower()
         photo_small = info.get("photo_small_id") or info.get("photo_small")
+        if ctype in {"private", "user", "bot"}:
+            title = str(info.get("title") or chat_id)
+            return self.user(str(chat_id), title, file_id=(str(photo_small) if photo_small else None))
+        title = str(info.get("title") or chat_id)
         cache_key = f"chat:{chat_id}:{photo_small or 'none'}"
         entity_key = f"chat:{chat_id}"
-        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        if photo_small:
+            path = self._paths.get(cache_key)
+        else:
+            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
         background = self._color(f"chat:{chat_id}")
         initials = self._initials(title)
 
@@ -93,9 +103,8 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 1.2
+        can_retry = (time.time() - failed_at) >= _AVATAR_RETRY_BACKOFF_SEC
         if can_retry:
-            # Even if photo id is missing in dialog payload, Telegram can often resolve it by chat id.
             self._schedule_download(
                 cache_key=cache_key,
                 kind="chat",
@@ -108,13 +117,17 @@ class AvatarCache:
 
         return placeholder
 
-    def user(self, user_id: str, header: str) -> QPixmap:
+    def user(self, user_id: str, header: str, *, file_id: Optional[str] = None) -> QPixmap:
         normalized_id = user_id or "unknown"
-        cache_key = f"user:{normalized_id}"
+        normalized_file_id = str(file_id or "").strip()
+        cache_key = f"user:{normalized_id}:{normalized_file_id or 'auto'}"
         entity_key = f"user:{normalized_id}"
         background = self._color(cache_key)
         initials = self._initials(header)
-        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        if normalized_file_id:
+            path = self._paths.get(cache_key)
+        else:
+            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
 
         if path:
             pix = self._cache.get(cache_key)
@@ -130,7 +143,7 @@ class AvatarCache:
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
-        can_retry = (time.time() - failed_at) >= 1.2
+        can_retry = (time.time() - failed_at) >= _AVATAR_RETRY_BACKOFF_SEC
         if (cache_key not in self._paths or not path) and can_retry:
             self._schedule_download(
                 cache_key=cache_key,
@@ -139,7 +152,7 @@ class AvatarCache:
                 title=header,
                 initials=initials,
                 background=background,
-                fetch_args={"user_id": normalized_id},
+                fetch_args={"user_id": normalized_id, "file_id": normalized_file_id or None},
             )
 
         return placeholder
@@ -180,7 +193,10 @@ class AvatarCache:
                         file_id=fetch_args.get("file_id"),
                     )
                 elif kind == "user":
-                    path = self._server.ensure_user_avatar(fetch_args["user_id"])
+                    path = self._server.ensure_user_avatar(
+                        fetch_args["user_id"],
+                        file_id=fetch_args.get("file_id"),
+                    )
             except Exception:
                 path = None
             finally:

@@ -30,6 +30,8 @@ from ui.styles import StyleManager
 
 # ------------------------ утилиты -------------------------
 
+_MEDIA_RENDER_THREADS: set[QThread] = set()
+
 def _fmt_time(ms: int) -> str:
     if ms < 0:
         ms = 0
@@ -393,16 +395,25 @@ class MediaRenderingMixin:
             return QSize(self.MIN_IMAGE_DIM, self.MIN_IMAGE_DIM)
 
         scale = 1.0
-        if width < self.MIN_IMAGE_DIM or height < self.MIN_IMAGE_DIM:
+        # Upscale only very small images where both sides are tiny.
+        # Do not force tall/narrow images (e.g. 50x450) into oversized bubbles.
+        if width < self.MIN_IMAGE_DIM and height < self.MIN_IMAGE_DIM:
             scale = max(self.MIN_IMAGE_DIM / max(width, 1), self.MIN_IMAGE_DIM / max(height, 1))
 
         limit = self.MAX_IMAGE_LANDSCAPE if width >= height else self.MAX_IMAGE_PORTRAIT
         limit_w, limit_h = limit.width(), limit.height()
         if width * scale > limit_w or height * scale > limit_h:
-            scale = min(limit_w / width, limit_h / height)
+            scale = min(scale, limit_w / max(width, 1), limit_h / max(height, 1))
 
-        target_w = max(int(round(width * scale)), self.MIN_IMAGE_DIM)
-        target_h = max(int(round(height * scale)), self.MIN_IMAGE_DIM)
+        min_edge = max(48, int(self.MIN_IMAGE_DIM * 0.25))
+        target_w = int(round(width * scale))
+        target_h = int(round(height * scale))
+        if width < min_edge:
+            target_w = max(target_w, min_edge)
+        if height < min_edge:
+            target_h = max(target_h, min_edge)
+        target_w = max(1, target_w)
+        target_h = max(1, target_h)
         return QSize(target_w, target_h)
 
     @staticmethod
@@ -524,29 +535,6 @@ class MediaRenderingMixin:
         self._time_lbl = None
         self._seek = None
         self._timeline_overlay = None
-        if not circular:
-            # Keep timeline controls over the preview surface (Telegram-like),
-            # so geometry stays stable and does not jump when opening media.
-            overlay = QWidget(cast(QWidget, self))
-            overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            overlay.setStyleSheet("background-color: rgba(10, 18, 26, 150); border-radius: 8px;")
-            overlay_layout = QHBoxLayout(overlay)
-            overlay_layout.setContentsMargins(8, 2, 8, 2)
-            overlay_layout.setSpacing(6)
-            self._seek = QSlider(Qt.Orientation.Horizontal, parent=overlay)
-            self._seek.setRange(0, 0)
-            cast(Any, self._seek.sliderPressed).connect(self._on_slider_pressed)
-            cast(Any, self._seek.sliderReleased).connect(self._on_slider_released)
-            cast(Any, self._seek.sliderMoved).connect(self._on_slider_moved)
-            self._seek.setEnabled(False)
-            self._time_lbl = QLabel("0:00 / 0:00", parent=overlay)
-            label_css = style_mgr.stylesheet("media.time_label")
-            self._time_lbl.setStyleSheet(label_css or "color:#9fa6b1; font-size:11px;")
-            overlay_layout.addWidget(self._seek, 1)
-            overlay_layout.addWidget(self._time_lbl, 0)
-            self._timeline_overlay = overlay
-            QTimer.singleShot(0, self._layout_timeline_overlay)
-            self._controls_bar = overlay_layout
 
         # FIX: сброс флагов превью
         self._thumb_player = None
@@ -784,15 +772,29 @@ class MediaRenderingMixin:
             return
         self._thumb_cb = on_done
         th = QThread()
+        try:
+            th.setObjectName(f"media_thumb_thread_{int(self.msg_id or 0)}")
+        except Exception:
+            th.setObjectName("media_thumb_thread")
         worker = ThumbWorker(self.server, str(self.chat_id), int(self.msg_id))
         worker.moveToThread(th)
         cast(Any, worker.done).connect(th.quit)
         cast(Any, th.finished).connect(worker.deleteLater)
         cast(Any, th.finished).connect(th.deleteLater)
         cast(Any, worker.done).connect(self._on_thumb_done)
-        if hasattr(self, "_bg_threads"):
-            try: self._bg_threads.append(th)
-            except Exception: pass
+        _MEDIA_RENDER_THREADS.add(th)
+        cast(Any, th.finished).connect(lambda th=th: _MEDIA_RENDER_THREADS.discard(th))
+        tracker = getattr(self, "_track_bg_thread", None)
+        if callable(tracker):
+            try:
+                tracker(th)
+            except Exception:
+                pass
+        elif hasattr(self, "_bg_threads"):
+            try:
+                self._bg_threads.append(th)
+            except Exception:
+                pass
             cast(Any, th.finished).connect(
                 lambda: self._bg_threads.remove(th)
                 if hasattr(self, "_bg_threads") and th in getattr(self, "_bg_threads", []) else None

@@ -399,6 +399,10 @@ class ReleaseCheckWorker(QObject):
         super().__init__()
         self.repo = str(repo or "").strip()
         self.current_version = str(current_version or "").strip()
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
 
     @staticmethod
     def _normalize_version(value: str) -> Optional[Tuple[int, ...]]:
@@ -463,11 +467,19 @@ class ReleaseCheckWorker(QObject):
             payload["error"] = "Не задан репозиторий обновлений"
             self.finished.emit(payload)
             return
+        if self._stop:
+            payload["error"] = "Операция отменена"
+            self.finished.emit(payload)
+            return
         try:
             import requests
 
             url = f"https://api.github.com/repos/{repo}/releases/latest"
             resp = requests.get(url, timeout=(3.5, 8.0), headers={"Accept": "application/vnd.github+json"})
+            if self._stop:
+                payload["error"] = "Операция отменена"
+                self.finished.emit(payload)
+                return
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
             tag_name = str(data.get("tag_name") or "").strip()
@@ -499,6 +511,17 @@ class UpdateDownloadWorker(QObject):
         super().__init__()
         self.url = str(url or "").strip()
         self.output_path = str(output_path or "").strip()
+        self._stop = False
+        self._response = None
+
+    def stop(self) -> None:
+        self._stop = True
+        response = getattr(self, "_response", None)
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
     @Slot()
     def run(self) -> None:
@@ -516,19 +539,28 @@ class UpdateDownloadWorker(QObject):
 
             os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
             with requests.get(self.url, stream=True, timeout=(5.0, 30.0)) as resp:
+                self._response = resp
                 resp.raise_for_status()
                 total = int(resp.headers.get("Content-Length") or 0)
                 downloaded = 0
                 with open(self.output_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        if self._stop:
+                            payload["error"] = "Операция отменена"
+                            break
                         if not chunk:
                             continue
                         fh.write(chunk)
                         downloaded += len(chunk)
                         self.progress.emit(downloaded, total)
-            payload["ok"] = True
+                if not self._stop:
+                    payload["ok"] = not self._stop
+            if self._stop and not payload["error"]:
+                payload["error"] = "Операция отменена"
         except Exception as exc:
             payload["error"] = str(exc)
+        finally:
+            self._response = None
         self.finished.emit(payload)
 
 

@@ -42,9 +42,18 @@ class AccountStore:
         accounts.setdefault(session_name, {"title": session_name, "phone": "", "last_used": 0})
         self._save()
 
-    def update_account(self, session_name: str, **meta: object) -> None:
+    def has_account(self, session_name: str) -> bool:
         accounts: Dict[str, Dict[str, object]] = self._data.setdefault("accounts", {})  # type: ignore[assignment]
-        account = accounts.setdefault(session_name, {"title": session_name})
+        return session_name in accounts
+
+    def update_account(self, session_name: str, *, create_if_missing: bool = True, **meta: object) -> bool:
+        accounts: Dict[str, Dict[str, object]] = self._data.setdefault("accounts", {})  # type: ignore[assignment]
+        if create_if_missing:
+            account = accounts.setdefault(session_name, {"title": session_name})
+        else:
+            account = accounts.get(session_name)
+            if account is None:
+                return False
         last_used = meta.get("last_used") if meta else None
         for key, value in meta.items():
             if key == "last_used":
@@ -56,6 +65,7 @@ class AccountStore:
         else:
             account.setdefault("last_used", time.time())
         self._save()
+        return True
 
     def get_account(self, session_name: str) -> Dict[str, object]:
         accounts: Dict[str, Dict[str, object]] = self._data.setdefault("accounts", {})  # type: ignore[assignment]

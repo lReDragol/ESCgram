@@ -38,6 +38,31 @@ EMOJI_RE = re.compile(
     re.UNICODE,
 )
 URL_RE = re.compile(r"(https?://[^\s]+|t\.me/[^\s]+)", re.IGNORECASE)
+PROFILE_MEDIA_TYPES = {
+    "image",
+    "photo",
+    "video",
+    "animation",
+    "gif",
+    "video_note",
+    "sticker",
+}
+PROFILE_FILE_TYPES = {
+    "document",
+    "audio",
+    "voice",
+}
+
+
+def _normalize_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    url = raw if raw.lower().startswith(("http://", "https://")) else f"https://{raw}"
+    # Trim common trailing punctuation from plain-text links.
+    while url and url[-1] in ".,;:!?)]}>":
+        url = url[:-1]
+    return url
 
 
 def _iter_emoji_sequences(text: str) -> Iterator[str]:
@@ -301,6 +326,25 @@ class Storage:
               PRIMARY KEY (peer_id, scanned_at)
             );
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_profile_sections_cache (
+              peer_id      INTEGER NOT NULL,
+              section      TEXT NOT NULL,
+              dedupe_key   TEXT NOT NULL,
+              message_id   INTEGER NOT NULL,
+              message_date INTEGER NOT NULL,
+              payload      TEXT NOT NULL,
+              updated_at   INTEGER NOT NULL,
+              PRIMARY KEY (peer_id, section, dedupe_key)
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_profile_scan_state (
+              peer_id         INTEGER PRIMARY KEY,
+              last_message_id INTEGER NOT NULL DEFAULT 0,
+              updated_at      INTEGER NOT NULL
+            );
+            """,
             # files: медиа-кэш по file_id (в т.ч. avatar/media пути)
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -331,6 +375,7 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_messages_peer_id   ON messages(peer_id, id DESC);",
             "CREATE INDEX IF NOT EXISTS idx_deleted_events_peer_date ON deleted_message_events(peer_id, deleted_at DESC);",
             "CREATE INDEX IF NOT EXISTS idx_chat_statistics_snapshots_peer_time ON chat_statistics_snapshots(peer_id, scanned_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_profile_sections_cache_peer_section_date ON chat_profile_sections_cache(peer_id, section, message_date DESC, message_id DESC);",
             "CREATE INDEX IF NOT EXISTS idx_ai_history_chat_id ON ai_history(chat_id, id DESC);",
         ]
         with self._lock:
@@ -1213,6 +1258,49 @@ class Storage:
                     return ordered
         return ordered
 
+    def get_recent_custom_emoji_ids(self, *, limit: int = 48, sender_id: Optional[int] = None) -> List[int]:
+        params: List[Any] = []
+        sender_sql = ""
+        if sender_id is not None:
+            sender_sql = "AND COALESCE(from_id, 0) = ?"
+            params.append(int(sender_id))
+        params.append(int(max(limit * 40, 200)))
+        rows = self._query(
+            f"""
+            SELECT entities
+            FROM messages
+            WHERE COALESCE(TRIM(entities), '') <> '' {sender_sql}
+            ORDER BY date DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        ordered: List[int] = []
+        seen: set[int] = set()
+        for (entities_raw,) in rows:
+            try:
+                entities = json.loads(str(entities_raw or "[]"))
+            except Exception:
+                entities = []
+            if not isinstance(entities, list):
+                continue
+            for entity in entities:
+                if not isinstance(entity, dict):
+                    continue
+                if str(entity.get("type") or "").strip().lower() != "custom_emoji":
+                    continue
+                try:
+                    custom_id = int(entity.get("custom_emoji_id") or 0)
+                except Exception:
+                    custom_id = 0
+                if custom_id <= 0 or custom_id in seen:
+                    continue
+                seen.add(custom_id)
+                ordered.append(custom_id)
+                if len(ordered) >= int(limit):
+                    return ordered
+        return ordered
+
     def get_chat_shared_media(self, peer_id: int, *, limit: int = 120) -> List[Dict[str, Any]]:
         rows = self._query(
             """
@@ -1222,9 +1310,9 @@ class Storage:
               COALESCE(m.media_type, 'text'),
               COALESCE(m.message, ''),
               COALESCE(m.file_name, ''),
-              COALESCE(m.file_size, 0),
-              COALESCE(m.mime, ''),
-              COALESCE(f.path, m.file_path, ''),
+              COALESCE(f.size, 0),
+              COALESCE(f.mime, ''),
+              COALESCE(f.path, ''),
               COALESCE(m.from_id, 0)
             FROM messages m
             LEFT JOIN files f
@@ -1237,17 +1325,30 @@ class Storage:
             (int(peer_id), int(max(limit, 1))),
         )
         out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
         for row in rows:
+            file_path = str(row[7] or "")
+            file_name = str(row[4] or "")
+            file_size = int(row[5] or 0)
+            if file_path.strip():
+                key = f"path:{file_path.strip().lower()}"
+            elif file_name.strip():
+                key = f"name:{file_name.strip().lower()}|{file_size}"
+            else:
+                key = f"mid:{int(row[0])}"
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(
                 {
                     "id": int(row[0]),
                     "date": int(row[1] or 0),
                     "type": str(row[2] or "media"),
                     "text": str(row[3] or ""),
-                    "file_name": str(row[4] or ""),
-                    "file_size": int(row[5] or 0),
+                    "file_name": file_name,
+                    "file_size": file_size,
                     "mime": str(row[6] or ""),
-                    "file_path": str(row[7] or ""),
+                    "file_path": file_path,
                     "from_id": int(row[8] or 0),
                 }
             )
@@ -1262,9 +1363,9 @@ class Storage:
               COALESCE(m.media_type, 'text'),
               COALESCE(m.message, ''),
               COALESCE(m.file_name, ''),
-              COALESCE(m.file_size, 0),
-              COALESCE(m.mime, ''),
-              COALESCE(f.path, m.file_path, ''),
+              COALESCE(f.size, 0),
+              COALESCE(f.mime, ''),
+              COALESCE(f.path, ''),
               COALESCE(m.from_id, 0)
             FROM messages m
             LEFT JOIN files f
@@ -1280,17 +1381,30 @@ class Storage:
             (int(peer_id), int(max(limit, 1))),
         )
         out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
         for row in rows:
+            file_path = str(row[7] or "")
+            file_name = str(row[4] or "")
+            file_size = int(row[5] or 0)
+            if file_path.strip():
+                key = f"path:{file_path.strip().lower()}"
+            elif file_name.strip():
+                key = f"name:{file_name.strip().lower()}|{file_size}"
+            else:
+                key = f"mid:{int(row[0])}"
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(
                 {
                     "id": int(row[0]),
                     "date": int(row[1] or 0),
                     "type": str(row[2] or "file"),
                     "text": str(row[3] or ""),
-                    "file_name": str(row[4] or ""),
-                    "file_size": int(row[5] or 0),
+                    "file_name": file_name,
+                    "file_size": file_size,
                     "mime": str(row[6] or ""),
-                    "file_path": str(row[7] or ""),
+                    "file_path": file_path,
                     "from_id": int(row[8] or 0),
                 }
             )
@@ -1313,7 +1427,7 @@ class Storage:
             (int(peer_id), int(max(limit * 8, 300))),
         )
         out: List[Dict[str, Any]] = []
-        seen: set[Tuple[int, str]] = set()
+        seen: set[str] = set()
         for msg_id, msg_date, text, from_id in sample_rows:
             body = str(text or "")
             if not body:
@@ -1322,8 +1436,10 @@ class Storage:
                 raw = str(match.group(0) or "").strip()
                 if not raw:
                     continue
-                url = raw if raw.lower().startswith("http") else f"https://{raw}"
-                key = (int(msg_id), url)
+                url = _normalize_url(raw)
+                if not url:
+                    continue
+                key = url.lower()
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1340,6 +1456,296 @@ class Storage:
                 if len(out) >= int(limit):
                     return out
         return out
+
+    def get_chat_latest_message_id(self, peer_id: int) -> int:
+        rows = self._query(
+            """
+            SELECT COALESCE(MAX(id), 0)
+            FROM messages
+            WHERE peer_id = ?
+            """,
+            (int(peer_id),),
+        )
+        if not rows:
+            return 0
+        try:
+            return int(rows[0][0] or 0)
+        except Exception:
+            return 0
+
+    def get_chat_profile_scan_state(self, peer_id: int) -> Dict[str, int]:
+        rows = self._query(
+            """
+            SELECT last_message_id, updated_at
+            FROM chat_profile_scan_state
+            WHERE peer_id = ?
+            LIMIT 1
+            """,
+            (int(peer_id),),
+        )
+        if not rows:
+            return {"last_message_id": 0, "updated_at": 0}
+        row = rows[0]
+        try:
+            last_message_id = int(row[0] or 0)
+        except Exception:
+            last_message_id = 0
+        try:
+            updated_at = int(row[1] or 0)
+        except Exception:
+            updated_at = 0
+        return {"last_message_id": last_message_id, "updated_at": updated_at}
+
+    def _set_chat_profile_scan_state(self, peer_id: int, *, last_message_id: int) -> None:
+        ts = self._now()
+        self._exec(
+            """
+            INSERT INTO chat_profile_scan_state(peer_id,last_message_id,updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+              last_message_id=excluded.last_message_id,
+              updated_at=excluded.updated_at
+            """,
+            (int(peer_id), int(last_message_id), ts),
+        )
+
+    def _upsert_chat_profile_section_rows(
+        self,
+        peer_id: int,
+        section: str,
+        rows: List[Tuple[str, int, int, str]],
+    ) -> None:
+        if not rows:
+            return
+        ts = self._now()
+        data: List[Tuple[Any, ...]] = []
+        for dedupe_key, message_id, message_date, payload in rows:
+            key = str(dedupe_key or "").strip()
+            if not key:
+                continue
+            data.append(
+                (
+                    int(peer_id),
+                    str(section or ""),
+                    key,
+                    int(message_id or 0),
+                    int(message_date or 0),
+                    str(payload or "{}"),
+                    ts,
+                )
+            )
+        if not data:
+            return
+        self._execmany(
+            """
+            INSERT INTO chat_profile_sections_cache(
+              peer_id,section,dedupe_key,message_id,message_date,payload,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(peer_id,section,dedupe_key) DO UPDATE SET
+              message_id=CASE
+                WHEN excluded.message_id >= chat_profile_sections_cache.message_id THEN excluded.message_id
+                ELSE chat_profile_sections_cache.message_id
+              END,
+              message_date=CASE
+                WHEN excluded.message_id >= chat_profile_sections_cache.message_id THEN excluded.message_date
+                ELSE chat_profile_sections_cache.message_date
+              END,
+              payload=CASE
+                WHEN excluded.message_id >= chat_profile_sections_cache.message_id THEN excluded.payload
+                ELSE chat_profile_sections_cache.payload
+              END,
+              updated_at=excluded.updated_at
+            """,
+            data,
+        )
+
+    def get_cached_chat_profile_section(
+        self,
+        peer_id: int,
+        section: str,
+        *,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT message_id, message_date, payload
+            FROM chat_profile_sections_cache
+            WHERE peer_id = ? AND section = ?
+            ORDER BY message_date DESC, message_id DESC
+            LIMIT ?
+            """,
+            (int(peer_id), str(section or ""), int(max(limit, 1))),
+        )
+        out: List[Dict[str, Any]] = []
+        for message_id, message_date, payload_raw in rows:
+            payload: Dict[str, Any]
+            try:
+                payload = json.loads(str(payload_raw or "{}"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            payload["id"] = int(message_id or payload.get("id") or 0)
+            payload["date"] = int(message_date or payload.get("date") or 0)
+            out.append(payload)
+        return out
+
+    def refresh_chat_profile_sections_cache(
+        self,
+        peer_id: int,
+        *,
+        chunk_size: int = 400,
+        full_scan: bool = False,
+    ) -> Dict[str, int]:
+        pid = int(peer_id)
+        scan_state = self.get_chat_profile_scan_state(pid)
+        latest_before = self.get_chat_latest_message_id(pid)
+        if latest_before <= 0:
+            if full_scan:
+                self._exec(
+                    "DELETE FROM chat_profile_sections_cache WHERE peer_id = ?",
+                    (pid,),
+                )
+                self._set_chat_profile_scan_state(pid, last_message_id=0)
+            return {"processed": 0, "last_message_id": 0, "latest_message_id": 0}
+
+        start_id = 0 if bool(full_scan) else int(scan_state.get("last_message_id") or 0)
+        if bool(full_scan):
+            self._exec(
+                "DELETE FROM chat_profile_sections_cache WHERE peer_id = ?",
+                (pid,),
+            )
+
+        processed = 0
+        last_id = int(start_id)
+        step = max(80, int(chunk_size or 0))
+
+        while True:
+            rows = self._query(
+                """
+                SELECT
+                  m.id,
+                  COALESCE(m.date, 0),
+                  COALESCE(m.message, ''),
+                  COALESCE(m.media_type, 'text'),
+                  COALESCE(m.file_name, ''),
+                  COALESCE(m.from_id, 0),
+                  COALESCE(m.media_group_id, ''),
+                  COALESCE(f.size, 0),
+                  COALESCE(f.mime, ''),
+                  COALESCE(f.path, '')
+                FROM messages m
+                LEFT JOIN files f
+                  ON f.file_id = COALESCE(m.media_id, CAST(m.peer_id AS TEXT) || ':' || CAST(m.id AS TEXT))
+                WHERE m.peer_id = ? AND m.id > ?
+                ORDER BY m.id ASC
+                LIMIT ?
+                """,
+                (pid, int(last_id), step),
+            )
+            if not rows:
+                break
+
+            media_batch: List[Tuple[str, int, int, str]] = []
+            files_batch: List[Tuple[str, int, int, str]] = []
+            links_batch: List[Tuple[str, int, int, str]] = []
+
+            for row in rows:
+                mid = int(row[0] or 0)
+                if mid <= 0:
+                    continue
+                msg_date = int(row[1] or 0)
+                text = str(row[2] or "")
+                media_type_raw = str(row[3] or "text").strip().lower()
+                media_type = {"photo": "image", "gif": "animation"}.get(media_type_raw, media_type_raw)
+                file_name = str(row[4] or "")
+                from_id = int(row[5] or 0)
+                media_group_id = str(row[6] or "")
+                file_size = int(row[7] or 0)
+                mime = str(row[8] or "")
+                file_path = str(row[9] or "")
+                file_path_norm = file_path.strip().lower()
+
+                if media_type in PROFILE_MEDIA_TYPES:
+                    media_payload = {
+                        "id": mid,
+                        "date": msg_date,
+                        "type": media_type or "media",
+                        "text": text,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                        "mime": mime,
+                        "file_path": file_path,
+                        "from_id": from_id,
+                        "media_group_id": media_group_id or None,
+                    }
+                    if file_path_norm:
+                        media_key = f"path:{file_path_norm}"
+                    elif file_name:
+                        media_key = f"name:{file_name.strip().lower()}|{file_size}"
+                    else:
+                        media_key = f"mid:{mid}"
+                    media_batch.append((media_key, mid, msg_date, json.dumps(media_payload, ensure_ascii=False)))
+
+                if media_type in PROFILE_FILE_TYPES or bool(file_name.strip()):
+                    file_payload = {
+                        "id": mid,
+                        "date": msg_date,
+                        "type": media_type or "file",
+                        "text": text,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                        "mime": mime,
+                        "file_path": file_path,
+                        "from_id": from_id,
+                    }
+                    if file_path_norm:
+                        file_key = f"path:{file_path_norm}"
+                    elif file_name:
+                        file_key = f"name:{file_name.strip().lower()}|{file_size}"
+                    else:
+                        file_key = f"mid:{mid}"
+                    files_batch.append((file_key, mid, msg_date, json.dumps(file_payload, ensure_ascii=False)))
+
+                if text:
+                    for match in URL_RE.finditer(text):
+                        raw = str(match.group(0) or "").strip()
+                        if not raw:
+                            continue
+                        url = _normalize_url(raw)
+                        if not url:
+                            continue
+                        link_payload = {
+                            "id": mid,
+                            "date": msg_date,
+                            "url": url,
+                            "raw": raw,
+                            "context": text[:320],
+                            "from_id": from_id,
+                        }
+                        links_batch.append((url.lower(), mid, msg_date, json.dumps(link_payload, ensure_ascii=False)))
+
+            self._upsert_chat_profile_section_rows(pid, "media", media_batch)
+            self._upsert_chat_profile_section_rows(pid, "files", files_batch)
+            self._upsert_chat_profile_section_rows(pid, "links", links_batch)
+
+            processed += len(rows)
+            last_id = int(rows[-1][0] or last_id)
+            self._set_chat_profile_scan_state(pid, last_message_id=last_id)
+
+            if len(rows) < step:
+                break
+
+        latest_after = self.get_chat_latest_message_id(pid)
+        if latest_after > last_id:
+            self._set_chat_profile_scan_state(pid, last_message_id=latest_after)
+            last_id = latest_after
+        return {
+            "processed": int(processed),
+            "last_message_id": int(last_id),
+            "latest_message_id": int(latest_after),
+        }
 
     def get_chat_members_activity(self, peer_id: int, *, limit: int = 80) -> List[Dict[str, Any]]:
         rows = self._query(

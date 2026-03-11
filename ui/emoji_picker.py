@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Optional, Sequence, List
 
 from PySide6.QtCore import Qt, Signal, QPoint
@@ -16,6 +17,41 @@ _FALLBACK_EMOJIS: Sequence[str] = [
     "🚀", "🌐", "💼", "📚", "📈", "📉", "💸", "🏆", "🥇", "🎁", "🧨", "🎯",
     "😅", "🤤", "😈", "😬", "🙃", "😐", "😮", "😱", "🤬", "😏", "🤓", "🤠",
 ]
+
+_FALLBACK_COMBINED_EMOJIS: Sequence[str] = [
+    "👨‍💻", "👩‍💻", "🧑‍💻", "👨‍💼", "👩‍💼", "🧑‍💼",
+    "👨‍🔧", "👩‍🔧", "🧑‍🔧", "👨‍🚀", "👩‍🚀", "🧑‍🚀",
+    "👨‍⚕️", "👩‍⚕️", "🧑‍⚕️", "👨‍🏫", "👩‍🏫", "🧑‍🏫",
+    "👨‍🎨", "👩‍🎨", "🧑‍🎨", "👨‍👩‍👧", "👨‍👩‍👧‍👦",
+    "👩‍👩‍👦", "👨‍👨‍👧", "🧑‍🤝‍🧑", "👩‍❤️‍💋‍👩", "👨‍❤️‍💋‍👨",
+]
+
+
+def _unicode_emoji_fallback(*, limit: Optional[int] = None) -> Sequence[str]:
+    max_items = int(limit) if isinstance(limit, int) and int(limit) > 0 else None
+    out: List[str] = []
+    seen: set[str] = set()
+    ranges = (
+        (0x1F300, 0x1FAFF),  # Symbols and pictographs (+ supplemental)
+        (0x2600, 0x26FF),    # Misc symbols
+        (0x2700, 0x27BF),    # Dingbats
+    )
+    for start, end in ranges:
+        for code in range(start, end + 1):
+            ch = chr(code)
+            if ch in seen or _is_flag_sequence(ch):
+                continue
+            try:
+                category = unicodedata.category(ch)
+            except Exception:
+                continue
+            if category not in {"So", "Sk"}:
+                continue
+            seen.add(ch)
+            out.append(ch)
+            if max_items is not None and len(out) >= max_items:
+                return tuple(out)
+    return tuple(out)
 
 
 def _is_flag_sequence(value: str) -> bool:
@@ -47,7 +83,8 @@ def _normalize_picker_emoji(values: Sequence[str], *, limit: Optional[int] = Non
     max_items = int(limit) if isinstance(limit, int) and int(limit) > 0 else None
     merged: List[str] = []
     seen: set[str] = set()
-    for emoji in list(_FALLBACK_EMOJIS) + [str(v or "").strip() for v in values]:
+    seed_values = list(_FALLBACK_EMOJIS) + list(_FALLBACK_COMBINED_EMOJIS)
+    for emoji in seed_values + [str(v or "").strip() for v in values]:
         value = str(emoji or "").strip()
         if not value or value in seen:
             continue
@@ -85,7 +122,9 @@ def load_all_emojis(*, limit: Optional[int] = None) -> Sequence[str]:
         values = []
 
     if not values:
-        values = [str(e) for e in _FALLBACK_EMOJIS if str(e).strip()]
+        values = list(_unicode_emoji_fallback(limit=max_items))
+    if not values:
+        values = [str(e) for e in (_FALLBACK_EMOJIS + _FALLBACK_COMBINED_EMOJIS) if str(e).strip()]
 
     normalized = list(_normalize_picker_emoji(values, limit=max_items))
     if max_items is not None:

@@ -185,6 +185,7 @@ class TelegramAdapter:
 
         # cache: (user_id, ts)
         self._me_cache: Optional[tuple[str, float]] = None
+        self._me_cache_lock: Optional[asyncio.Lock] = None
 
         # config
         cfg = _load_config()
@@ -218,7 +219,6 @@ class TelegramAdapter:
         self._session_name = picked
         self._pending_session_name: Optional[str] = None
         if self._session_exists(self._session_name):
-            self._account_store.ensure_account(self._session_name)
             self._account_store.set_active(self._session_name)
         self._download_jobs: Dict[str, _DownloadJob] = {}
         self._message_to_job: Dict[Tuple[str, int], str] = {}
@@ -330,6 +330,26 @@ class TelegramAdapter:
         self._pending_session_name = None
         self._activate_session(session_name, register=True)
 
+    def cancel_pending_account_session(self, fallback_session: Optional[str] = None) -> None:
+        pending = str(self._pending_session_name or "").strip()
+        target = str(fallback_session or "").strip()
+
+        if pending and target and target != pending and self._session_exists(target):
+            self._activate_session(
+                target,
+                register=bool(getattr(self._account_store, "has_account", lambda *_: False)(target)),
+            )
+        elif target and target != self._session_name and self._session_exists(target):
+            self._activate_session(
+                target,
+                register=bool(getattr(self._account_store, "has_account", lambda *_: False)(target)),
+            )
+
+        if pending:
+            self._delete_session_files(pending)
+            self._account_store.remove_account(pending)
+        self._pending_session_name = None
+
     def delete_account(self, session_name: str) -> None:
         name = str(session_name or "").strip()
         if not name:
@@ -345,16 +365,17 @@ class TelegramAdapter:
             self._delete_session_files(session_name)
         self._session_name = session_name
         if register:
-            self._account_store.ensure_account(session_name)
             self._account_store.set_active(session_name)
-            self._account_store.update_account(session_name, last_used=time.time())
+            self._account_store.update_account(session_name, last_used=time.time(), create_if_missing=False)
         self._connected = False
         self._initialized = False
         self._auth_invalid = False
+        self._current_phone_hash = None
         self.start()
 
     def _finalize_authenticated_session(self, profile: Optional[Dict[str, Any]] = None) -> None:
         self._pending_session_name = None
+        self._current_phone_hash = None
         self._account_store.ensure_account(self._session_name)
         self._account_store.set_active(self._session_name)
         base_meta: Dict[str, Any] = {"last_used": time.time()}
@@ -402,7 +423,10 @@ class TelegramAdapter:
             return None
 
         async def _get_me():
-            me = await self._client.get_me()
+            me = getattr(self._client, "me", None)
+            if me is None:
+                me = await self._client.get_me()
+                setattr(self._client, "me", me)
             return {
                 "user_id": int(getattr(me, "id", 0) or 0),
                 "first_name": (me.first_name or ""),
@@ -429,6 +453,8 @@ class TelegramAdapter:
     def stop(self) -> None:
         if not self._enabled or not self._loop:
             return
+        loop = self._loop
+        thread = self._thread
 
         async def _shutdown():
             try:
@@ -442,28 +468,40 @@ class TelegramAdapter:
                             await task
                 except Exception:
                     log.exception("[TG] Failed to flush pending deleted events during shutdown")
-                if self._initialized and self._client:
-                    await self._client.terminate()
-                    self._initialized = False
             finally:
-                if self._connected and self._client:
-                    try:
-                        await self._client.disconnect()
-                    except Exception:
-                        pass
                 if self._stop_event and not self._stop_event.is_set():
                     self._stop_event.set()
 
-        fut = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+        fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
         try:
-            fut.result(5)
+            fut.result(3)
         except Exception:
-            pass
+            try:
+                if loop.is_running():
+                    loop.call_soon_threadsafe(
+                        lambda: self._stop_event.set()
+                        if self._stop_event and not self._stop_event.is_set()
+                        else None
+                    )
+            except Exception:
+                pass
 
-        if self._thread:
-            self._thread.join(timeout=5)
+        if thread:
+            thread.join(timeout=8)
+            if thread.is_alive():
+                log.warning("[TG] Loop thread did not stop within timeout; forcing loop stop")
+                try:
+                    if loop.is_running():
+                        loop.call_soon_threadsafe(loop.stop)
+                except Exception:
+                    pass
+                thread.join(timeout=2)
         self._thread = None
         self._loop = None
+        self._client = None
+        self._stop_event = None
+        self._connected = False
+        self._initialized = False
         self._raw_delete_handler = None
         self._deleted_flush_task = None
         self._pending_deleted_by_peer = {}
@@ -490,39 +528,54 @@ class TelegramAdapter:
             log.info("[TG] connected (non-interactive)")
 
         async def _main():
+            self._stop_event = asyncio.Event()
             await _connect_only()
+            if self._stop_event.is_set():
+                return
             # если уже авторизованы — поднимем апдейты
             try:
                 me = await self._client.get_me()
                 self._auth_invalid = False
                 self._finalize_authenticated_session(self._profile_from_raw_me(me))
-                await self._initialize_updates()
-            except Exception:
-                pass
+                if not self._stop_event.is_set():
+                    await self._initialize_updates()
+            except Exception as exc:
+                if self._is_auth_issue(exc):
+                    self._auth_invalid = True
+                    self._notify_auth_issue(exc)
 
-            self._stop_event = asyncio.Event()
             await self._stop_event.wait()
 
             try:
                 if self._initialized:
-                    await self._client.terminate()
+                    await asyncio.wait_for(self._client.terminate(), timeout=3.0)
             finally:
                 try:
-                    await self._client.disconnect()
+                    await asyncio.wait_for(self._client.disconnect(), timeout=3.0)
                 except Exception:
                     pass
 
         try:
             self._loop.run_until_complete(_main())
         finally:
-            pending = asyncio.all_tasks(loop=self._loop)
+            pending = [t for t in asyncio.all_tasks(loop=self._loop) if not t.done()]
             for t in pending:
                 t.cancel()
             try:
-                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=1.5)
+                    )
             except Exception:
                 pass
-            self._loop.stop()
+            try:
+                self._loop.stop()
+            except Exception:
+                pass
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     # -------------------- helpers --------------------
     @staticmethod
@@ -717,20 +770,34 @@ class TelegramAdapter:
         В Pyrogram 2.x self.me может быть None до первого get_me().
         А save_file() смотрит self.me.is_premium -> без этого падает.
         """
-        if getattr(self._client, "me", None) is None:
-            me = await self._client.get_me()
-            setattr(self._client, "me", me)
+        if getattr(self._client, "me", None) is not None:
+            return
+        me = await self._client.get_me()
+        setattr(self._client, "me", me)
 
     async def _get_me_id_cached(self, ttl_sec: float = 60.0) -> Optional[str]:
         try:
-            now = time.time()
-            if self._me_cache and (now - self._me_cache[1] < ttl_sec):
-                return self._me_cache[0]
-            me = await self._client.get_me()  # внутри users.GetFullUser
-            mid = str(me.id)
-            self._me_cache = (mid, now)
-            setattr(self._client, "me", me)  # прогреваем для save_file()
-            return mid
+            lock = self._me_cache_lock
+            if lock is None:
+                lock = asyncio.Lock()
+                self._me_cache_lock = lock
+            async with lock:
+                now = time.time()
+                if self._me_cache and (now - self._me_cache[1] < ttl_sec):
+                    return self._me_cache[0]
+                me = getattr(self._client, "me", None)
+                if me is not None:
+                    mid = str(getattr(me, "id", "") or "").strip()
+                    if mid:
+                        self._me_cache = (mid, now)
+                        return mid
+                me = await self._client.get_me()  # внутри users.GetFullUser
+                mid = str(getattr(me, "id", "") or "").strip()
+                if not mid:
+                    return None
+                self._me_cache = (mid, now)
+                setattr(self._client, "me", me)  # прогреваем для save_file()
+                return mid
         except sqlite3.ProgrammingError as exc:
             if "closed database" in str(exc).lower():
                 log.warning("[TG] storage connection closed, reconnecting client")
@@ -743,7 +810,10 @@ class TelegramAdapter:
                     return await self._get_me_id_cached(ttl_sec=ttl_sec)  # retry once
                 except Exception:
                     return None
-        except Exception:
+        except Exception as exc:
+            if self._is_auth_issue(exc):
+                self._auth_invalid = True
+                self._notify_auth_issue(exc)
             return None
 
     # -------- ffmpeg helpers: convert to OGG/Opus & probe duration --------
@@ -1312,6 +1382,75 @@ class TelegramAdapter:
         except Exception:
             return []
 
+    def get_custom_emoji_items_sync(self, custom_ids: List[int], timeout: float = 12.0) -> List[Dict[str, Any]]:
+        if not (self._enabled and self._client and self._loop):
+            return []
+        normalized: List[int] = []
+        seen: set[int] = set()
+        for raw_id in list(custom_ids or []):
+            try:
+                custom_id = int(raw_id or 0)
+            except Exception:
+                custom_id = 0
+            if custom_id <= 0 or custom_id in seen:
+                continue
+            seen.add(custom_id)
+            normalized.append(custom_id)
+            if len(normalized) >= 200:
+                break
+        if not normalized:
+            return []
+
+        async def _run() -> List[Dict[str, Any]]:
+            try:
+                stickers = await self._client.get_custom_emoji_stickers(normalized)
+            except Exception:
+                return []
+            out: List[Dict[str, Any]] = []
+            for custom_id, sticker in zip(normalized, list(stickers or [])):
+                try:
+                    thumbs = list(getattr(sticker, "thumbs", None) or [])
+                    thumb_file_id = str(getattr(thumbs[0], "file_id", "") or "").strip() if thumbs else ""
+                    out.append(
+                        {
+                            "custom_emoji_id": int(custom_id),
+                            "file_id": str(getattr(sticker, "file_id", "") or "").strip(),
+                            "thumb_file_id": thumb_file_id,
+                            "emoji": str(getattr(sticker, "emoji", "") or "").strip(),
+                            "mime": str(getattr(sticker, "mime_type", "") or "").strip(),
+                            "is_animated": bool(getattr(sticker, "is_animated", False)),
+                            "is_video": bool(getattr(sticker, "is_video", False)),
+                            "width": int(getattr(sticker, "width", 0) or 0),
+                            "height": int(getattr(sticker, "height", 0) or 0),
+                        }
+                    )
+                except Exception:
+                    continue
+            return out
+
+        try:
+            return list(self._call(_run(), timeout) or [])
+        except Exception:
+            return []
+
+    def get_recent_custom_emojis_sync(self, limit: int = 24, timeout: float = 12.0) -> List[Dict[str, Any]]:
+        if not self._storage:
+            return []
+        my_id: Optional[int] = None
+        try:
+            raw_id = self.get_self_id_sync(timeout=timeout)
+            if raw_id:
+                my_id = int(raw_id)
+        except Exception:
+            my_id = None
+        try:
+            custom_ids = self._storage.get_recent_custom_emoji_ids(limit=max(1, int(limit)), sender_id=my_id)
+        except Exception:
+            custom_ids = []
+        if not custom_ids:
+            return []
+        return self.get_custom_emoji_items_sync(custom_ids, timeout=timeout)
+
     def get_chat_full_info_sync(self, chat_id: str, timeout: float = 15.0) -> Optional[Dict[str, Any]]:
         if not (self._enabled and self._client and self._loop):
             return None
@@ -1427,37 +1566,51 @@ class TelegramAdapter:
         async def _run() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
             seen: set[int] = set()
-            async for member in self._client.get_chat_members(int(chat_id), limit=total):
-                user = getattr(member, "user", None)
-                if user is None:
-                    continue
-                try:
-                    uid = int(getattr(user, "id", 0) or 0)
-                except Exception:
-                    uid = 0
-                if uid <= 0 or uid in seen:
-                    continue
-                seen.add(uid)
-                first = str(getattr(user, "first_name", "") or "").strip()
-                last = str(getattr(user, "last_name", "") or "").strip()
-                username = str(getattr(user, "username", "") or "").strip()
-                full_name = " ".join([part for part in [first, last] if part]).strip()
-                if not full_name:
-                    full_name = username or str(uid)
-                status_raw = getattr(member, "status", None)
-                status = str(getattr(status_raw, "name", None) or status_raw or "").strip().lower()
-                out.append(
-                    {
-                        "id": uid,
-                        "name": full_name,
-                        "username": username,
-                        "type": "bot" if bool(getattr(user, "is_bot", False)) else "user",
-                        "status": status,
-                        "is_verified": bool(getattr(user, "is_verified", False)),
-                    }
-                )
-                if len(out) >= total:
-                    break
+            try:
+                # For private dialogs/chat ids that don't support participants API,
+                # skip member scan to avoid CHANNEL_INVALID/FLOOD_WAIT stalls in UI.
+                chat = await self._client.get_chat(int(chat_id))
+                ctype = getattr(chat, "type", None)
+                ctype_name = str(getattr(ctype, "name", ctype) or "").strip().lower()
+                if ctype_name in {"private", "bot"}:
+                    return out
+            except Exception:
+                # Non-fatal: try scanning members below and fallback to [] on failure.
+                pass
+            try:
+                async for member in self._client.get_chat_members(int(chat_id), limit=total):
+                    user = getattr(member, "user", None)
+                    if user is None:
+                        continue
+                    try:
+                        uid = int(getattr(user, "id", 0) or 0)
+                    except Exception:
+                        uid = 0
+                    if uid <= 0 or uid in seen:
+                        continue
+                    seen.add(uid)
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    username = str(getattr(user, "username", "") or "").strip()
+                    full_name = " ".join([part for part in [first, last] if part]).strip()
+                    if not full_name:
+                        full_name = username or str(uid)
+                    status_raw = getattr(member, "status", None)
+                    status = str(getattr(status_raw, "name", None) or status_raw or "").strip().lower()
+                    out.append(
+                        {
+                            "id": uid,
+                            "name": full_name,
+                            "username": username,
+                            "type": "bot" if bool(getattr(user, "is_bot", False)) else "user",
+                            "status": status,
+                            "is_verified": bool(getattr(user, "is_verified", False)),
+                        }
+                    )
+                    if len(out) >= total:
+                        break
+            except Exception:
+                return out
             return out
 
         try:
@@ -1587,23 +1740,37 @@ class TelegramAdapter:
 
     # -------------------- AUTH: phone + code (+2FA) --------------------
     def send_login_code_sync(self, phone: str, timeout: float = 20.0) -> str:
+        phone_number = self._normalize_phone_number(phone)
+        self._current_phone_hash = None
+
         async def _send():
-            sent = await self._client.send_code(phone)
-            self._current_phone_hash = sent.phone_code_hash
-            return self._current_phone_hash
-        return self._call(_send(), timeout)
+            sent = await self._client.send_code(phone_number)
+            phone_hash = str(getattr(sent, "phone_code_hash", "") or "").strip()
+            if not phone_hash:
+                raise RuntimeError("Telegram не вернул phone_code_hash для входа.")
+            self._current_phone_hash = phone_hash
+            return phone_hash
+
+        result = self._call(_send(), timeout)
+        phone_hash = str(result or "").strip()
+        if not phone_hash:
+            raise RuntimeError("Не удалось запросить код подтверждения у Telegram.")
+        return phone_hash
 
     def sign_in_with_code_sync(
         self, phone: str, code: str, password: Optional[str] = None, timeout: float = 30.0
     ) -> bool:
+        phone_number = self._normalize_phone_number(phone)
+        login_code = self._normalize_phone_code(code)
+
         async def _signin():
             if not self._current_phone_hash:
                 raise RuntimeError("Сначала отправьте код на телефон (нет phone_code_hash).")
             try:
                 await self._client.sign_in(
-                    phone_number=phone,
+                    phone_number=phone_number,
                     phone_code_hash=self._current_phone_hash,
-                    phone_code=code
+                    phone_code=login_code,
                 )
             except SessionPasswordNeeded:
                 if not password:
@@ -1616,6 +1783,24 @@ class TelegramAdapter:
             self._auth_invalid = False
             self._finalize_authenticated_session()
         return ok
+
+    def reset_phone_login_state(self) -> None:
+        self._current_phone_hash = None
+
+    @staticmethod
+    def _normalize_phone_number(phone: str) -> str:
+        raw = str(phone or "").strip()
+        has_plus = raw.startswith("+")
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return raw
+        return f"+{digits}" if has_plus else digits
+
+    @staticmethod
+    def _normalize_phone_code(code: str) -> str:
+        raw = str(code or "").strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return digits or raw
 
     # -------------------- AUTH: QR login (+2FA) --------------------
     def submit_qr_2fa_password_sync(self, password: str, timeout: float = 5.0) -> bool:
@@ -2739,9 +2924,9 @@ class TelegramAdapter:
         *,
         entities: Optional[List[Dict[str, Any]]] = None,
         timeout: float = 15.0,
-    ) -> bool:
+    ) -> Optional[int]:
         if not (self._enabled and self._client and self._loop):
-            return False
+            return None
 
         async def _send():
             try:
@@ -2795,12 +2980,20 @@ class TelegramAdapter:
                     **kwargs,
                 )
                 if msg_obj is not None:
-                    self._remember_local_outgoing(getattr(msg_obj, "id", None))
-                return True
+                    message_id = int(getattr(msg_obj, "id", 0) or 0)
+                    if message_id > 0:
+                        self._remember_local_outgoing(message_id)
+                        return message_id
+                return None
             except Exception:
-                return False
+                return None
 
-        return bool(self._call(_send(), timeout))
+        result = self._call(_send(), timeout)
+        try:
+            message_id = int(result) if result is not None else 0
+        except Exception:
+            message_id = 0
+        return message_id if message_id > 0 else None
 
     def delete_messages_sync(self, chat_id: str, message_ids: List[int], timeout: float = 15.0) -> bool:
         if not (self._enabled and self._client and self._loop):
@@ -2870,6 +3063,10 @@ class TelegramAdapter:
         async def _press() -> Dict[str, Any]:
             try:
                 msg = await self._client.get_messages(int(chat_id), int(message_id))
+                if isinstance(msg, (list, tuple)):
+                    msg = msg[0] if msg else None
+                if msg is None:
+                    return {"ok": False, "error": "message not found"}
                 result = await msg.click(int(row), int(col))
                 payload: Dict[str, Any] = {"ok": True}
                 if isinstance(result, str) and result.strip():
