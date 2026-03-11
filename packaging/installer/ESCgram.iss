@@ -215,7 +215,8 @@ begin
   ApiPage.Values[1] := '';
   ApiPage.Edits[0].ReadOnly := False;
   ApiPage.Edits[1].ReadOnly := False;
-  ApiPage.Edits[0].SetFocus;
+  if ApiPage.Edits[0].CanFocus then
+    WizardForm.ActiveControl := ApiPage.Edits[0];
 end;
 
 procedure _OnApiPublicCheckClick(Sender: TObject);
