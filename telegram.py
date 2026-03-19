@@ -71,6 +71,7 @@ except Exception:
 def _load_config() -> Dict[str, Any]:
     candidates: List[Path] = []
     seen: Set[str] = set()
+    failed_reads: List[Tuple[Path, Exception]] = []
 
     def _add(path: Optional[Path]) -> None:
         if not path:
@@ -131,8 +132,11 @@ def _load_config() -> Dict[str, Any]:
                 if isinstance(cfg, dict):
                     log.info("[TG] config loaded from %s", path)
                     return cfg
-        except Exception:
+        except Exception as exc:
+            failed_reads.append((path, exc))
             continue
+    for path, exc in failed_reads:
+        log.warning("[TG] failed to read config %s: %s", path, exc)
     return {}
 
 
@@ -227,6 +231,8 @@ class TelegramAdapter:
         self._pending_deleted_unknown: Set[int] = set()
         self._deleted_flush_task: Optional[asyncio.Task[Any]] = None
         self._raw_delete_handler: Optional["RawUpdateHandler"] = None
+        self._loop_ready = threading.Event()
+        self._shutdown_requested = threading.Event()
 
         self._local_outgoing_ids: Deque[int] = deque()
         self._local_outgoing_lookup: Set[int] = set()
@@ -244,6 +250,18 @@ class TelegramAdapter:
 
     def set_ghost_mode(self, enabled: bool) -> None:
         self._ghost_mode_enabled = bool(enabled)
+
+    def _reset_runtime_state(self) -> None:
+        self._loop = None
+        self._client = None
+        self._stop_event = None
+        self._connected = False
+        self._initialized = False
+        self._raw_delete_handler = None
+        self._deleted_flush_task = None
+        self._pending_deleted_by_peer = {}
+        self._pending_deleted_unknown = set()
+        self._loop_ready.clear()
 
     def _pick_existing_session_name(self, candidates: List[str]) -> str:
         for name in candidates:
@@ -445,16 +463,34 @@ class TelegramAdapter:
         if not self._enabled:
             log.info("[TG] Telegram disabled: missing pyrogram or telegram_api_id/hash in config.json (or env DRAGO_TG_API_*)")
             return
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
+            self._reset_runtime_state()
         if self._thread:
             return
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._shutdown_requested.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="telegram-loop")
         self._thread.start()
 
     def stop(self) -> None:
-        if not self._enabled or not self._loop:
-            return
-        loop = self._loop
         thread = self._thread
+        if not self._enabled and not thread:
+            return
+        self._shutdown_requested.set()
+
+        if thread and not self._loop:
+            self._loop_ready.wait(timeout=2.0)
+
+        loop = self._loop
+        if not loop:
+            if thread:
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    log.warning("[TG] Stop requested before loop initialised; thread is still alive")
+                else:
+                    self._thread = None
+                    self._reset_runtime_state()
+            return
 
         async def _shutdown():
             try:
@@ -497,18 +533,11 @@ class TelegramAdapter:
                     pass
                 thread.join(timeout=2)
         self._thread = None
-        self._loop = None
-        self._client = None
-        self._stop_event = None
-        self._connected = False
-        self._initialized = False
-        self._raw_delete_handler = None
-        self._deleted_flush_task = None
-        self._pending_deleted_by_peer = {}
-        self._pending_deleted_unknown = set()
+        self._reset_runtime_state()
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
+        self._loop_ready.set()
         asyncio.set_event_loop(self._loop)
         ensure_asyncio_exception_logging(self._loop)
 
@@ -529,8 +558,14 @@ class TelegramAdapter:
 
         async def _main():
             self._stop_event = asyncio.Event()
+            if self._shutdown_requested.is_set():
+                self._stop_event.set()
+                return
             await _connect_only()
             if self._stop_event.is_set():
+                return
+            if self._shutdown_requested.is_set():
+                self._stop_event.set()
                 return
             # если уже авторизованы — поднимем апдейты
             try:
@@ -576,6 +611,9 @@ class TelegramAdapter:
                 self._loop.close()
             except Exception:
                 pass
+            if self._thread is threading.current_thread():
+                self._thread = None
+            self._reset_runtime_state()
 
     # -------------------- helpers --------------------
     @staticmethod

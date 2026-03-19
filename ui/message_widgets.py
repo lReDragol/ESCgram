@@ -77,7 +77,7 @@ def _bubble_radius() -> int:
 
 
 class _CustomEmojiBus(QObject):
-    resolved = Signal(int)
+    resolved = Signal(str)
 
     def __init__(self) -> None:
         super().__init__(None)
@@ -170,7 +170,7 @@ def _queue_custom_emoji_fetch(custom_id: int) -> None:
         with _CUSTOM_EMOJI_LOCK:
             _CUSTOM_EMOJI_PENDING.discard(cid)
         try:
-            _CUSTOM_EMOJI_BUS.resolved.emit(cid)
+            _CUSTOM_EMOJI_BUS.resolved.emit(str(cid))
         except Exception:
             return
 
@@ -743,8 +743,8 @@ class RichTextLabel(QLabel):
             html = _prepare_rich_text(text)
         self.setText(html)
 
-    @Slot(int)
-    def _on_custom_emoji_resolved(self, custom_id: int) -> None:
+    @Slot(str)
+    def _on_custom_emoji_resolved(self, custom_id: str) -> None:
         try:
             cid = int(custom_id or 0)
         except Exception:

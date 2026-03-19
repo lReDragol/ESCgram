@@ -5,6 +5,7 @@ import os
 import re
 import time
 import threading
+import logging
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ try:
     import apsw  # type: ignore
     HAVE_APSW = True
 except Exception:
+    apsw = None  # type: ignore[assignment]
     HAVE_APSW = False
 import sqlite3
 
@@ -52,6 +54,13 @@ PROFILE_FILE_TYPES = {
     "audio",
     "voice",
 }
+log = logging.getLogger("storage")
+
+
+def _ensure_db_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(str(path)))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def _normalize_url(value: str) -> str:
@@ -136,7 +145,7 @@ class Storage:
 
     @classmethod
     def open_default(cls) -> "Storage":
-        os.makedirs(os.path.dirname(DEFAULT_DB_PATH), exist_ok=True)
+        _ensure_db_parent_dir(DEFAULT_DB_PATH)
         st = cls(DEFAULT_DB_PATH)
         st.connect()
         return st
@@ -146,22 +155,30 @@ class Storage:
             return
         self._closing = False
 
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        _ensure_db_parent_dir(self.db_path)
 
+        apsw_error: Optional[Exception] = None
         if HAVE_APSW:
-            conn = apsw.Connection(self.db_path)  # type: ignore[assignment]
-            conn.setbusytimeout(5_000)  # мс
-            self._cx = _ConnWrap(True, conn)
-            cur = conn.cursor()
-            # WAL и базовые pragma
-            cur.execute("PRAGMA foreign_keys=ON;")
-            cur.execute("PRAGMA journal_mode=WAL;")              # включаем WAL
-            cur.execute("PRAGMA synchronous=NORMAL;")            # в WAL это «безопасно» и быстро
-            cur.execute("PRAGMA temp_store=MEMORY;")
-            cur.execute("PRAGMA cache_size=-%d;" % CACHE_PAGES_KIB)
-            cur.execute("PRAGMA wal_autocheckpoint=1000;")       # ~1000 страниц между чекпойнтами
-            cur.execute("PRAGMA mmap_size=%d;" % MMAP_SIZE_BYTES)
-        else:
+            try:
+                conn = apsw.Connection(self.db_path)  # type: ignore[union-attr,assignment]
+                conn.setbusytimeout(5_000)  # мс
+                cur = conn.cursor()
+                # WAL и базовые pragma
+                cur.execute("PRAGMA foreign_keys=ON;")
+                cur.execute("PRAGMA journal_mode=WAL;")              # включаем WAL
+                cur.execute("PRAGMA synchronous=NORMAL;")            # в WAL это «безопасно» и быстро
+                cur.execute("PRAGMA temp_store=MEMORY;")
+                cur.execute("PRAGMA cache_size=-%d;" % CACHE_PAGES_KIB)
+                cur.execute("PRAGMA wal_autocheckpoint=1000;")       # ~1000 страниц между чекпойнтами
+                cur.execute("PRAGMA mmap_size=%d;" % MMAP_SIZE_BYTES)
+                self._cx = _ConnWrap(True, conn)
+                return
+            except Exception as exc:
+                apsw_error = exc
+                self._cx = None
+                log.warning("APSW init failed for %s; falling back to sqlite3: %s", self.db_path, exc)
+
+        try:
             conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
             conn.execute("PRAGMA busy_timeout=5000;")
             conn.execute("PRAGMA foreign_keys=ON;")
@@ -173,6 +190,10 @@ class Storage:
             conn.execute("PRAGMA wal_autocheckpoint=1000;")
             conn.execute("PRAGMA mmap_size=%d;" % MMAP_SIZE_BYTES)
             self._cx = _ConnWrap(False, conn)
+        except Exception:
+            if apsw_error is not None:
+                log.exception("sqlite3 fallback also failed after APSW init error for %s", self.db_path)
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -246,6 +267,22 @@ class Storage:
                 return list(cur.fetchall())
             finally:
                 cur.close()
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self._query(f"PRAGMA table_info({table_name})")
+        columns: set[str] = set()
+        for row in rows:
+            if len(row) > 1 and row[1]:
+                columns.add(str(row[1]))
+        return columns
+
+    def _ensure_columns(self, table_name: str, columns: Sequence[Tuple[str, str]]) -> None:
+        existing = self._table_columns(table_name)
+        for column_name, ddl in columns:
+            if column_name in existing:
+                continue
+            self._exec(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+            existing.add(column_name)
 
     # --------------------------- schema ---------------------------
 
@@ -381,54 +418,23 @@ class Storage:
         with self._lock:
             for sql in ddl:
                 self._exec(sql)
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN is_deleted INTEGER DEFAULT 0")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN forward_info TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN file_name TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN entities TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN reply_markup TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN duration INTEGER")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN waveform TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN reactions TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN poll TEXT")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN views INTEGER")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN forwards INTEGER")
-            except Exception:
-                pass
-            try:
-                self._exec("ALTER TABLE messages ADD COLUMN media_group_id TEXT")
-            except Exception:
-                pass
+            self._ensure_columns(
+                "messages",
+                [
+                    ("is_deleted", "INTEGER DEFAULT 0"),
+                    ("forward_info", "TEXT"),
+                    ("file_name", "TEXT"),
+                    ("entities", "TEXT"),
+                    ("reply_markup", "TEXT"),
+                    ("duration", "INTEGER"),
+                    ("waveform", "TEXT"),
+                    ("reactions", "TEXT"),
+                    ("poll", "TEXT"),
+                    ("views", "INTEGER"),
+                    ("forwards", "INTEGER"),
+                    ("media_group_id", "TEXT"),
+                ],
+            )
 
     # --------------------------- DAO: UPSERT ---------------------------
 

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+
+log = logging.getLogger("account_store")
 
 
 class AccountStore:
@@ -20,12 +25,44 @@ class AccountStore:
             try:
                 self._data = json.loads(self._path.read_text(encoding="utf-8"))
             except Exception:
+                backup = self._path.with_suffix(self._path.suffix + ".bak")
+                try:
+                    self._path.replace(backup)
+                    log.warning("Corrupt account metadata moved to %s", backup)
+                except Exception:
+                    log.warning("Corrupt account metadata could not be backed up: %s", self._path)
                 self._data = {"active": None, "accounts": {}}
         self._data.setdefault("accounts", {})
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+        fd = None
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=self._path.stem + ".",
+                suffix=".tmp",
+                dir=str(self._path.parent),
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = None
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self._path)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            if tmp_path:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
 
     # ---------------------------- helpers ----------------------------
     @property

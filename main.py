@@ -4,7 +4,8 @@ import os
 import sys
 import signal
 import argparse
-from typing import Optional
+import logging
+from typing import Any, Optional
 
 from utils.error_guard import guard_module
 from utils.logging_setup import configure_logging
@@ -56,6 +57,17 @@ def _prepend_local_pydeps_to_sys_path() -> None:
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
+
+def _unlock_instance_lock(lock: Optional[Any]) -> None:
+    if lock is None:
+        return
+    try:
+        unlock = getattr(lock, "unlock", None)
+        if callable(unlock):
+            unlock()
+    except Exception:
+        pass
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", default=None)
@@ -78,29 +90,40 @@ def main():
         print("ESCgram уже запущен. Вторая копия не будет открыта.")
         return
 
-    from server import ServerCore
-    from telegram import TelegramAdapter
-    from gui_chat import run_gui
-
     configure_logging(log_directory=os.getenv("DRAGO_LOG_DIR") or str(app_paths.logs_dir()))
-    server = ServerCore(service_token=SERVICE_TOKEN)
-    server.start()  # aiohttp в своём потоке/loop
-
-    tg = TelegramAdapter()
-    tg.set_server(server)
-    tg.start()  # non-interactive connect
-
-    server.set_telegram_adapter(tg)
+    log = logging.getLogger("main")
+    server = None
+    tg = None
 
     try:
+        from server import ServerCore
+        from telegram import TelegramAdapter
+        from gui_chat import run_gui
+
+        server = ServerCore(service_token=SERVICE_TOKEN)
+        server.start()  # aiohttp в своём потоке/loop
+
+        tg = TelegramAdapter()
+        tg.set_server(server)
+        tg.start()  # non-interactive connect
+
+        server.set_telegram_adapter(tg)
         run_gui(server, tg)
+    except Exception:
+        log.exception("ESCgram startup failed")
+        raise
     finally:
-        tg.stop()
-        server.stop()
-        try:
-            instance_lock.unlock()
-        except Exception:
-            pass
+        if tg is not None:
+            try:
+                tg.stop()
+            except Exception:
+                log.exception("Failed to stop Telegram adapter cleanly")
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                log.exception("Failed to stop server cleanly")
+        _unlock_instance_lock(instance_lock)
 
 guard_module(globals())
 

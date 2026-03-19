@@ -84,6 +84,7 @@ from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
 from utils.logging_setup import configure_logging, current_log_dir, current_log_files
 from ui.message_feed import MessageFeedMixin
+import ui.media_render as media_render_module
 import ui.message_widgets as message_widgets_module
 from ui.message_widgets import (
     DEFAULT_BUBBLE_THEME,
@@ -7702,6 +7703,27 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             except Exception:
                 return False
 
+        def _drain_tracked_threads(threads: Iterable[object], wait_ms: int) -> None:
+            active_threads: List[QThread] = []
+            for thread in list(threads or []):
+                if not _thread_is_running(thread):
+                    continue
+                try:
+                    if hasattr(thread, "requestInterruption"):
+                        thread.requestInterruption()
+                except Exception:
+                    pass
+                try:
+                    thread.quit()
+                except Exception:
+                    pass
+                active_threads.append(thread)
+            for thread in active_threads:
+                try:
+                    thread.wait(max(0, int(wait_ms or 0)))
+                except Exception:
+                    pass
+
         for timer_name in (
             "_timer",
             "_resort_timer",
@@ -7875,6 +7897,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
         try:
             self.clear_feed()
+        except Exception:
+            pass
+        try:
+            _drain_tracked_threads(getattr(message_widgets_module, "_MESSAGE_WIDGET_THREADS", set()), wait_ms=2500)
+        except Exception:
+            pass
+        try:
+            _drain_tracked_threads(getattr(media_render_module, "_MEDIA_RENDER_THREADS", set()), wait_ms=2500)
         except Exception:
             pass
 
