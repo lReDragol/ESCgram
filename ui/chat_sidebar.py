@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from ui.settings_panel import SettingsDrawer
+from ui.ayugram_assets import load_ayugram_icon, load_ayugram_pixmap
+from ui.components.avatar import AvatarWidget, make_avatar_pixmap
 from ui.styles import StyleManager
 from ui.qt_threading import invoke_in_gui_thread
 from utils.telegram_links import build_search_aliases
@@ -300,66 +303,96 @@ class FolderButton(QPushButton):
 
 
 class ChatListRowWidget(QWidget):
-    """Ayugram-style chat row matching DialogCell night theme."""
+    """DialogCell-inspired chat row for the sidebar."""
 
     def __init__(
         self,
         *,
         title: str,
-        meta: str,
+        preview: str,
         unread: int,
+        time_text: str = "",
+        pinned: bool = False,
         avatar_size: int = 40,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._avatar_size = max(28, int(avatar_size or 40))
+        self._avatar_size = max(44, int(avatar_size or 40))
         self._avatar_cache_key: Optional[tuple] = None
         self._avatar_pixmap_key: Optional[int] = None
+        self._title_text = str(title or "").strip()
+        self._avatar_is_placeholder = True
+        self._pin_pixmap = load_ayugram_pixmap("pin.png", tint="#7f9fc5", size=14)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(10, 9, 6, 9)
+        root.setContentsMargins(12, 8, 12, 8)
         root.setSpacing(12)
 
-        self._avatar = QLabel(self)
+        self._avatar = AvatarWidget(size=self._avatar_size, parent=self)
         av = self._avatar_size
-        self._avatar.setFixedSize(av, av)
-        self._avatar.setStyleSheet(f"border-radius:{av // 2}px; background:rgba(30,30,30,0.85);")
-        self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(2)
+        text_col.setSpacing(3)
 
-        self._title = QLabel(str(title or "").strip(), self)
-        self._title.setStyleSheet("font-size:13px; font-weight:600; color:#f1f1f1; background:transparent;")
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+
+        self._title = QLabel(self._title_text, self)
+        self._title.setStyleSheet("font-size:14px; font-weight:700; color:#eff6ff; background:transparent;")
         self._title.setWordWrap(False)
-        text_col.addWidget(self._title, 0)
+        top_row.addWidget(self._title, 1)
 
-        self._meta = QLabel(str(meta or "").strip(), self)
-        self._meta.setStyleSheet("font-size:11px; color:#828da2; background:transparent;")
-        self._meta.setWordWrap(False)
-        self._meta.setVisible(bool(meta))
-        text_col.addWidget(self._meta, 0)
+        self._pin_label = QLabel(self)
+        self._pin_label.setFixedSize(16, 16)
+        self._pin_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pin_label.setPixmap(self._pin_pixmap)
+        self._pin_label.hide()
+        top_row.addWidget(self._pin_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._time = QLabel(str(time_text or "").strip(), self)
+        self._time.setStyleSheet("font-size:11px; color:#7f95b0; background:transparent;")
+        self._time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._time.setMinimumWidth(46)
+        top_row.addWidget(self._time, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        text_col.addLayout(top_row)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(8)
+
+        self._preview = QLabel(str(preview or "").strip(), self)
+        self._preview.setStyleSheet("font-size:12px; color:#8ea5bf; background:transparent;")
+        self._preview.setWordWrap(False)
+        bottom_row.addWidget(self._preview, 1)
 
         root.addLayout(text_col, 1)
 
         self._badge = QLabel("", self)
-        self._badge.setMinimumWidth(23)
+        self._badge.setMinimumWidth(22)
+        self._badge.setFixedHeight(22)
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._badge.setStyleSheet(
-            "background-color:#3bb07b; color:#ffffff; border-radius:11px; padding:2px 8px; font-size:12px; font-weight:700;"
+            "background-color:#58a8f6; color:#ffffff; border-radius:11px; padding:1px 8px; font-size:11px; font-weight:700;"
         )
-        root.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bottom_row.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        text_col.addLayout(bottom_row)
+
+        self.set_pinned(pinned)
         self.set_unread(unread)
+        self._apply_placeholder_avatar()
 
     def set_avatar(self, pixmap: Optional[QPixmap]) -> None:
         if pixmap is None or pixmap.isNull():
-            self._avatar.setPixmap(QPixmap())
-            self._avatar_cache_key = None
+            self._avatar_is_placeholder = True
             self._avatar_pixmap_key = None
+            self._apply_placeholder_avatar()
+            self._avatar_cache_key = None
             return
         try:
             self._avatar_pixmap_key = int(pixmap.cacheKey())
@@ -371,7 +404,8 @@ class ChatListRowWidget(QWidget):
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self._avatar.setPixmap(scaled)
+        self._avatar_is_placeholder = False
+        self._avatar.set_pixmap(scaled)
 
     def set_avatar_cached(self, pixmap: Optional[QPixmap], *, cache_key: Optional[tuple] = None) -> None:
         key = cache_key if cache_key is not None else ("none",)
@@ -388,18 +422,31 @@ class ChatListRowWidget(QWidget):
 
     def set_title(self, title: str) -> None:
         normalized = str(title or "").strip()
+        self._title_text = normalized
         if self._title.text() != normalized:
             self._title.setText(normalized)
+        if self._avatar_is_placeholder:
+            self._apply_placeholder_avatar()
 
-    def set_meta(self, meta: str) -> None:
-        normalized = str(meta or "").strip()
-        if self._meta.text() != normalized:
-            self._meta.setText(normalized)
-        self._meta.setVisible(bool(normalized))
+    def set_preview(self, preview: str) -> None:
+        normalized = str(preview or "").strip()
+        if self._preview.text() != normalized:
+            self._preview.setText(normalized)
 
-    def update_row(self, *, title: str, meta: str, unread: int) -> None:
+    def set_time_text(self, value: str) -> None:
+        normalized = str(value or "").strip()
+        if self._time.text() != normalized:
+            self._time.setText(normalized)
+        self._time.setVisible(bool(normalized))
+
+    def set_pinned(self, pinned: bool) -> None:
+        self._pin_label.setVisible(bool(pinned))
+
+    def update_row(self, *, title: str, preview: str, unread: int, time_text: str = "", pinned: bool = False) -> None:
         self.set_title(title)
-        self.set_meta(meta)
+        self.set_preview(preview)
+        self.set_time_text(time_text)
+        self.set_pinned(pinned)
         self.set_unread(unread)
 
     def set_unread(self, unread: int) -> None:
@@ -410,6 +457,31 @@ class ChatListRowWidget(QWidget):
             return
         self._badge.setVisible(True)
         self._badge.setText(str(count if count < 1000 else "999+"))
+
+    def _apply_placeholder_avatar(self) -> None:
+        initials = self._extract_initials(self._title_text)
+        pixmap = make_avatar_pixmap(
+            self._avatar_size,
+            None,
+            initials,
+            background=self._placeholder_color(self._title_text),
+        )
+        self._avatar.set_pixmap(pixmap)
+
+    @staticmethod
+    def _extract_initials(title: str) -> str:
+        parts = [chunk for chunk in str(title or "").replace("_", " ").split() if chunk]
+        if not parts:
+            return "?"
+        if len(parts) == 1:
+            return parts[0][:2]
+        return f"{parts[0][:1]}{parts[1][:1]}"
+
+    @staticmethod
+    def _placeholder_color(seed: str) -> QColor:
+        palette = ["#5c86ff", "#43b3b0", "#55a867", "#bb77ff", "#ff8a65", "#4d87c7"]
+        index = abs(hash(str(seed or ""))) % len(palette)
+        return QColor(palette[index])
 
 
 class ChatSidebarMixin:
@@ -447,14 +519,23 @@ class ChatSidebarMixin:
     def _build_sidebar(self) -> QWidget:
         self._style_mgr = getattr(self, "_style_mgr", StyleManager.instance())
         left = QVBoxLayout()
-        left.setContentsMargins(0, 8, 8, 8)
+        left.setContentsMargins(10, 10, 10, 8)
         left.setSpacing(10)
         self._chat_list_override_mode: str = ""
         self._chat_list_override_rows: List[Dict[str, Any]] = []
 
-        search_row = QHBoxLayout()
-        search_row.setContentsMargins(0, 0, 0, 0)
-        search_row.setSpacing(8)
+        top_shell = QFrame()
+        top_shell.setObjectName("sidebarTopShell")
+        top_shell.setStyleSheet(
+            "QFrame#sidebarTopShell{background-color:#17212b;border-radius:18px;border:1px solid rgba(255,255,255,0.05);}"
+        )
+        top_shell_layout = QVBoxLayout(top_shell)
+        top_shell_layout.setContentsMargins(10, 10, 10, 10)
+        top_shell_layout.setSpacing(10)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
 
         self.menu_button = QToolButton()
         self.menu_button.setCheckable(True)
@@ -462,32 +543,69 @@ class ChatSidebarMixin:
         self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.menu_button.setAutoRaise(True)
         self.menu_button.setText("☰")
-        self.menu_button.setIconSize(QSize(20, 20))
+        self.menu_button.setFixedSize(36, 36)
         self.menu_button.setToolTip("Настройки")
-        self._style_mgr.bind_stylesheet(self.menu_button, "chat_sidebar.menu_button")
+        self.menu_button.setStyleSheet(
+            "QToolButton{border:none;background:transparent;color:#edf5ff;border-radius:18px;font-size:18px;font-weight:700;}"
+            "QToolButton:hover{background-color:rgba(122,184,255,0.14);}"
+            "QToolButton:checked{background-color:rgba(122,184,255,0.22);}"
+        )
         self.menu_button.toggled.connect(self._toggle_settings_panel)
-        search_row.addWidget(self.menu_button, 0, Qt.AlignmentFlag.AlignLeft)
+        action_row.addWidget(self.menu_button, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self.search = QLineEdit(placeholderText="Поиск (имя, @username, id)…")
+        top_title = QLabel("ESCgram")
+        top_title.setStyleSheet("color:#edf5ff;font-size:15px;font-weight:700;background:transparent;")
+        action_row.addWidget(top_title, 1, Qt.AlignmentFlag.AlignVCenter)
+
+        btn_focus_search = self._build_sidebar_icon_button(
+            icon_name="search.png",
+            tooltip="Поиск",
+            on_click=lambda: self.search.setFocus(),
+        )
+        action_row.addWidget(btn_focus_search, 0)
+
+        btn_new_chat = self._build_sidebar_icon_button(
+            icon_name="new_chat.png",
+            tooltip="Контакты и новый чат",
+            on_click=lambda: getattr(self, "_open_contacts_picker", lambda: None)(),
+        )
+        action_row.addWidget(btn_new_chat, 0)
+        top_shell_layout.addLayout(action_row)
+
+        search_frame = QFrame()
+        search_frame.setObjectName("sidebarSearchFrame")
+        search_frame.setStyleSheet(
+            "QFrame#sidebarSearchFrame{background-color:#1f2c39;border-radius:16px;border:1px solid rgba(255,255,255,0.04);}"
+        )
+        search_row = QHBoxLayout(search_frame)
+        search_row.setContentsMargins(12, 6, 12, 6)
+        search_row.setSpacing(8)
+
+        search_icon = QLabel(search_frame)
+        search_icon.setPixmap(load_ayugram_pixmap("search.png", tint="#7f95b0", size=16))
+        search_icon.setFixedSize(18, 18)
+        search_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        search_row.addWidget(search_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.search = QLineEdit(placeholderText="Search")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_search_text_changed)
         self.search.returnPressed.connect(self._on_search_submitted)
+        self.search.setStyleSheet(
+            "QLineEdit{background:transparent;border:none;color:#e7eff9;padding:6px 0;font-size:13px;selection-background-color:rgba(88,168,246,0.30);}"
+        )
         search_row.addWidget(self.search, 1)
+        top_shell_layout.addWidget(search_frame)
 
-        search_container = QWidget()
-        search_container.setLayout(search_row)
-        left.addWidget(search_container)
+        left.addWidget(top_shell)
 
         loading_label = QLabel("")
         self._style_mgr.bind_stylesheet(loading_label, "chat_sidebar.loading")
         loading_label.hide()
         left.addWidget(loading_label)
 
-        folders_row = QHBoxLayout()
-        folders_row.setContentsMargins(0, 0, 0, 0)
-        folders_row.setSpacing(0)
-
         folder_wrap = QFrame()
+        self._folder_wrap = folder_wrap
         folder_wrap.setObjectName("folderPanel")
         self._style_mgr.bind_stylesheet(folder_wrap, "chat_sidebar.folder_panel")
         folder_wrap.setFixedWidth(72)
@@ -535,14 +653,19 @@ class ChatSidebarMixin:
         self.chat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.chat_list.setIconSize(QSize(self._avatar_size, self._avatar_size))
         self.chat_list.setSpacing(0)
-        self.chat_list.setMinimumWidth(270 + 20)
-        row_h = max(32, self._avatar_size)
+        self.chat_list.setMinimumWidth(328)
+        row_h = max(72, self._avatar_size + 18)
         self.chat_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        list_style = self._style_mgr.stylesheet("chat_sidebar.list", {"row_height": row_h})
-        self.chat_list.setStyleSheet(list_style)
-        folders_row.addWidget(folder_wrap, 0)
-        folders_row.addWidget(self.chat_list, 1)
-        left.addLayout(folders_row, 1)
+        self.chat_list.setStyleSheet(
+            "QListWidget{font-size:13px;background-color:#17212b;border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:18px;padding:6px 0 6px 0;outline:none;}"
+            "QListWidget::item{height:"
+            + str(row_h)
+            + "px;padding:0 4px;margin:0 8px;border-radius:16px;color:#eef5ff;}"
+            "QListWidget::item:selected{background-color:rgba(88,168,246,0.18);}"
+            "QListWidget::item:hover{background-color:rgba(255,255,255,0.04);}"
+        )
+        left.addWidget(self.chat_list, 1)
         try:
             self.chat_list.viewport().installEventFilter(cast(QObject, self))
         except Exception:
@@ -649,6 +772,23 @@ class ChatSidebarMixin:
         shown = QPoint(anchor.x(), 0)
         hidden = QPoint(anchor.x() - width - self._settings_hidden_offset, 0)
         return shown, hidden
+
+    def _build_sidebar_icon_button(self, *, icon_name: str, tooltip: str, on_click) -> QToolButton:
+        button = QToolButton()
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setFixedSize(36, 36)
+        button.setToolTip(tooltip)
+        button.setIcon(load_ayugram_icon(icon_name, tint="#edf5ff", size=20))
+        button.setIconSize(QSize(20, 20))
+        button.setStyleSheet(
+            "QToolButton{border:none;background:transparent;border-radius:18px;padding:0;}"
+            "QToolButton:hover{background-color:rgba(122,184,255,0.14);}"
+            "QToolButton:pressed{background-color:rgba(122,184,255,0.24);}"
+        )
+        button.clicked.connect(on_click)
+        return button
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if obj is self._left_wrap and event.type() == QEvent.Type.Resize:
@@ -973,23 +1113,9 @@ class ChatSidebarMixin:
                 if is_hidden and hide_hidden:
                     continue
                 title = str(custom_titles.get(cid, (info.get("title") or cid).strip()))
-                indicator = str(info.get("_ai_indicator") or self._compose_indicator(cid, info=info))
                 unread_count = max(0, int(info.get("unread_count") or 0))
-                type_label = self._type_label(str(info.get("type", "")))
-                meta_parts: List[str] = []
-                if type_label:
-                    meta_parts.append(type_label)
-                if info.get("pinned"):
-                    meta_parts.append("Закреплён")
-                if indicator == "🟢":
-                    meta_parts.append("AI: авто")
-                elif indicator == "🔴":
-                    meta_parts.append("AI: выкл")
-                elif indicator == "⚪":
-                    meta_parts.append("AI")
-                if is_hidden:
-                    meta_parts.append("Скрыт")
-                meta = " • ".join(meta_parts).strip()
+                preview = self._dialog_preview_text(cid, info)
+                time_text = self._dialog_time_text(info.get("last_ts") or info.get("last_message_date"))
                 info = dict(info)
                 info["title_display"] = title
                 info["_id_aliases"] = self._chat_id_aliases(cid)
@@ -1002,9 +1128,10 @@ class ChatSidebarMixin:
                         int(info.get("last_ts") or 0),
                         unread_count,
                         int(bool(info.get("pinned"))),
+                        preview,
+                        time_text,
                         str(info.get("type") or ""),
                         str(info.get("username") or ""),
-                        indicator,
                         int(is_hidden),
                         str(info.get("photo_small_id") or info.get("photo_small") or ""),
                     )
@@ -1014,7 +1141,9 @@ class ChatSidebarMixin:
                         "id": cid,
                         "info": info,
                         "title": title,
-                        "meta": meta,
+                        "preview": preview,
+                        "time_text": time_text,
+                        "pinned": bool(info.get("pinned")),
                         "unread": unread_count,
                     }
                 )
@@ -1052,7 +1181,9 @@ class ChatSidebarMixin:
                     cid = str(row["id"])
                     info = dict(row["info"]) if isinstance(row.get("info"), dict) else {}
                     title = str(row.get("title") or cid)
-                    meta = str(row.get("meta") or "")
+                    preview = str(row.get("preview") or "")
+                    time_text = str(row.get("time_text") or "")
+                    pinned = bool(row.get("pinned"))
                     unread = int(row.get("unread") or 0)
                     item = self.chat_list.item(idx)
                     if item is None:
@@ -1061,7 +1192,13 @@ class ChatSidebarMixin:
                     item.setData(Qt.ItemDataRole.UserRole + 1, info)
                     row_widget = self.chat_list.itemWidget(item)
                     if isinstance(row_widget, ChatListRowWidget):
-                        row_widget.update_row(title=title, meta=meta, unread=unread)
+                        row_widget.update_row(
+                            title=title,
+                            preview=preview,
+                            unread=unread,
+                            time_text=time_text,
+                            pinned=pinned,
+                        )
                         pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
                         if pixmap is not None:
                             row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
@@ -1075,17 +1212,21 @@ class ChatSidebarMixin:
                     cid = str(row["id"])
                     info = dict(row["info"]) if isinstance(row.get("info"), dict) else {}
                     title = str(row.get("title") or cid)
-                    meta = str(row.get("meta") or "")
+                    preview = str(row.get("preview") or "")
+                    time_text = str(row.get("time_text") or "")
+                    pinned = bool(row.get("pinned"))
                     unread = int(row.get("unread") or 0)
                     item = QListWidgetItem("")
                     item.setData(Qt.ItemDataRole.UserRole, cid)
                     item.setData(Qt.ItemDataRole.UserRole + 1, info)
-                    item.setSizeHint(QSize(270, max(row_h, self._avatar_size + 12)))
+                    item.setSizeHint(QSize(320, max(row_h, self._avatar_size + 22)))
                     row_widget = ChatListRowWidget(
                         title=title,
-                        meta=meta,
+                        preview=preview,
                         unread=unread,
-                        avatar_size=self._avatar_size,
+                        time_text=time_text,
+                        pinned=pinned,
+                        avatar_size=max(self._avatar_size, 52),
                         parent=self.chat_list,
                     )
                     pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
@@ -1163,6 +1304,75 @@ class ChatSidebarMixin:
         except Exception:
             return None, None
 
+    def _dialog_preview_text(self, chat_id: str, info: Dict[str, Any]) -> str:
+        explicit = str(info.get("last_message") or info.get("text_preview") or "").strip()
+        if explicit:
+            return self._normalize_dialog_preview(explicit)
+
+        chats = self.history.get("chats", {}) if isinstance(self.history, dict) else {}
+        bucket = chats.get(chat_id, []) if isinstance(chats, dict) else []
+        if isinstance(bucket, list) and bucket:
+            raw = bucket[-1]
+            if isinstance(raw, dict):
+                role = str(raw.get("role") or "").strip().lower()
+                message_type = str(raw.get("type") or raw.get("media_type") or "text").strip().lower()
+                text = str(raw.get("text") or raw.get("message") or "").strip()
+                if not text:
+                    text = self._media_preview_label(message_type)
+                elif role == "assistant":
+                    text = f"AI: {text}"
+                return self._normalize_dialog_preview(text)
+
+        username = str(info.get("username") or "").strip()
+        if username:
+            return f"@{username}"
+        return self._media_preview_label(str(info.get("type") or ""))
+
+    @staticmethod
+    def _normalize_dialog_preview(text: str) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) > 72:
+            return compact[:69] + "..."
+        return compact or "Нет сообщений"
+
+    @staticmethod
+    def _media_preview_label(kind: str) -> str:
+        mapping = {
+            "image": "Фото",
+            "photo": "Фото",
+            "video": "Видео",
+            "video_note": "Видеосообщение",
+            "audio": "Музыка",
+            "voice": "Голосовое сообщение",
+            "animation": "GIF",
+            "sticker": "Стикер",
+            "document": "Файл",
+            "channel": "Канал",
+            "group": "Группа",
+            "private": "Личный чат",
+            "bot": "Бот",
+        }
+        return mapping.get(str(kind or "").strip().lower(), "Нет сообщений")
+
+    @staticmethod
+    def _dialog_time_text(raw_value: Any) -> str:
+        try:
+            timestamp = int(raw_value or 0)
+        except Exception:
+            timestamp = 0
+        if timestamp <= 0:
+            return ""
+        try:
+            dt = datetime.fromtimestamp(timestamp)
+            now = datetime.now()
+        except Exception:
+            return ""
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        if dt.year == now.year:
+            return dt.strftime("%d.%m")
+        return dt.strftime("%d.%m.%y")
+
     def _populate_chat_list_override(
         self,
         *,
@@ -1184,17 +1394,38 @@ class ChatSidebarMixin:
                 continue
             info = dict(row.get("info") or {})
             title = str(row.get("title") or info.get("title") or cid)
-            meta = str(row.get("meta") or "")
+            preview = str(row.get("preview") or row.get("meta") or self._dialog_preview_text(cid, info))
             unread = max(0, int(row.get("unread") or info.get("unread_count") or 0))
+            time_text = str(row.get("time_text") or self._dialog_time_text(info.get("last_ts") or info.get("last_message_date")))
+            pinned = bool(row.get("pinned", info.get("pinned", False)))
             info.setdefault("id", cid)
             info.setdefault("title", title)
             info.setdefault("title_display", title)
             info.setdefault("_id_aliases", self._chat_id_aliases(cid))
             info.setdefault("_search_blob", self._build_chat_search_blob(cid, info))
             visible_rows.append(
-                {"id": cid, "info": info, "title": title, "meta": meta, "unread": unread}
+                {
+                    "id": cid,
+                    "info": info,
+                    "title": title,
+                    "preview": preview,
+                    "time_text": time_text,
+                    "pinned": pinned,
+                    "unread": unread,
+                }
             )
-            signature_rows.append((cid, title, meta, unread, str(info.get("type") or ""), str(info.get("photo_small_id") or info.get("photo_small") or "")))
+            signature_rows.append(
+                (
+                    cid,
+                    title,
+                    preview,
+                    time_text,
+                    int(pinned),
+                    unread,
+                    str(info.get("type") or ""),
+                    str(info.get("photo_small_id") or info.get("photo_small") or ""),
+                )
+            )
 
         data_signature = ("override", mode, tuple(signature_rows))
         if data_signature == getattr(self, "_chat_list_data_signature", None):
@@ -1213,17 +1444,21 @@ class ChatSidebarMixin:
             cid = str(row["id"])
             info = dict(row["info"]) if isinstance(row.get("info"), dict) else {}
             title = str(row.get("title") or cid)
-            meta = str(row.get("meta") or "")
+            preview = str(row.get("preview") or "")
+            time_text = str(row.get("time_text") or "")
+            pinned = bool(row.get("pinned"))
             unread = int(row.get("unread") or 0)
             item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, cid)
             item.setData(Qt.ItemDataRole.UserRole + 1, info)
-            item.setSizeHint(QSize(270, max(row_h, self._avatar_size + 12)))
+            item.setSizeHint(QSize(320, max(row_h, self._avatar_size + 22)))
             row_widget = ChatListRowWidget(
                 title=title,
-                meta=meta,
+                preview=preview,
                 unread=unread,
-                avatar_size=self._avatar_size,
+                time_text=time_text,
+                pinned=pinned,
+                avatar_size=max(self._avatar_size, 52),
                 parent=self.chat_list,
             )
             pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)

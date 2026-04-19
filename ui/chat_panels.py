@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ui.ayugram_assets import load_ayugram_icon
 from ui.components.avatar import AvatarWidget
 
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".mpg", ".mpeg", ".flv", ".ts", ".m4v"}
@@ -78,20 +79,19 @@ class _ClickableFrame(QFrame):
 
 class ChatHeaderBar(QFrame):
     infoRequested = Signal()
+    searchRequested = Signal()
     menuRequested = Signal(QPoint)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("chatHeaderBar")
         self.setStyleSheet(
-            "QFrame#chatHeaderBar{background-color:#232326;border-bottom:1px solid rgba(255,255,255,0.06);}"
-            "QLabel#chatHeaderTitle{color:#ffffff;font-size:17px;font-weight:700;}"
-            "QLabel#chatHeaderSubtitle{color:#868686;font-size:12px;}"
-            "QPushButton{background-color:rgba(255,255,255,0.04);color:#f1f1f1;border:none;border-radius:14px;padding:6px 10px;}"
-            "QPushButton:hover{background-color:rgba(255,255,255,0.09);}"
+            "QFrame#chatHeaderBar{background-color:#17212b;border-bottom:1px solid rgba(255,255,255,0.05);}"
+            "QLabel#chatHeaderTitle{color:#edf5ff;font-size:15px;font-weight:700;}"
+            "QLabel#chatHeaderSubtitle{color:#87a0ba;font-size:11px;}"
         )
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(16, 10, 14, 10)
         layout.setSpacing(10)
 
         self._click_area = _ClickableFrame(self)
@@ -99,9 +99,9 @@ class ChatHeaderBar(QFrame):
         self._click_area.setCursor(Qt.CursorShape.PointingHandCursor)
         click_layout = QHBoxLayout(self._click_area)
         click_layout.setContentsMargins(0, 0, 0, 0)
-        click_layout.setSpacing(10)
+        click_layout.setSpacing(12)
 
-        self.avatar = AvatarWidget(size=42, parent=self._click_area)
+        self.avatar = AvatarWidget(size=40, parent=self._click_area)
         click_layout.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         text_col = QVBoxLayout()
@@ -117,12 +117,14 @@ class ChatHeaderBar(QFrame):
         click_layout.addLayout(text_col, 1)
         layout.addWidget(self._click_area, 1)
 
-        self.btn_more = QPushButton("⋯", self)
-        self.btn_more.setFixedWidth(42)
-        self.btn_more.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_search = self._make_icon_button("search.png", "Поиск в чате")
+        layout.addWidget(self.btn_search, 0)
+
+        self.btn_more = self._make_icon_button("menu_more.png", "Меню чата")
         layout.addWidget(self.btn_more, 0)
 
         self._click_area.clicked.connect(self.infoRequested.emit)
+        self.btn_search.clicked.connect(self.searchRequested.emit)
         self.btn_more.clicked.connect(self._emit_menu_requested)
 
     def set_chat(self, *, title: str, subtitle: str = "", avatar: Optional[QPixmap] = None) -> None:
@@ -132,6 +134,8 @@ class ChatHeaderBar(QFrame):
         self.subtitle_label.setVisible(bool(subtitle_text))
         if avatar is not None and not avatar.isNull():
             self.avatar.set_pixmap(avatar)
+        else:
+            self.avatar.set_pixmap(QPixmap())
 
     def _emit_menu_requested(self) -> None:
         try:
@@ -139,6 +143,22 @@ class ChatHeaderBar(QFrame):
         except Exception:
             point = QPoint()
         self.menuRequested.emit(point)
+
+    @staticmethod
+    def _make_icon_button(icon_name: str, tooltip: str) -> QPushButton:
+        button = QPushButton()
+        button.setFixedSize(36, 36)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip(tooltip)
+        button.setIcon(load_ayugram_icon(icon_name, tint="#edf5ff", size=18))
+        button.setIconSize(QSize(18, 18))
+        button.setStyleSheet(
+            "QPushButton{background:transparent;border:none;border-radius:18px;padding:0;}"
+            "QPushButton:hover{background-color:rgba(122,184,255,0.14);}"
+            "QPushButton:pressed{background-color:rgba(122,184,255,0.24);}"
+        )
+        return button
 
 
 class _StatsSection(QWidget):

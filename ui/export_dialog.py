@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
-QFrame,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,

@@ -1277,11 +1277,9 @@ class Bubble(QWidget):
         return max(0, count)
 
     def _update_body_margins(self) -> None:
-        base = 8
-        offset = 4
-        left = base + (offset if not self._align_right else 0)
-        right = base + (offset if self._align_right else 0)
-        self._body.setContentsMargins(left, 6, right, 6)
+        left = 12
+        right = 12
+        self._body.setContentsMargins(left, 8, right, 8)
 
     def _apply_styles(self) -> None:
         theme = self._current_theme()
@@ -1377,9 +1375,27 @@ class Bubble(QWidget):
         rect = self.rect().adjusted(0.5, 0.5, -0.5, -0.5)
         if rect.width() <= 4 or rect.height() <= 4:
             return QPainterPath()
-        radius = min(self._BODY_RADIUS, rect.width() / 2.0, rect.height() / 2.0)
+        tail_h = min(8.0, max(4.0, rect.height() * 0.12))
+        bubble_rect = rect.adjusted(0.0, 0.0, 0.0, -tail_h)
+        radius = min(self._BODY_RADIUS, bubble_rect.width() / 2.0, bubble_rect.height() / 2.0)
         path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+        path.addRoundedRect(bubble_rect, radius, radius)
+
+        tail = QPainterPath()
+        if self._align_right:
+            start_x = bubble_rect.right() - radius * 0.95
+            end_x = bubble_rect.right() - radius * 0.25
+            tip_x = bubble_rect.right() + 2.0
+        else:
+            start_x = bubble_rect.left() + radius * 0.95
+            end_x = bubble_rect.left() + radius * 0.25
+            tip_x = bubble_rect.left() - 2.0
+        base_y = bubble_rect.bottom() - max(1.0, tail_h * 0.25)
+        tip_y = bubble_rect.bottom() + tail_h
+        tail.moveTo(start_x, base_y)
+        tail.quadTo(tip_x, tip_y, end_x, base_y + 1.0)
+        tail.closeSubpath()
+        path.addPath(tail)
         return path
 
     @classmethod
@@ -1694,8 +1710,8 @@ class TextMessageWidget(QWidget):
         self._selected = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setContentsMargins(10, 3, 10, 3)
+        root.setSpacing(3)
 
         self.header_label = QLabel(f"<b>{header}</b>" if self._show_header_label else "")
         self.header_label.setTextFormat(Qt.TextFormat.RichText)
@@ -2157,8 +2173,8 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._has_hidden = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(10, 4, 10, 4)
+        root.setSpacing(4)
         self._root_layout = root
 
         header_lbl = QLabel(f"<b>{header}</b>" if self._show_header_label else "")

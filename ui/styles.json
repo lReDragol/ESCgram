@@ -197,8 +197,8 @@
         },
         "quote_block_style": "margin:4px 0; padding-left:8px; border-left:3px solid rgba(89,183,233,0.45); color:#c4d4eb;",
         "metrics": {
-          "body_radius": 15,
-          "bubble_max_ratio": 0.54
+          "body_radius": 18,
+          "bubble_max_ratio": 0.68
         }
       }
     },
@@ -394,8 +394,8 @@
         },
         "quote_block_style": "margin:4px 0; padding-left:8px; border-left:3px solid rgba(89,183,233,0.45); color:#c4d4eb;",
         "metrics": {
-          "body_radius": 14,
-          "bubble_max_ratio": 0.54
+          "body_radius": 18,
+          "bubble_max_ratio": 0.68
         }
       }
     }

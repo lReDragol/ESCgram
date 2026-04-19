@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl,
     QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property, QStandardPaths
 )
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter, QLinearGradient
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -63,6 +63,7 @@ from utils.zwc import (
 )
 from utils.text_markup import parse_tg_style_markup
 from ui.account_manager import AccountManagerDialog
+from ui.ayugram_assets import load_ayugram_icon
 from ui.auth_dialog import AuthDialog
 from ui.avatar_cache import AvatarCache
 from ui.chat_sidebar import ChatSidebarMixin
@@ -166,6 +167,30 @@ class ChatInputTextEdit(QTextEdit):
                 max(int(caret_rect.height()), int(self.fontMetrics().height()) + 4),
             )
             painter.drawText(draw_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), placeholder)
+        finally:
+            painter.end()
+
+
+class ChatSurface(QWidget):
+    """Painted chat backdrop inspired by Telegram/AyuGram gradients."""
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            gradient = QLinearGradient(0, 0, self.width(), self.height())
+            gradient.setColorAt(0.0, QColor("#12202d"))
+            gradient.setColorAt(0.35, QColor("#142737"))
+            gradient.setColorAt(1.0, QColor("#0f1b27"))
+            painter.fillRect(self.rect(), gradient)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(108, 164, 218, 22))
+            painter.drawEllipse(-60, 40, 280, 280)
+            painter.setBrush(QColor(77, 120, 160, 20))
+            painter.drawEllipse(self.width() - 220, 140, 280, 280)
+            painter.setBrush(QColor(255, 255, 255, 10))
+            painter.drawEllipse(self.width() // 2 - 120, self.height() - 260, 240, 240)
         finally:
             painter.end()
 
@@ -1180,7 +1205,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         center_body_layout.setContentsMargins(0, 0, 0, 0)
         center_body_layout.setSpacing(0)
 
-        chat_area = QWidget(center_body)
+        chat_area = ChatSurface(center_body)
+        chat_area.setObjectName("chatSurface")
         chat_area_layout = QVBoxLayout(chat_area)
         chat_area_layout.setContentsMargins(0, 0, 0, 0)
         chat_area_layout.setSpacing(0)
@@ -1252,6 +1278,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _build_chat_header(self) -> QWidget:
         header = ChatHeaderBar(self)
         header.infoRequested.connect(self._show_current_chat_info)
+        header.searchRequested.connect(self.show_message_search)
         header.menuRequested.connect(self._show_chat_header_menu)
         self._chat_header = header
         self._refresh_chat_header()
@@ -1390,7 +1417,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _bubble_max_width(self) -> int:
         viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
         vw = int(viewport.width()) if viewport is not None else int(self.width())
-        ratio = float(StyleManager.instance().metric("message_widgets.metrics.bubble_max_ratio", 0.54) or 0.54)
+        ratio = float(StyleManager.instance().metric("message_widgets.metrics.bubble_max_ratio", 0.68) or 0.68)
         maxw = int(vw * ratio)
         return max(280, min(920, maxw))
 
@@ -1666,21 +1693,31 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _build_bottom_row(self) -> QHBoxLayout:
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 8, 0, 8)
-        bottom_row.setSpacing(6)
+        bottom_row.setContentsMargins(12, 8, 12, 12)
+        bottom_row.setSpacing(8)
 
-        self.btn_attach = QToolButton()
-        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_attach.setText("📎")
-        self.btn_attach.setToolTip("Отправить файлы")
-        self.btn_attach.clicked.connect(self._pick_files_and_send)
-        bottom_row.addWidget(self.btn_attach)
+        compose_shell = QFrame()
+        compose_shell.setObjectName("chatComposeShell")
+        compose_shell.setStyleSheet(
+            "QFrame#chatComposeShell{background-color:#17212b;border:1px solid rgba(255,255,255,0.05);border-radius:22px;}"
+        )
+        compose_layout = QHBoxLayout(compose_shell)
+        compose_layout.setContentsMargins(10, 4, 10, 4)
+        compose_layout.setSpacing(2)
+
+        self.btn_media = QToolButton()
+        self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_media.setToolTip("Эмодзи / стикеры / GIF")
+        self.btn_media.clicked.connect(self._toggle_media_picker)
+        self._style_compose_embedded_button(self.btn_media, icon_name="emoji.png")
+        compose_layout.addWidget(self.btn_media, 0)
 
         self.user_input = ChatInputTextEdit()
         self.user_input.setMinimumHeight(self._input_min_height)
         self.user_input.setMaximumHeight(self._input_max_height)
         self.user_input.setStyleSheet(
-            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
+            "QTextEdit{background:transparent;border:none;color:#edf5ff;padding:6px 2px;"
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;font-size:14px;}"
         )
         self._default_input_placeholder = "Сообщение..."
         self.user_input.setPlaceholderText(self._default_input_placeholder)
@@ -1692,30 +1729,52 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self.user_input.document().setDocumentMargin(4.0)
         except Exception:
             pass
-        bottom_row.addWidget(self.user_input, 1)
+        compose_layout.addWidget(self.user_input, 1)
 
-        self.btn_media = QToolButton()
-        self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_media.setText("😊")
-        self.btn_media.setToolTip("Эмодзи / стикеры / GIF")
-        self.btn_media.clicked.connect(self._toggle_media_picker)
-        bottom_row.addWidget(self.btn_media)
+        self.btn_attach = QToolButton()
+        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach.setToolTip("Отправить файлы")
+        self.btn_attach.clicked.connect(self._pick_files_and_send)
+        self._style_compose_embedded_button(self.btn_attach, icon_name="attach.png")
+        compose_layout.addWidget(self.btn_attach, 0)
 
-        self.btn_send = QPushButton("Отправить")
-        self._send_button_label = self.btn_send.text()
-        self.btn_send.setAutoDefault(False)
-        self.btn_send.pressed.connect(self._send_pressed)
-        self.btn_send.released.connect(self._send_released)
-        bottom_row.addWidget(self.btn_send)
+        bottom_row.addWidget(compose_shell, 1)
 
-        self.auto_ai_checkbox = QCheckBox("🤖")
+        self.auto_ai_checkbox = QCheckBox("AI")
         self.auto_ai_checkbox.setToolTip("Автоответ AI для текущего чата")
         self.auto_ai_checkbox.stateChanged.connect(self.on_auto_ai_changed)
-        bottom_row.addWidget(self.auto_ai_checkbox)
+        self.auto_ai_checkbox.setStyleSheet(
+            "QCheckBox{color:#7fa8d4;background-color:#17212b;border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:16px;padding:8px 10px 8px 10px;font-size:11px;font-weight:700;spacing:0;}"
+            "QCheckBox::indicator{width:0;height:0;}"
+            "QCheckBox:hover{background-color:#1d2b39;}"
+            "QCheckBox:checked{color:#ffffff;background-color:#2b5278;border-color:rgba(110,201,255,0.45);}"
+        )
+        bottom_row.addWidget(self.auto_ai_checkbox, 0)
+
+        self.btn_send = QToolButton()
+        self._send_button_label = ""
+        self.btn_send.pressed.connect(self._send_pressed)
+        self.btn_send.released.connect(self._send_released)
+        self._style_compose_action_button(
+            self.btn_send,
+            icon_name="send.png",
+            tooltip="Отправить",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        bottom_row.addWidget(self.btn_send)
 
         self.btn_voice = QToolButton()
         self.btn_voice.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_voice.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._style_compose_action_button(
+            self.btn_voice,
+            icon_name="mic.png",
+            tooltip="Голосовое сообщение",
+            accent=True,
+            icon_tint="#ffffff",
+        )
         voice_action = self.btn_voice.addAction("Отправить аудио…")
         voice_action.triggered.connect(self._pick_mp3_and_send)
         video_action = self.btn_voice.addAction("Отправить кружок…")
@@ -1725,6 +1784,45 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         QTimer.singleShot(0, self._adjust_input_height)
 
         return bottom_row
+
+    def _style_compose_embedded_button(self, button: QToolButton, *, icon_name: str) -> None:
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setFixedSize(38, 38)
+        button.setIcon(load_ayugram_icon(icon_name, tint="#8ea5bf", size=20))
+        button.setIconSize(QSize(20, 20))
+        button.setStyleSheet(
+            "QToolButton{border:none;background:transparent;border-radius:19px;padding:0;}"
+            "QToolButton:hover{background-color:rgba(122,184,255,0.12);}"
+            "QToolButton:pressed{background-color:rgba(122,184,255,0.2);}"
+        )
+
+    def _style_compose_action_button(
+        self,
+        button: QToolButton,
+        *,
+        icon_name: str,
+        tooltip: str,
+        accent: bool,
+        icon_tint: str,
+        background: Optional[str] = None,
+    ) -> None:
+        bg = background or ("#58a8f6" if accent else "#1d2b39")
+        hover = "#69b2fa" if accent else "#223244"
+        button.setToolTip(tooltip)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setAutoRaise(True)
+        button.setFixedSize(42, 42)
+        button.setIcon(load_ayugram_icon(icon_name, tint=icon_tint, size=18))
+        button.setIconSize(QSize(18, 18))
+        button.setStyleSheet(
+            "QToolButton{border:none;border-radius:21px;padding:0;background-color:"
+            + bg
+            + ";}"
+            "QToolButton:hover{background-color:"
+            + hover
+            + ";}"
+        )
 
     @Slot()
     def _adjust_input_height(self) -> None:
@@ -1747,6 +1845,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         editor.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded if need_scroll else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self._refresh_compose_actions()
+
+    def _refresh_compose_actions(self) -> None:
+        editor = getattr(self, "user_input", None)
+        text_present = False
+        if isinstance(editor, QTextEdit):
+            try:
+                text_present = bool(str(editor.toPlainText() or "").strip())
+            except Exception:
+                text_present = False
+        recording = bool(getattr(self, "_recording", False))
+        send_btn = getattr(self, "btn_send", None)
+        voice_btn = getattr(self, "btn_voice", None)
+        if send_btn is not None:
+            send_btn.setVisible(text_present and not recording)
+        if voice_btn is not None:
+            voice_btn.setVisible(recording or not text_present)
 
     @staticmethod
     def _classify_attachment_kind(path: str) -> str:
@@ -6889,7 +7004,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _send_long(self) -> None:
         self._send_long_mode = True
         try:
-            self.btn_send.setText("\u0421\u043a\u0440\u044b\u0442\u043e")
+            self._style_compose_action_button(
+                self.btn_send,
+                icon_name="send.png",
+                tooltip="Отправка невидимого сообщения",
+                accent=True,
+                icon_tint="#ffffff",
+                background="#8a5cf6",
+            )
         except Exception:
             pass
 
@@ -6903,7 +7025,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             if txt:
                 self.send_message_invisible()
         self._send_long_mode = False
-        QTimer.singleShot(200, lambda: self.btn_send.setText(self._send_button_label))
+        self._style_compose_action_button(
+            self.btn_send,
+            icon_name="send.png",
+            tooltip="Отправить",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        self._refresh_compose_actions()
 
     def send_message_invisible(self) -> None:
         text = (self.user_input.toPlainText() or "").strip()
@@ -6996,11 +7125,24 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _update_voice_button(self) -> None:
         if self._recording:
-            self.btn_voice.setText("⏺️")
-            self.btn_voice.setToolTip("Идёт запись… отпустите, чтобы отправить")
+            self._style_compose_action_button(
+                self.btn_voice,
+                icon_name="mic.png",
+                tooltip="Идёт запись… отпустите, чтобы отправить",
+                accent=True,
+                icon_tint="#ffffff",
+                background="#d66072",
+            )
+            self._refresh_compose_actions()
             return
-        self.btn_voice.setText("🎙")
-        self.btn_voice.setToolTip("Удерживать — запись голосового; клик — меню (аудио/кружок)")
+        self._style_compose_action_button(
+            self.btn_voice,
+            icon_name="mic.png",
+            tooltip="Удерживать — запись голосового; клик — меню (аудио/кружок)",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        self._refresh_compose_actions()
 
     def _start_recording(self) -> None:
         if not self.current_chat_id:
@@ -7027,7 +7169,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             )
             self._rec_stream.start()
             self._recording = True
-            self.btn_voice.setText("⏺️")
+            self._update_voice_button()
             self._toast("Запись… отпустите кнопку, чтобы отправить как голосовое")
         except Exception as exc:
             self._recording = False
