@@ -23,7 +23,10 @@ Desktop.ini
 
 # Build artifacts
 build/
+build-linux/
+.build-linux-py-v026/
 dist/
+dist-linux/
 dist_installer/
 dist_linux/
 *.egg-info/
@@ -51,3 +54,6 @@ save/
 # Local organization (dev artifacts, backups)
 misc/
 LOCAL_INSTALLER_LINUX_AUR.md
+
+# Local reference sources
+ayugram_src/

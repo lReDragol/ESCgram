@@ -1,13 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from bisect import bisect_left
 from collections import deque
+import concurrent.futures
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 from urllib.parse import quote as _url_quote, unquote as _url_unquote
 from html import escape
@@ -39,8 +41,8 @@ except Exception:  # pragma: no cover - fallback for unexpected runtime envs
 
 from ui.media_render import MediaRenderingMixin, _fmt_time
 from ui.common import HAVE_QTMULTIMEDIA, MediaPlaybackCoordinator, log
+from ui.qt_threading import invoke_in_gui_thread
 from ui.styles import StyleManager
-from ui.send_media_workers import FfmpegConvertWorker
 
 if HAVE_QTMULTIMEDIA:
     from PySide6.QtMultimedia import QMediaPlayer
@@ -77,7 +79,7 @@ def _bubble_radius() -> int:
 
 
 class _CustomEmojiBus(QObject):
-    resolved = Signal(int)
+    resolved = Signal(str)
 
     def __init__(self) -> None:
         super().__init__(None)
@@ -87,8 +89,47 @@ _CUSTOM_EMOJI_PROVIDER: Any = None
 _CUSTOM_EMOJI_BUS = _CustomEmojiBus()
 _CUSTOM_EMOJI_LOCK = threading.Lock()
 _CUSTOM_EMOJI_CACHE: Dict[int, Dict[str, Any]] = {}
+_CUSTOM_EMOJI_CACHE_MAX_SIZE: int = 1024
 _CUSTOM_EMOJI_PENDING: set[int] = set()
 _MESSAGE_WIDGET_THREADS: set[QThread] = set()
+
+
+# ---------------------------------------------------------------------------
+# Voice decode thread pool — avoids spawning a new QThread per voice playback
+# ---------------------------------------------------------------------------
+class _VoiceDecodeBus(QObject):
+    """Signal bus that relays decode results from worker threads to the GUI."""
+    done = Signal(int, dict)  # (msg_id, payload)
+
+
+_voice_decode_bus = _VoiceDecodeBus()
+_voice_decode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="voice_decode")
+
+
+def _voice_decode_submit(msg_id: int, cmd: list, output_path: str, timeout_sec: float = 45.0) -> None:
+    """Submit an ffmpeg voice-decode job to the shared pool."""
+    def _run() -> None:
+        payload: Dict[str, Any] = {"ok": False, "output_path": output_path, "error": ""}
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=timeout_sec,
+            )
+            if not (os.path.isfile(output_path) and os.path.getsize(output_path) > 0):
+                raise RuntimeError("Конвертация не дала результата")
+            payload["ok"] = True
+        except subprocess.TimeoutExpired:
+            payload["error"] = "Конвертация заняла слишком много времени и была прервана."
+        except subprocess.CalledProcessError as exc:
+            payload["error"] = f"ffmpeg завершился с ошибкой (код {exc.returncode})."
+        except Exception as exc:
+            payload["error"] = str(exc)
+        _voice_decode_bus.done.emit(msg_id, payload)
+
+    _voice_decode_pool.submit(_run)
 
 
 def set_custom_emoji_provider(provider: Any) -> None:
@@ -120,6 +161,13 @@ def _cache_custom_emoji_asset(custom_id: int, payload: Dict[str, Any]) -> None:
     if path:
         data["url"] = QUrl.fromLocalFile(path).toString()
     with _CUSTOM_EMOJI_LOCK:
+        # Evict oldest entries when cache exceeds limit
+        while len(_CUSTOM_EMOJI_CACHE) >= _CUSTOM_EMOJI_CACHE_MAX_SIZE:
+            try:
+                oldest_key = next(iter(_CUSTOM_EMOJI_CACHE))
+                _CUSTOM_EMOJI_CACHE.pop(oldest_key, None)
+            except (StopIteration, RuntimeError):
+                break
         _CUSTOM_EMOJI_CACHE[int(custom_id)] = data
 
 
@@ -170,7 +218,7 @@ def _queue_custom_emoji_fetch(custom_id: int) -> None:
         with _CUSTOM_EMOJI_LOCK:
             _CUSTOM_EMOJI_PENDING.discard(cid)
         try:
-            _CUSTOM_EMOJI_BUS.resolved.emit(cid)
+            _CUSTOM_EMOJI_BUS.resolved.emit(str(cid))
         except Exception:
             return
 
@@ -186,7 +234,7 @@ else:
     ACCENT_LINK_COLOR = _parsed_link_color.name()
 
 DEFAULT_BUBBLE_THEME_FALLBACK = {
-    "me": {"bg": "#2b5278", "border": "#3a71a1", "text": "#f4f7ff", "link": ACCENT_LINK_COLOR},
+    "me": {"bg": "#2b5278", "border": "#3a71a1", "text": "#ffffff", "link": ACCENT_LINK_COLOR},
     "assistant": {"bg": "#1f4a3a", "border": "#2e6a53", "text": "#f2fff7", "link": ACCENT_LINK_COLOR},
     "other": {"bg": "#182533", "border": "#243247", "text": "#dfe6f0", "link": ACCENT_LINK_COLOR},
 }
@@ -210,7 +258,7 @@ def set_bubble_theme(theme: dict[str, dict[str, str]]) -> None:
 
 
 def _on_style_profile_changed(_profile: Dict[str, Any]) -> None:
-    Bubble.schedule_refresh_all()
+    invoke_in_gui_thread(Bubble.schedule_refresh_all)
 
 
 _STYLE_MGR.style_changed.connect(_on_style_profile_changed)
@@ -282,24 +330,24 @@ def _autolink_plain_to_html(text: str) -> str:
             href = raw
         return (
             f'<a href="{escape(href, True)}" '
-            f'style="color:{ACCENT_LINK_COLOR}; text-decoration:none; font-weight:600;">'
-            f'{escape(raw)}</a>'
+            f'style="text-decoration:none;">'
+            f'<span style="color:{ACCENT_LINK_COLOR}; font-weight:600;">{escape(raw)}</span></a>'
         )
 
     s = _URL_RE.sub(_u, s)
     s = _TME_RE.sub(
         lambda m: (
             f'<a href="https://{m.group("url")}" '
-            f'style="color:{ACCENT_LINK_COLOR}; text-decoration:none; font-weight:600;">'
-            f'{m.group("url")}</a>'
+            f'style="text-decoration:none;">'
+            f'<span style="color:{ACCENT_LINK_COLOR}; font-weight:600;">{m.group("url")}</span></a>'
         ),
         s,
     )
     s = _EMAIL_RE.sub(
         lambda m: (
             f'<a href="mailto:{m.group("email")}" '
-            f'style="color:{ACCENT_LINK_COLOR}; text-decoration:none; font-weight:600;">'
-            f'{m.group("email")}</a>'
+            f'style="text-decoration:none;">'
+            f'<span style="color:{ACCENT_LINK_COLOR}; font-weight:600;">{m.group("email")}</span></a>'
         ),
         s,
     )
@@ -312,8 +360,8 @@ def _autolink_plain_to_html(text: str) -> str:
     s = _MENTION_RE.sub(
         lambda m: (
             f'<a href="https://t.me/{m.group("mention").lstrip("@")}" '
-            f'style="color:{ACCENT_LINK_COLOR}; text-decoration:none; font-weight:600;">'
-            f'{m.group("mention")}</a>'
+            f'style="text-decoration:none;">'
+            f'<span style="color:{ACCENT_LINK_COLOR}; font-weight:600;">{m.group("mention")}</span></a>'
         ),
         s,
     )
@@ -550,10 +598,10 @@ def _render_entities_html(
             return f'<span style="color:{ACCENT_LINK_COLOR};font-weight:600;">'
         if t == "bot_command":
             href = escape(str(span.url or ""), quote=True)
-            return f'<a href="{href}" style="color:{ACCENT_LINK_COLOR};text-decoration:none;font-weight:700;">'
+            return f'<a href="{href}" style="text-decoration:none;"><span style="color:{ACCENT_LINK_COLOR};font-weight:700;">'
         if t == "text_link" and span.url:
             href = escape(str(span.url), quote=True)
-            return f'<a href="{href}" style="color:{ACCENT_LINK_COLOR};text-decoration:none;font-weight:600;">'
+            return f'<a href="{href}" style="text-decoration:none;"><span style="color:{ACCENT_LINK_COLOR};font-weight:600;">'
         if t == "blockquote":
             return '<span style="color:#c4d4eb;border-left:3px solid rgba(89,183,233,0.45);padding-left:8px;">'
         if t == "custom_emoji":
@@ -580,8 +628,10 @@ def _render_entities_html(
             return "</span>"
         if t == "pre":
             return "</pre>"
-        if t in {"text_link", "spoiler", "bot_command"}:
+        if t == "spoiler":
             return "</a>"
+        if t in {"text_link", "bot_command"}:
+            return "</span></a>"
         return ""
 
     opens: Dict[int, List[_RichSpan]] = {}
@@ -642,6 +692,7 @@ def _render_entities_html(
 class RichTextLabel(QLabel):
     """QLabel с кликабельными ссылками и выделением текста."""
     commandActivated = Signal(str)
+    urlActivated = Signal(str)
 
     def __init__(self, text: str, parent: QWidget | None = None):
         super().__init__(parent)
@@ -649,8 +700,13 @@ class RichTextLabel(QLabel):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         self.setOpenExternalLinks(False)
         self.setTextFormat(Qt.TextFormat.RichText)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setStyleSheet(
             "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
+            "background-color:transparent;"
+            "border:none;"
+            "outline:none;"
+            f"a{{color:{ACCENT_LINK_COLOR};text-decoration:none;}}"
         )
         self._raw_text = ""
         self._entities: Optional[List[Dict[str, Any]]] = None
@@ -665,7 +721,7 @@ class RichTextLabel(QLabel):
         self._spoiler_timer.setInterval(48)
         self._spoiler_timer.timeout.connect(self._tick_spoiler_animation)
         self.linkActivated.connect(self._on_link_activated)
-        _CUSTOM_EMOJI_BUS.resolved.connect(self._on_custom_emoji_resolved)
+        _CUSTOM_EMOJI_BUS.resolved.connect(self._on_custom_emoji_resolved, Qt.ConnectionType.QueuedConnection)
         self.set_message(text)
 
     def _on_link_activated(self, href: str) -> None:
@@ -681,7 +737,9 @@ class RichTextLabel(QLabel):
                 self._spoiler_timer.start()
             self._render_current()
             return
-        QDesktopServices.openUrl(QUrl(str(href)))
+        href_text = str(href or "").strip()
+        if href_text:
+            self.urlActivated.emit(href_text)
 
     def set_message(self, text: str, *, entities: Optional[List[Dict[str, Any]]] = None) -> None:
         normalized = str(text or "")
@@ -743,8 +801,8 @@ class RichTextLabel(QLabel):
             html = _prepare_rich_text(text)
         self.setText(html)
 
-    @Slot(int)
-    def _on_custom_emoji_resolved(self, custom_id: int) -> None:
+    @Slot(str)
+    def _on_custom_emoji_resolved(self, custom_id: str) -> None:
         try:
             cid = int(custom_id or 0)
         except Exception:
@@ -934,11 +992,13 @@ class MessageReplyMarkupWidget(QWidget):
             "border-radius:11px;color:#dff1ff;padding:7px 11px;font-size:12px;font-weight:600;text-align:center;}"
             "QPushButton:hover{background-color:rgba(89,183,255,0.24);}"
             "QPushButton:pressed{background-color:rgba(89,183,255,0.30);}"
+            "QPushButton:focus{outline:none;}"
         ) if inline else (
             "QPushButton{background-color:rgba(255,255,255,0.055);border:1px solid rgba(255,255,255,0.08);"
-            "border-radius:13px;color:#dfe7f5;padding:10px 12px;font-size:12px;font-weight:600;text-align:left;}"
+            "border-radius:13px;color:#f1f1f1;padding:10px 12px;font-size:12px;font-weight:600;text-align:left;}"
             "QPushButton:hover{background-color:rgba(255,255,255,0.10);}"
             "QPushButton:pressed{background-color:rgba(255,255,255,0.15);}"
+            "QPushButton:focus{outline:none;}"
         )
         built_rows = 0
         for row in rows:
@@ -1041,7 +1101,7 @@ class _AlbumTileLabel(QLabel):
         self.setScaledContents(False)
         self.setStyleSheet(
             "background-color:rgba(255,255,255,0.04);"
-            "border-radius:14px;color:#dfe7f5;font-size:12px;font-weight:600;"
+            "border-radius:14px;color:#f1f1f1;font-size:12px;font-weight:600;"
         )
 
     def set_payload(self, payload: Dict[str, Any]) -> None:
@@ -1071,7 +1131,7 @@ class _AlbumTileLabel(QLabel):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(8, 14, 22, 166))
         painter.drawRoundedRect(rect, 14, 14)
-        painter.setPen(QColor("#f4f7ff"))
+        painter.setPen(QColor("#ffffff"))
         font = painter.font()
         font.setPointSize(max(20, font.pointSize()))
         font.setBold(True)
@@ -1217,15 +1277,13 @@ class Bubble(QWidget):
         return max(0, count)
 
     def _update_body_margins(self) -> None:
-        base = 8
-        offset = 4
-        left = base + (offset if not self._align_right else 0)
-        right = base + (offset if self._align_right else 0)
-        self._body.setContentsMargins(left, 6, right, 6)
+        left = 12
+        right = 12
+        self._body.setContentsMargins(left, 8, right, 8)
 
     def _apply_styles(self) -> None:
         theme = self._current_theme()
-        text = theme.get("text", "#f4f7ff")
+        text = theme.get("text", "#ffffff")
         link = theme.get("link", "#59b7e9")
         css = _style_sheet(
             "message.bubble.label",
@@ -1317,9 +1375,27 @@ class Bubble(QWidget):
         rect = self.rect().adjusted(0.5, 0.5, -0.5, -0.5)
         if rect.width() <= 4 or rect.height() <= 4:
             return QPainterPath()
-        radius = min(self._BODY_RADIUS, rect.width() / 2.0, rect.height() / 2.0)
+        tail_h = min(8.0, max(4.0, rect.height() * 0.12))
+        bubble_rect = rect.adjusted(0.0, 0.0, 0.0, -tail_h)
+        radius = min(self._BODY_RADIUS, bubble_rect.width() / 2.0, bubble_rect.height() / 2.0)
         path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+        path.addRoundedRect(bubble_rect, radius, radius)
+
+        tail = QPainterPath()
+        if self._align_right:
+            start_x = bubble_rect.right() - radius * 0.95
+            end_x = bubble_rect.right() - radius * 0.25
+            tip_x = bubble_rect.right() + 2.0
+        else:
+            start_x = bubble_rect.left() + radius * 0.95
+            end_x = bubble_rect.left() + radius * 0.25
+            tip_x = bubble_rect.left() - 2.0
+        base_y = bubble_rect.bottom() - max(1.0, tail_h * 0.25)
+        tip_y = bubble_rect.bottom() + tail_h
+        tail.moveTo(start_x, base_y)
+        tail.quadTo(tip_x, tip_y, end_x, base_y + 1.0)
+        tail.closeSubpath()
+        path.addPath(tail)
         return path
 
     @classmethod
@@ -1335,17 +1411,20 @@ class Bubble(QWidget):
     def schedule_refresh_all(cls) -> None:
         cls._BODY_RADIUS = _bubble_radius()
         cls._refresh_queue = deque(list(cls._instances))
-        app = QApplication.instance()
-        if app is None:
-            cls.refresh_all()
-            return
-        if cls._refresh_timer is None:
-            timer = QTimer(app)
-            timer.setSingleShot(True)
-            timer.timeout.connect(cls._drain_refresh_queue)
-            cls._refresh_timer = timer
-        if not cls._refresh_timer.isActive():
-            cls._refresh_timer.start(0)
+        def _schedule() -> None:
+            app = QApplication.instance()
+            if app is None:
+                cls.refresh_all()
+                return
+            if cls._refresh_timer is None:
+                timer = QTimer(app)
+                timer.setSingleShot(True)
+                timer.timeout.connect(cls._drain_refresh_queue)
+                cls._refresh_timer = timer
+            if not cls._refresh_timer.isActive():
+                cls._refresh_timer.start(0)
+
+        invoke_in_gui_thread(_schedule)
 
     @classmethod
     def _drain_refresh_queue(cls) -> None:
@@ -1592,6 +1671,7 @@ class ForwardInfoWidget(QWidget):
 class TextMessageWidget(QWidget):
     """Widget that renders plain text messages with optional reply preview."""
     commandActivated = Signal(str)
+    urlActivated = Signal(str)
     replyMarkupButtonActivated = Signal(dict)
 
     def __init__(
@@ -1630,8 +1710,8 @@ class TextMessageWidget(QWidget):
         self._selected = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setContentsMargins(10, 3, 10, 3)
+        root.setSpacing(3)
 
         self.header_label = QLabel(f"<b>{header}</b>" if self._show_header_label else "")
         self.header_label.setTextFormat(Qt.TextFormat.RichText)
@@ -1640,10 +1720,11 @@ class TextMessageWidget(QWidget):
         root.addWidget(self.header_label, 0, alignment)
         self.header_label.setVisible(self._show_header_label)
 
-        self.deleted_label = QLabel("Сообщение удалено")
+        self.deleted_label = QLabel("🧹 Сообщение удалено")
         self.deleted_label.setStyleSheet(_style_sheet("message.deleted.label", "color:#ff9aa0;font-size:11px;"))
         self.deleted_label.hide()
         root.addWidget(self.deleted_label, 0, alignment)
+
 
         self.hidden_label = QLabel("Содержимое скрыто")
         self.hidden_label.setStyleSheet(_style_sheet("message.hidden.label", "color:#9fa6b1;font-size:11px;"))
@@ -1653,8 +1734,11 @@ class TextMessageWidget(QWidget):
         self.bubble = Bubble("", role, parent=self)
         root.addWidget(self.bubble, 0)
         self._message_label = RichTextLabel(text, self)
-        self._message_label.setStyleSheet(_style_sheet("message.body.rich_text", "background-color: transparent;"))
+        self._message_label.setStyleSheet(
+            self._message_label.styleSheet() + _style_sheet("message.body.rich_text", "background-color: transparent;")
+        )
         self._message_label.commandActivated.connect(self.commandActivated.emit)
+        self._message_label.urlActivated.connect(self.urlActivated.emit)
         if self._text_entities:
             self._message_label.set_message(text, entities=self._text_entities)
         self.bubble.add_content(self._message_label)
@@ -1985,6 +2069,7 @@ class VoiceWaveformWidget(QWidget):
 
 class ChatItemWidget(MediaRenderingMixin, QWidget):
     commandActivated = Signal(str)
+    urlActivated = Signal(str)
     replyMarkupButtonActivated = Signal(dict)
 
     def __init__(
@@ -2053,8 +2138,8 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._radial_doc_widget: Optional[RadialDownloadWidget] = None
         # Voice playback: QtMultimedia on Windows often can't decode OGG/Opus, so decode to WAV on demand.
         self._voice_decoded_path: Optional[str] = None
-        self._voice_decode_thread: Optional[QThread] = None
-        self._voice_decode_worker: Optional[FfmpegConvertWorker] = None
+        self._voice_decode_pending: bool = False
+        self._voice_bus_connected: bool = False
         self._voice_decode_autoplay: bool = False
 
         self.download_job_id: Optional[str] = None
@@ -2088,8 +2173,8 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._has_hidden = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(10, 4, 10, 4)
+        root.setSpacing(4)
         self._root_layout = root
 
         header_lbl = QLabel(f"<b>{header}</b>" if self._show_header_label else "")
@@ -2100,10 +2185,11 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         self._header_color: Optional[str] = None
         self._refresh_header_style()
 
-        self.deleted_label = QLabel("Сообщение удалено")
+        self.deleted_label = QLabel("🧹 Сообщение удалено")
         self.deleted_label.setStyleSheet(_style_sheet("message.deleted.label", "color:#ff9aa0;font-size:11px;"))
         self.deleted_label.hide()
         root.addWidget(self.deleted_label, 0, alignment)
+
 
         # --- контейнер: внутри контент, опционально обёрнутый в bubble ---
         self.bubble = None
@@ -2336,7 +2422,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             info_layout = QVBoxLayout()
             title = os.path.basename(self.file_path) if self.file_path else "Аудиофайл"
             title_lbl = QLabel(title)
-            title_lbl.setStyleSheet(_style_sheet("message.audio.title", "color:#f4f7ff;font-weight:bold;"))
+            title_lbl.setStyleSheet(_style_sheet("message.audio.title", "color:#ffffff;font-weight:bold;"))
             info_layout.addWidget(title_lbl)
 
             meta_parts = []
@@ -2378,7 +2464,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         info_layout.setSpacing(3)
         title = os.path.basename(self.file_path) if self.file_path else "Документ"
         title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(_style_sheet("message.document.title", "color:#f4f7ff;font-weight:600;font-size:13px;"))
+        title_lbl.setStyleSheet(_style_sheet("message.document.title", "color:#ffffff;font-weight:600;font-size:13px;"))
         title_lbl.setWordWrap(True)
         info_layout.addWidget(title_lbl)
 
@@ -2540,19 +2626,15 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             self._play_audio_path(decoded)
             return
 
-        # Decode to WAV in background via ffmpeg.
+        # Decode to WAV in background via shared thread pool.
         ffmpeg = _resolve_ffmpeg_binary()
         if not ffmpeg:
             self._set_voice_status("ffmpeg не найден — воспроизведение голосовых недоступно.")
             return
 
-        th = getattr(self, "_voice_decode_thread", None)
-        try:
-            if th is not None and th.isRunning():
-                # Already decoding; keep waiting.
-                return
-        except Exception:
-            pass
+        if getattr(self, "_voice_decode_pending", False):
+            # Already decoding; keep waiting.
+            return
 
         cmd = [
             ffmpeg,
@@ -2574,6 +2656,7 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         ]
 
         self._voice_decode_autoplay = True
+        self._voice_decode_pending = True
         self._set_voice_status("Подготавливаю аудио…")
         if self.play_button and _qt_is_valid(self.play_button):
             try:
@@ -2582,22 +2665,12 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
             except Exception:
                 pass
 
-        thread = QThread()
-        try:
-            thread.setObjectName(f"voice_decode_thread_{int(self.msg_id or 0)}")
-        except Exception:
-            thread.setObjectName("voice_decode_thread")
-        worker = FfmpegConvertWorker(cmd, decoded, timeout_sec=45.0)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.done.connect(self._on_voice_decode_done)
-        worker.done.connect(thread.quit)
-        worker.done.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._voice_decode_thread = thread
-        self._voice_decode_worker = worker
-        self._track_bg_thread(thread)
-        thread.start()
+        # Connect the bus signal to our handler (once per widget)
+        if not getattr(self, "_voice_bus_connected", False):
+            _voice_decode_bus.done.connect(self._on_voice_decode_pool_done)
+            self._voice_bus_connected = True
+
+        _voice_decode_submit(int(self.msg_id or 0), cmd, decoded, timeout_sec=45.0)
 
     def _play_audio_path(self, path: str) -> None:
         player = self._ensure_player()
@@ -2652,6 +2725,15 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         if self._voice_decode_autoplay:
             self._voice_decode_autoplay = False
             self._play_audio_path(out_path)
+
+    @Slot(int, dict)
+    def _on_voice_decode_pool_done(self, msg_id: int, payload: Dict[str, Any]) -> None:
+        """Handle voice decode result from the shared thread pool."""
+        my_id = int(getattr(self, "msg_id", 0) or 0)
+        if my_id != msg_id:
+            return  # not our result
+        self._voice_decode_pending = False
+        self._on_voice_decode_done(payload)
 
     def _on_voice_wave_seek(self, ratio: float) -> None:
         player = self._ensure_player()
@@ -2804,9 +2886,10 @@ class ChatItemWidget(MediaRenderingMixin, QWidget):
         if self._caption_label or not self._content_layout:
             return
         caption = RichTextLabel(self.text, self)
-        caption.setStyleSheet(_style_sheet("message.caption", "font-size:13px;"))
+        caption.setStyleSheet(caption.styleSheet() + _style_sheet("message.caption", "font-size:13px;"))
         caption.setWordWrap(True)
         caption.commandActivated.connect(self.commandActivated.emit)
+        caption.urlActivated.connect(self.urlActivated.emit)
         if self.text_entities:
             caption.set_message(self.text, entities=self.text_entities)
         if self.kind == "image" and not self.bubble:

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -20,11 +21,12 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 import sqlite3
-from concurrent.futures import TimeoutError as FuturesTimeoutError, CancelledError as FuturesCancelledError
+from concurrent.futures import Future as ConcurrentFuture, TimeoutError as FuturesTimeoutError, CancelledError as FuturesCancelledError
 
 from utils.account_store import AccountStore
 from utils import app_paths
 from utils.error_guard import ensure_asyncio_exception_logging, guard_module
+from utils.telegram_links import parse_telegram_reference
 log = logging.getLogger("telegram_adapter")
 
 
@@ -38,6 +40,8 @@ class _PyrogramNoiseFilter(logging.Filter):
             msg = ""
         if "FILE_ID_INVALID" in msg:
             return False
+        if "AUTH_KEY_UNREGISTERED" in msg:
+            return False
         return True
 
 
@@ -49,6 +53,11 @@ if not getattr(_pyro_logger, "_escgram_noise_filter_installed", False):
 if TYPE_CHECKING:
     from storage import Storage
 
+
+class UserVisibleAuthError(RuntimeError):
+    __suppress_error_guard__ = True
+
+
 # ---- optional deps ----
 try:
     import qrcode  # for QR login
@@ -57,20 +66,24 @@ except Exception:
     HAVE_QR = False
 
 try:
-    from pyrogram import Client, filters, enums
+    from pyrogram import Client, filters, enums, utils as pyrogram_utils
     from pyrogram.types import InputMediaPhoto, InputMediaVideo, Message, MessageEntity
     from pyrogram.errors import SessionPasswordNeeded
     from pyrogram.handlers import RawUpdateHandler
     from pyrogram.raw import functions as raw_fn, types as raw_types
+    from pyrogram.storage.sqlite_storage import SCHEMA as PYROGRAM_SQLITE_SCHEMA
     HAVE_PYROGRAM = True
 except Exception:
     HAVE_PYROGRAM = False
+    PYROGRAM_SQLITE_SCHEMA = ""
+    pyrogram_utils = None
 
 
 # ----------------------------- config -----------------------------
 def _load_config() -> Dict[str, Any]:
     candidates: List[Path] = []
     seen: Set[str] = set()
+    failed_reads: List[Tuple[Path, Exception]] = []
 
     def _add(path: Optional[Path]) -> None:
         if not path:
@@ -131,8 +144,11 @@ def _load_config() -> Dict[str, Any]:
                 if isinstance(cfg, dict):
                     log.info("[TG] config loaded from %s", path)
                     return cfg
-        except Exception:
+        except Exception as exc:
+            failed_reads.append((path, exc))
             continue
+    for path, exc in failed_reads:
+        log.warning("[TG] failed to read config %s: %s", path, exc)
     return {}
 
 
@@ -182,6 +198,7 @@ class TelegramAdapter:
         self._connected = False
         self._initialized = False
         self._auth_invalid = False
+        self._auth_challenge_pending = False
 
         # cache: (user_id, ts)
         self._me_cache: Optional[tuple[str, float]] = None
@@ -204,6 +221,8 @@ class TelegramAdapter:
 
         # auth state
         self._current_phone_hash: Optional[str] = None
+        self._current_login_delivery_hint: str = ""
+        self._current_password_hint: str = ""
         self._qr_handler: Optional["RawUpdateHandler"] = None
         self._qr_event: Optional[asyncio.Event] = None
         self._qr_pwd_event: Optional[asyncio.Event] = None
@@ -227,6 +246,8 @@ class TelegramAdapter:
         self._pending_deleted_unknown: Set[int] = set()
         self._deleted_flush_task: Optional[asyncio.Task[Any]] = None
         self._raw_delete_handler: Optional["RawUpdateHandler"] = None
+        self._loop_ready = threading.Event()
+        self._shutdown_requested = threading.Event()
 
         self._local_outgoing_ids: Deque[int] = deque()
         self._local_outgoing_lookup: Set[int] = set()
@@ -234,6 +255,12 @@ class TelegramAdapter:
         self._local_outgoing_lock = threading.Lock()
         self._last_auth_error_at: float = 0.0
         self._last_history_timeout_at: float = 0.0
+        self._file_download_blocked_until: float = 0.0
+        self._file_download_block_reason: str = ""
+        self._file_download_lock = threading.Lock()
+        self._public_lookup_blocked_until: float = 0.0
+        self._public_lookup_block_reason: str = ""
+        self._public_lookup_lock = threading.Lock()
         log.info(f"[TG] using session name: {self._session_name} (workdir={self._workdir})")
 
     def set_server(self, server: "ServerCore") -> None:
@@ -241,9 +268,41 @@ class TelegramAdapter:
 
     def set_storage(self, storage: Optional["Storage"]) -> None:
         self._storage = storage
+        self._sync_storage_session()
+
+    def _sync_storage_session(self) -> None:
+        storage = getattr(self, "_storage", None)
+        if storage is None:
+            return
+        switcher = getattr(storage, "switch_db_path", None)
+        if not callable(switcher):
+            return
+        try:
+            switcher(str(app_paths.session_db_path(self._session_name)))
+        except Exception:
+            log.exception("[TG] Failed to switch storage DB for session %s", self._session_name)
 
     def set_ghost_mode(self, enabled: bool) -> None:
         self._ghost_mode_enabled = bool(enabled)
+
+    def _reset_runtime_state(self) -> None:
+        self._loop = None
+        self._client = None
+        self._stop_event = None
+        self._connected = False
+        self._initialized = False
+        self._auth_challenge_pending = False
+        self._raw_delete_handler = None
+        self._deleted_flush_task = None
+        self._pending_deleted_by_peer = {}
+        self._pending_deleted_unknown = set()
+        self._me_cache = None
+        self._me_cache_lock = None
+        self._current_phone_hash = None
+        self._current_login_delivery_hint = ""
+        self._current_password_hint = ""
+        self._loop_ready.clear()
+        self._clear_file_download_block()
 
     def _pick_existing_session_name(self, candidates: List[str]) -> str:
         for name in candidates:
@@ -290,6 +349,280 @@ class TelegramAdapter:
                     candidate.unlink()
                 except Exception:
                     pass
+
+    def _pick_replacement_session(self, removed_session: str) -> Tuple[str, bool, bool]:
+        removed = str(removed_session or "").strip()
+        active = str(self._account_store.active_session or "").strip()
+        for row in self._account_store.list_accounts(active):
+            session = str(row.get("session") or "").strip()
+            if not session or session == removed:
+                continue
+            if self._session_exists(session):
+                return session, False, True
+
+        session_files = sorted(
+            [p for p in self._workdir.glob("*.session") if p.is_file() and p.stem != removed],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if session_files:
+            return session_files[0].stem, False, True
+
+        fallback = "my_account_gui"
+        if fallback == removed or self._session_exists(fallback):
+            fallback = self._generate_session_name(base="account")
+        return fallback, True, False
+
+    @staticmethod
+    def _sanitize_session_name(base: str) -> str:
+        raw = str(base or "").strip()
+        if not raw:
+            return "imported_session"
+        cleaned: List[str] = []
+        for ch in raw:
+            if ch.isascii() and (ch.isalnum() or ch in {"_", "-"}):
+                cleaned.append(ch.lower())
+            elif ch in {" ", "."}:
+                cleaned.append("_")
+        value = "".join(cleaned).strip("_-")
+        if value:
+            return value
+        digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        return f"imported_{digest}"
+
+    @staticmethod
+    def _sqlite_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row[1]) for row in rows if len(row) > 1}
+
+    def _detect_session_file_format(self, session_path: Path) -> str:
+        try:
+            conn = sqlite3.connect(str(session_path))
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"Не удалось открыть session-файл: {exc}") from exc
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+                if row and row[0]
+            }
+            if "sessions" not in tables:
+                raise RuntimeError("Файл не похож на Telegram session SQLite-базу.")
+            session_columns = self._sqlite_table_columns(conn, "sessions")
+        finally:
+            conn.close()
+        if {"dc_id", "api_id", "test_mode", "auth_key", "date", "user_id", "is_bot"}.issubset(session_columns):
+            return "pyrogram"
+        if {"dc_id", "server_address", "port", "auth_key"}.issubset(session_columns):
+            return "telethon"
+        raise RuntimeError("Неизвестный формат session-файла. Поддерживаются Pyrogram и Telethon.")
+
+    def _pick_import_session_name(self, source_path: Path) -> str:
+        pending = str(self._pending_session_name or "").strip()
+        if pending:
+            return pending
+
+        current = str(self._session_name or "").strip()
+        if current and not self._session_exists(current):
+            return current
+
+        base = self._sanitize_session_name(source_path.stem)
+        if current and base == current and not self._session_exists(base):
+            return base
+        if not self._session_exists(base) and not self._account_store.has_account(base):
+            return base
+        return self._generate_session_name(base=base or "imported_session")
+
+    def _write_pyrogram_session_file(self, source_path: Path, target_path: Path, session_format: str) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        tmp_path: Optional[Path] = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{target_path.stem}.",
+                suffix=".session.tmp",
+                dir=str(target_path.parent),
+            )
+            os.close(fd)
+            fd = None
+            tmp_path = Path(tmp_name)
+            with contextlib.suppress(Exception):
+                tmp_path.unlink()
+
+            if session_format == "pyrogram":
+                shutil.copy2(source_path, tmp_path)
+                conn = sqlite3.connect(str(tmp_path))
+                try:
+                    conn.execute(
+                        "UPDATE sessions SET api_id = ?, date = ?",
+                        (int(self._api_id), int(time.time())),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            else:
+                if not PYROGRAM_SQLITE_SCHEMA:
+                    raise RuntimeError("Pyrogram недоступен: не удалось подготовить session-файл.")
+
+                source_conn = sqlite3.connect(str(source_path))
+                try:
+                    row = source_conn.execute(
+                        "SELECT dc_id, auth_key FROM sessions "
+                        "WHERE auth_key IS NOT NULL AND length(auth_key) > 0 "
+                        "ORDER BY dc_id LIMIT 1"
+                    ).fetchone()
+                finally:
+                    source_conn.close()
+                if not row:
+                    raise RuntimeError("В Telethon session-файле не найден действующий auth_key.")
+
+                dc_id = int(row[0] or 0)
+                auth_key = row[1]
+                if isinstance(auth_key, memoryview):
+                    auth_key = auth_key.tobytes()
+                elif isinstance(auth_key, bytearray):
+                    auth_key = bytes(auth_key)
+                if not isinstance(auth_key, bytes) or not auth_key:
+                    raise RuntimeError("Telethon session-файл не содержит валидный auth_key.")
+
+                target_conn = sqlite3.connect(str(tmp_path))
+                try:
+                    target_conn.executescript(PYROGRAM_SQLITE_SCHEMA)
+                    target_conn.execute("INSERT INTO version VALUES (?)", (3,))
+                    target_conn.execute(
+                        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            dc_id,
+                            int(self._api_id),
+                            0,
+                            sqlite3.Binary(auth_key),
+                            int(time.time()),
+                            None,
+                            None,
+                        ),
+                    )
+                    target_conn.commit()
+                finally:
+                    target_conn.close()
+
+            os.replace(tmp_path, target_path)
+            tmp_path = None
+        finally:
+            if fd is not None:
+                with contextlib.suppress(Exception):
+                    os.close(fd)
+            if tmp_path is not None and tmp_path.exists():
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink()
+
+    def import_session_file_sync(
+        self,
+        session_path: str,
+        *,
+        target_session_name: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        if not self._enabled or self._api_id is None or not self._api_hash:
+            raise RuntimeError("Telegram API не настроен: импорт session-файла недоступен.")
+
+        source_path = Path(session_path).expanduser()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Session-файл не найден: {source_path}")
+
+        session_format = self._detect_session_file_format(source_path)
+        target_session = str(target_session_name or self._pick_import_session_name(source_path)).strip()
+        if not target_session:
+            raise RuntimeError("Не удалось определить имя для импортируемой сессии.")
+
+        target_path = self._workdir / f"{target_session}.session"
+        try:
+            source_resolved = source_path.resolve()
+        except Exception:
+            source_resolved = source_path
+        try:
+            target_resolved = target_path.resolve()
+        except Exception:
+            target_resolved = target_path
+
+        if source_resolved == target_resolved and session_format != "pyrogram":
+            target_session = self._generate_session_name(base=self._sanitize_session_name(source_path.stem))
+            target_path = self._workdir / f"{target_session}.session"
+            target_resolved = target_path
+
+        previous_session = str(self._session_name or "").strip()
+        previous_exists = bool(previous_session and self._session_exists(previous_session))
+        same_target = source_resolved == target_resolved
+        created_target = False
+
+        try:
+            if self._thread:
+                self.stop()
+            if not same_target:
+                self._delete_session_files(target_session)
+                self._write_pyrogram_session_file(source_path, target_path, session_format)
+                created_target = True
+            else:
+                conn = sqlite3.connect(str(target_path))
+                try:
+                    conn.execute(
+                        "UPDATE sessions SET api_id = ?, date = ?",
+                        (int(self._api_id), int(time.time())),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            self._pending_session_name = target_session
+            self._activate_session(target_session, register=False)
+
+            deadline = time.time() + max(5.0, float(timeout))
+            while time.time() < deadline:
+                remaining = max(1.0, deadline - time.time())
+                if self.is_authorized_sync(timeout=min(5.0, remaining)):
+                    profile = self.refresh_active_account_profile()
+                    if profile is None:
+                        self._finalize_authenticated_session()
+                        profile = self.get_active_account_meta()
+                    result = dict(profile or {})
+                    result.setdefault("session", target_session)
+                    result["authorized"] = True
+                    result["requires_login"] = False
+                    return result
+                if self._auth_invalid:
+                    break
+                time.sleep(0.25)
+
+            self._prepare_current_session_for_manual_login(target_session)
+            return {
+                "session": target_session,
+                "authorized": False,
+                "requires_login": True,
+                "message": (
+                    "Session-файл импортирован, но Telegram требует повторную авторизацию. "
+                    "Введите номер телефона и код из Telegram на вкладке «По номеру»."
+                ),
+            }
+        except Exception:
+            if created_target or (target_session != previous_session and not same_target):
+                self._delete_session_files(target_session)
+                try:
+                    self._account_store.remove_account(target_session)
+                except Exception:
+                    pass
+            self._pending_session_name = None
+            if previous_exists and previous_session and (
+                previous_session != self._session_name or not self._thread
+            ):
+                try:
+                    self._activate_session(
+                        previous_session,
+                        register=bool(self._account_store.has_account(previous_session)),
+                    )
+                except Exception:
+                    log.warning("Failed to restore previous session after import error", exc_info=True)
+            raise
 
     def current_session_name(self) -> str:
         return self._session_name
@@ -350,12 +683,22 @@ class TelegramAdapter:
             self._account_store.remove_account(pending)
         self._pending_session_name = None
 
+    def _prepare_current_session_for_manual_login(self, session_name: Optional[str] = None) -> str:
+        target = str(session_name or self._session_name or "").strip()
+        if not target:
+            target = self._generate_session_name(base="account")
+        self._pending_session_name = target
+        self._activate_session(target, clean=True, register=False)
+        return target
+
     def delete_account(self, session_name: str) -> None:
         name = str(session_name or "").strip()
         if not name:
             raise ValueError("Не указан аккаунт")
         if name == self._session_name:
-            raise RuntimeError("Нельзя удалить активный аккаунт. Сначала переключитесь на другой.")
+            replacement, clean, register = self._pick_replacement_session(name)
+            self._pending_session_name = None
+            self._activate_session(replacement, clean=clean, register=register)
         self._delete_session_files(name)
         self._account_store.remove_account(name)
 
@@ -364,18 +707,25 @@ class TelegramAdapter:
         if clean:
             self._delete_session_files(session_name)
         self._session_name = session_name
+        self._sync_storage_session()
         if register:
             self._account_store.set_active(session_name)
             self._account_store.update_account(session_name, last_used=time.time(), create_if_missing=False)
         self._connected = False
         self._initialized = False
         self._auth_invalid = False
+        self._auth_challenge_pending = False
         self._current_phone_hash = None
+        self._current_login_delivery_hint = ""
+        self._current_password_hint = ""
         self.start()
 
     def _finalize_authenticated_session(self, profile: Optional[Dict[str, Any]] = None) -> None:
         self._pending_session_name = None
         self._current_phone_hash = None
+        self._current_login_delivery_hint = ""
+        self._current_password_hint = ""
+        self._auth_challenge_pending = False
         self._account_store.ensure_account(self._session_name)
         self._account_store.set_active(self._session_name)
         base_meta: Dict[str, Any] = {"last_used": time.time()}
@@ -445,16 +795,40 @@ class TelegramAdapter:
         if not self._enabled:
             log.info("[TG] Telegram disabled: missing pyrogram or telegram_api_id/hash in config.json (or env DRAGO_TG_API_*)")
             return
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
+            self._reset_runtime_state()
         if self._thread:
             return
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._shutdown_requested.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="telegram-loop")
         self._thread.start()
 
     def stop(self) -> None:
-        if not self._enabled or not self._loop:
-            return
-        loop = self._loop
         thread = self._thread
+        if not self._enabled and not thread:
+            return
+        self._shutdown_requested.set()
+
+        if thread and not self._loop:
+            self._loop_ready.wait(timeout=2.0)
+
+        loop = self._loop
+        if not loop:
+            if thread:
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    log.warning("[TG] Stop requested before loop initialised; thread is still alive")
+                else:
+                    self._thread = None
+                    self._reset_runtime_state()
+            return
+        if loop.is_closed():
+            if thread:
+                thread.join(timeout=2.0)
+            self._thread = None
+            self._reset_runtime_state()
+            return
 
         async def _shutdown():
             try:
@@ -472,9 +846,15 @@ class TelegramAdapter:
                 if self._stop_event and not self._stop_event.is_set():
                     self._stop_event.set()
 
-        fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+        shutdown_coro = _shutdown()
         try:
-            fut.result(3)
+            fut = asyncio.run_coroutine_threadsafe(shutdown_coro, loop)
+        except Exception:
+            self._discard_coroutine(shutdown_coro)
+            fut = None
+        try:
+            if fut is not None:
+                fut.result(3)
         except Exception:
             try:
                 if loop.is_running():
@@ -497,18 +877,11 @@ class TelegramAdapter:
                     pass
                 thread.join(timeout=2)
         self._thread = None
-        self._loop = None
-        self._client = None
-        self._stop_event = None
-        self._connected = False
-        self._initialized = False
-        self._raw_delete_handler = None
-        self._deleted_flush_task = None
-        self._pending_deleted_by_peer = {}
-        self._pending_deleted_unknown = set()
+        self._reset_runtime_state()
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
+        self._loop_ready.set()
         asyncio.set_event_loop(self._loop)
         ensure_asyncio_exception_logging(self._loop)
 
@@ -529,8 +902,14 @@ class TelegramAdapter:
 
         async def _main():
             self._stop_event = asyncio.Event()
+            if self._shutdown_requested.is_set():
+                self._stop_event.set()
+                return
             await _connect_only()
             if self._stop_event.is_set():
+                return
+            if self._shutdown_requested.is_set():
+                self._stop_event.set()
                 return
             # если уже авторизованы — поднимем апдейты
             try:
@@ -540,9 +919,7 @@ class TelegramAdapter:
                 if not self._stop_event.is_set():
                     await self._initialize_updates()
             except Exception as exc:
-                if self._is_auth_issue(exc):
-                    self._auth_invalid = True
-                    self._notify_auth_issue(exc)
+                self._handle_authorized_call_exception(exc)
 
             await self._stop_event.wait()
 
@@ -576,6 +953,9 @@ class TelegramAdapter:
                 self._loop.close()
             except Exception:
                 pass
+            if self._thread is threading.current_thread():
+                self._thread = None
+            self._reset_runtime_state()
 
     # -------------------- helpers --------------------
     @staticmethod
@@ -593,14 +973,81 @@ class TelegramAdapter:
         except Exception:
             pass
 
+    def _submit_coro(self, coro: Any) -> Tuple[Optional[ConcurrentFuture[Any]], Dict[str, Any]]:
+        loop = self._loop
+        if loop is None:
+            self._discard_coroutine(coro)
+            return None, {}
+
+        future: ConcurrentFuture[Any] = ConcurrentFuture()
+        state: Dict[str, Any] = {"task": None, "cancel_requested": False}
+
+        def _runner() -> None:
+            if future.cancelled():
+                self._discard_coroutine(coro)
+                return
+            if loop.is_closed():
+                self._discard_coroutine(coro)
+                if not future.done():
+                    future.set_result(None)
+                return
+
+            task = loop.create_task(coro)
+            state["task"] = task
+
+            if state.get("cancel_requested"):
+                task.cancel()
+
+            def _done(done_task: asyncio.Task[Any]) -> None:
+                if future.cancelled() or future.done():
+                    return
+                try:
+                    result = done_task.result()
+                except asyncio.CancelledError:
+                    future.cancel()
+                except Exception as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+
+            task.add_done_callback(_done)
+
+        try:
+            loop.call_soon_threadsafe(_runner)
+        except RuntimeError:
+            self._discard_coroutine(coro)
+            return None, {}
+
+        return future, state
+
+    def _wait_for_client_connection(self, timeout: float = 15.0) -> bool:
+        if not self._enabled:
+            return False
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
+            self._reset_runtime_state()
+        if not self._thread:
+            self.start()
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            if self._client is not None and self._loop is not None and self._connected:
+                return True
+            time.sleep(0.05)
+        return bool(self._client is not None and self._loop is not None and self._connected)
+
     def _call(self, coro, timeout: float):
+        return self._call_with_options(coro, timeout)
+
+    def _call_with_options(self, coro, timeout: float, *, allow_auth_exceptions: bool = False):
         if not (self._loop and self._client and self._enabled):
             self._discard_coroutine(coro)
             return None
         if not self._connected:
             self._discard_coroutine(coro)
             return None
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        fut, state = self._submit_coro(coro)
+        if fut is None:
+            return None
         try:
             return fut.result(timeout=timeout)
         except FuturesCancelledError:
@@ -610,10 +1057,20 @@ class TelegramAdapter:
             # Timeout is expected under unstable network conditions.
             # Return None instead of raising to avoid noisy "Unhandled error in _call"
             # from error_guard wrappers.
-            try:
-                fut.cancel()
-            except Exception:
-                pass
+            state["cancel_requested"] = True
+            task = state.get("task")
+            loop = self._loop
+            if task is not None and loop is not None:
+                try:
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(task.cancel)
+                except Exception:
+                    pass
+            else:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
             self._throttled_warning(
                 "_last_call_timeout_at",
                 4.0,
@@ -622,24 +1079,474 @@ class TelegramAdapter:
             )
             return None
         except Exception as exc:
+            if self._is_auth_challenge(exc):
+                self._auth_challenge_pending = True
+                if allow_auth_exceptions:
+                    raise UserVisibleAuthError(str(exc)) from None
+                return None
             if self._is_auth_issue(exc):
+                if allow_auth_exceptions:
+                    raise
                 self._auth_invalid = True
                 self._notify_auth_issue(exc)
                 return None
+            if allow_auth_exceptions and self._is_expected_auth_flow_error(exc):
+                raise UserVisibleAuthError(str(exc)) from None
             if isinstance(exc, ConnectionError) and "not been started" in str(exc).lower():
                 return None
             # If the caller timed out (or errored), ensure the coroutine doesn't
             # keep running in the background and blocking the shared loop.
-            try:
-                fut.cancel()
-            except Exception:
-                pass
+            state["cancel_requested"] = True
+            task = state.get("task")
+            loop = self._loop
+            if task is not None and loop is not None:
+                try:
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(task.cancel)
+                except Exception:
+                    pass
+            else:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
             raise
 
     @staticmethod
     def _is_auth_issue(exc: BaseException) -> bool:
         msg = str(exc).upper()
-        return ("AUTH_KEY_UNREGISTERED" in msg) or ("SESSION_PASSWORD_NEEDED" in msg) or ("UNAUTHORIZED" in msg)
+        return ("AUTH_KEY_UNREGISTERED" in msg) or ("UNAUTHORIZED" in msg)
+
+    @staticmethod
+    def _is_auth_challenge(exc: BaseException) -> bool:
+        msg = str(exc).upper()
+        return "SESSION_PASSWORD_NEEDED" in msg
+
+    @staticmethod
+    def _is_expected_auth_flow_error(exc: BaseException) -> bool:
+        msg = str(exc).upper()
+        markers = (
+            "SESSION_PASSWORD_NEEDED",
+            "PASSWORD_HASH_INVALID",
+            "PHONE_CODE_INVALID",
+            "PHONE_CODE_EXPIRED",
+            "PHONE_CODE_HASH_EMPTY",
+            "PHONE_CODE_HASH_INVALID",
+            "PHONE_NUMBER_INVALID",
+            "PHONE_NUMBER_BANNED",
+            "FLOOD_WAIT",
+        )
+        return any(marker in msg for marker in markers)
+
+    @staticmethod
+    def _describe_sent_code_delivery(sent_code_type: Any) -> str:
+        marker = str(getattr(sent_code_type, "name", sent_code_type) or "").upper()
+        if "EMAIL" in marker:
+            return "по email"
+        if "SMS" in marker or "FRAGMENT" in marker:
+            return "по SMS"
+        if "FLASH" in marker:
+            return "через flash call"
+        if "CALL" in marker:
+            return "звонком"
+        if "APP" in marker:
+            return "в Telegram"
+        return ""
+
+    def current_login_delivery_hint(self) -> str:
+        return str(self._current_login_delivery_hint or "")
+
+    def current_login_password_hint(self) -> str:
+        return str(self._current_password_hint or "")
+
+    @staticmethod
+    def _extract_flood_wait_seconds(exc: BaseException) -> Optional[int]:
+        for attr_name in ("value", "x", "seconds"):
+            try:
+                value = getattr(exc, attr_name, None)
+            except Exception:
+                value = None
+            if isinstance(value, (int, float)) and float(value) > 0:
+                try:
+                    return max(1, int(value))
+                except Exception:
+                    pass
+        msg = str(exc or "")
+        patterns = (
+            r"wait of (\d+) seconds is required",
+            r"FLOOD_WAIT(?:_X)?[^\d]*(\d+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, msg, flags=re.IGNORECASE)
+            if match:
+                try:
+                    return max(1, int(match.group(1)))
+                except Exception:
+                    continue
+        return None
+
+    def _clear_file_download_block(self) -> None:
+        with self._file_download_lock:
+            self._file_download_blocked_until = 0.0
+            self._file_download_block_reason = ""
+
+    def _file_downloads_blocked(self) -> bool:
+        with self._file_download_lock:
+            blocked_until = float(self._file_download_blocked_until or 0.0)
+            if blocked_until <= 0.0:
+                return False
+            if time.monotonic() >= blocked_until:
+                self._file_download_blocked_until = 0.0
+                self._file_download_block_reason = ""
+                return False
+            return True
+
+    def _pause_file_downloads(self, wait_seconds: int, *, reason: str = "") -> None:
+        wait_seconds = max(1, int(wait_seconds or 0))
+        now = time.monotonic()
+        with self._file_download_lock:
+            previous_until = float(self._file_download_blocked_until or 0.0)
+            new_until = max(previous_until, now + wait_seconds)
+            self._file_download_blocked_until = new_until
+            if reason:
+                self._file_download_block_reason = str(reason)
+            remaining = max(1, int(round(new_until - now)))
+            should_log = previous_until <= now or new_until > (previous_until + 1.0)
+        if not should_log:
+            return
+        suffix = f" ({reason})" if reason else ""
+        log.warning("[TG] File downloads paused for %ss%s", remaining, suffix)
+
+    def _handle_file_download_exception(self, exc: BaseException, *, context: str) -> bool:
+        if self._handle_authorized_call_exception(exc):
+            return True
+        wait_seconds = self._extract_flood_wait_seconds(exc)
+        if not wait_seconds:
+            return False
+        msg = str(exc or "")
+        reason = str(context or "file-download")
+        if "EXPORTAUTHORIZATION" in msg.upper():
+            reason = f"{reason}; auth.ExportAuthorization"
+        self._pause_file_downloads(wait_seconds, reason=reason)
+        return True
+
+    def _public_lookups_blocked(self) -> bool:
+        with self._public_lookup_lock:
+            blocked_until = float(self._public_lookup_blocked_until or 0.0)
+            if blocked_until <= 0.0:
+                return False
+            if time.monotonic() >= blocked_until:
+                self._public_lookup_blocked_until = 0.0
+                self._public_lookup_block_reason = ""
+                return False
+            return True
+
+    def get_public_lookup_status(self) -> Dict[str, Any]:
+        with self._public_lookup_lock:
+            blocked_until = float(self._public_lookup_blocked_until or 0.0)
+            reason = str(self._public_lookup_block_reason or "")
+        now = time.monotonic()
+        if blocked_until <= 0.0 or now >= blocked_until:
+            return {
+                "blocked": False,
+                "remaining_seconds": 0,
+                "reason": "",
+            }
+        return {
+            "blocked": True,
+            "remaining_seconds": max(1, int(round(blocked_until - now))),
+            "reason": reason,
+        }
+
+    def _pause_public_lookups(self, wait_seconds: int, *, reason: str = "") -> None:
+        wait_seconds = max(1, int(wait_seconds or 0))
+        now = time.monotonic()
+        with self._public_lookup_lock:
+            previous_until = float(self._public_lookup_blocked_until or 0.0)
+            new_until = max(previous_until, now + wait_seconds)
+            self._public_lookup_blocked_until = new_until
+            if reason:
+                self._public_lookup_block_reason = str(reason)
+            remaining = max(1, int(round(new_until - now)))
+            should_log = previous_until <= now or new_until > (previous_until + 1.0)
+        if should_log:
+            suffix = f" ({reason})" if reason else ""
+            log.warning("[TG] Public username lookups paused for %ss%s", remaining, suffix)
+
+    def _handle_public_lookup_exception(self, exc: BaseException, *, context: str) -> bool:
+        if self._handle_authorized_call_exception(exc):
+            return True
+        wait_seconds = self._extract_flood_wait_seconds(exc)
+        if not wait_seconds:
+            return False
+        self._pause_public_lookups(wait_seconds, reason=str(context or "public-lookup"))
+        return True
+
+    def _handle_authorized_call_exception(self, exc: BaseException) -> bool:
+        if self._is_auth_challenge(exc):
+            self._auth_challenge_pending = True
+            return True
+        if self._is_auth_issue(exc):
+            self._auth_invalid = True
+            self._notify_auth_issue(exc)
+            return True
+        return False
+
+    def _authorized_requests_blocked(self) -> bool:
+        return bool(self._auth_invalid or self._auth_challenge_pending or not self._connected)
+
+    @staticmethod
+    def _is_peer_id_invalid(exc: BaseException) -> bool:
+        msg = str(exc or "").upper()
+        return (
+            "PEER_ID_INVALID" in msg
+            or "PEER ID INVALID" in msg
+            or "CHAT_ID_INVALID" in msg
+            or "CHAT ID INVALID" in msg
+            or "CHANNEL_INVALID" in msg
+            or "CHANNEL ID INVALID" in msg
+            or "USERNAME_INVALID" in msg
+            or "USERNAME NOT FOUND" in msg
+        )
+
+    @staticmethod
+    def _is_chat_access_denied(exc: BaseException) -> bool:
+        msg = str(exc or "").upper()
+        return (
+            "CHANNEL_PRIVATE" in msg
+            or "CHAT_FORBIDDEN" in msg
+            or "CHANNEL_FORBIDDEN" in msg
+            or "CHAT_ADMIN_REQUIRED" in msg
+            or "USER_NOT_PARTICIPANT" in msg
+            or "INVITE_REQUEST_SENT" in msg
+        )
+
+    @staticmethod
+    def _extract_available_reactions(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            source = list(value)
+        else:
+            nested = getattr(value, "reactions", None)
+            if isinstance(nested, (list, tuple, set)):
+                source = list(nested)
+            else:
+                return []
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in source:
+            try:
+                emoji = str(getattr(item, "emoji", None) or item or "").strip()
+            except Exception:
+                emoji = ""
+            if not emoji or emoji in seen:
+                continue
+            seen.add(emoji)
+            out.append(emoji)
+        return out
+
+    @staticmethod
+    def _username_lookup_variants(username: str) -> List[str]:
+        handle = str(username or "").strip().lstrip("@")
+        if not handle:
+            return []
+        variants: List[str] = [handle]
+        if handle.upper() not in variants:
+            variants.append(handle.upper())
+        if "_" not in handle and len(handle) >= 8:
+            cut_points = [3, max(3, len(handle) // 2)]
+            for cut in cut_points:
+                if cut <= 0 or cut >= len(handle):
+                    continue
+                for variant in (
+                    handle[:cut] + "_" + handle[cut:],
+                    handle[:cut].upper() + "_" + handle[cut:].upper(),
+                ):
+                    if variant not in variants:
+                        variants.append(variant)
+        return variants
+
+    def _history_target_variants(self, chat_id: str, *, include_username_fallback: bool = False) -> List[Any]:
+        raw = str(chat_id or "").strip()
+        if not raw:
+            return []
+        variants: List[Any] = []
+        seen: set[str] = set()
+
+        def _add(value: Any) -> None:
+            key = str(value or "").strip()
+            if not key or key in seen:
+                return
+            seen.add(key)
+            if isinstance(value, str) and value.lstrip("-").isdigit():
+                try:
+                    variants.append(int(value))
+                    return
+                except Exception:
+                    pass
+            variants.append(value)
+
+        ref = parse_telegram_reference(raw)
+        if raw.lstrip("-").isdigit():
+            _add(raw)
+        elif ref.username:
+            for variant in self._username_lookup_variants(ref.username):
+                _add(variant)
+        elif ref.invite:
+            _add(ref.invite)
+        else:
+            _add(raw)
+        if include_username_fallback and raw.lstrip("-").isdigit() and self._storage is not None:
+            getter = getattr(self._storage, "get_peer", None)
+            if callable(getter):
+                try:
+                    peer = dict(getter(int(raw)) or {})
+                except Exception:
+                    peer = {}
+                username = str(peer.get("username") or "").strip()
+                if username and not self._public_lookups_blocked():
+                    _add(username)
+        return variants
+
+    def _persist_peer_row(self, row: Optional[Dict[str, Any]]) -> None:
+        if not row or not self._storage:
+            return
+        try:
+            self._storage.upsert_peers([row])
+        except Exception:
+            log.exception("[TG] Failed to persist peer row")
+
+    def _peer_row_from_entity(self, entity: Any) -> Optional[Dict[str, Any]]:
+        row = self._chat_to_peer_row(entity)
+        if row:
+            return row
+        return self._user_to_peer_row(entity)
+
+    def _peer_row_from_resolved_username(self, resolved: Any, *, requested_username: str = "") -> Optional[Dict[str, Any]]:
+        peer = getattr(resolved, "peer", None)
+        peer_class = str(getattr(getattr(peer, "__class__", None), "__name__", "") or "").lower()
+        requested = str(requested_username or "").strip()
+        if peer_class == "peerchannel":
+            channel_id = int(getattr(peer, "channel_id", 0) or 0)
+            for chat in list(getattr(resolved, "chats", None) or []):
+                try:
+                    raw_id = int(getattr(chat, "id", 0) or 0)
+                except Exception:
+                    raw_id = 0
+                if raw_id != channel_id:
+                    continue
+                row = self._chat_to_peer_row(chat)
+                if row and requested and not str(row.get("username") or "").strip():
+                    row["username"] = requested
+                return row
+        if peer_class == "peeruser":
+            user_id = int(getattr(peer, "user_id", 0) or 0)
+            for user in list(getattr(resolved, "users", None) or []):
+                try:
+                    raw_id = int(getattr(user, "id", 0) or 0)
+                except Exception:
+                    raw_id = 0
+                if raw_id != user_id:
+                    continue
+                row = self._user_to_peer_row(user)
+                if row and requested and not str(row.get("username") or "").strip():
+                    row["username"] = requested
+                return row
+        return None
+
+    def _peer_row_from_storage_username(self, username: str) -> Optional[Dict[str, Any]]:
+        handle = str(username or "").strip().lstrip("@")
+        if not handle or self._storage is None:
+            return None
+        getter = getattr(self._storage, "get_peer_by_username", None)
+        if not callable(getter):
+            return None
+        try:
+            row = getter(handle) or {}
+        except Exception:
+            return None
+        return dict(row) if isinstance(row, dict) and row else None
+
+    async def _resolve_username_row(self, username: str) -> Optional[Dict[str, Any]]:
+        handle = str(username or "").strip().lstrip("@")
+        if not handle:
+            return None
+        stored = self._peer_row_from_storage_username(handle)
+        if stored:
+            return stored
+        if self._public_lookups_blocked():
+            return None
+        try:
+            resolved = await self._client.invoke(raw_fn.contacts.ResolveUsername(username=handle))
+        except Exception as exc:
+            self._handle_public_lookup_exception(exc, context="contacts.ResolveUsername")
+            return None
+        return self._peer_row_from_resolved_username(resolved, requested_username=handle)
+
+    def resolve_chat_reference_sync(
+        self,
+        reference: str,
+        *,
+        join: bool = False,
+        timeout: float = 15.0,
+    ) -> Optional[Dict[str, Any]]:
+        if not (self._enabled and self._client and self._loop):
+            return None
+        ref = parse_telegram_reference(reference)
+        raw = str(reference or "").strip()
+        target: Any = ref.username or ref.canonical or raw
+        if not target:
+            return None
+        username_variants = self._username_lookup_variants(ref.username) if ref.is_username and ref.username else []
+
+        async def _run() -> Optional[Dict[str, Any]]:
+            entity = None
+            row: Optional[Dict[str, Any]] = None
+            if ref.is_username:
+                for variant in username_variants:
+                    row = await self._resolve_username_row(variant)
+                    if row:
+                        break
+            if join and (ref.is_invite or ref.is_username) and not self._public_lookups_blocked():
+                try:
+                    entity = await self._client.join_chat(target)
+                except Exception as exc:
+                    self._handle_public_lookup_exception(exc, context="join_chat")
+                    if not self._is_peer_id_invalid(exc):
+                        try:
+                            entity = await self._client.get_chat(target)
+                        except Exception:
+                            entity = None
+            else:
+                get_chat_targets: List[Any] = []
+                if ref.is_username and username_variants:
+                    get_chat_targets.extend(username_variants)
+                else:
+                    get_chat_targets.append(target)
+                for chat_target in get_chat_targets:
+                    try:
+                        entity = await self._client.get_chat(chat_target)
+                    except Exception as exc:
+                        self._handle_public_lookup_exception(exc, context="get_chat")
+                        entity = None
+                        continue
+                    if entity is not None:
+                        break
+            entity_row = self._peer_row_from_entity(entity)
+            if entity_row:
+                row = dict(row or {})
+                row.update({key: value for key, value in entity_row.items() if value not in (None, "")})
+            if row:
+                self._persist_peer_row(row)
+            return row
+
+        try:
+            return self._call(_run(), timeout)
+        except Exception as exc:
+            if self._handle_authorized_call_exception(exc):
+                return None
+            return None
 
     def _throttled_warning(self, stamp_attr: str, interval_sec: float, text: str, *args: Any) -> None:
         now = time.monotonic()
@@ -811,9 +1718,7 @@ class TelegramAdapter:
                 except Exception:
                     return None
         except Exception as exc:
-            if self._is_auth_issue(exc):
-                self._auth_invalid = True
-                self._notify_auth_issue(exc)
+            self._handle_authorized_call_exception(exc)
             return None
 
     # -------- ffmpeg helpers: convert to OGG/Opus & probe duration --------
@@ -1161,6 +2066,8 @@ class TelegramAdapter:
     def is_authorized_sync(self, timeout: float = 5.0) -> bool:
         if not self._enabled:
             return False
+        if self._auth_challenge_pending:
+            return False
 
         # Give the background thread time to initialize loop/client after start().
         warmup_deadline = time.time() + 5.0
@@ -1259,7 +2166,8 @@ class TelegramAdapter:
     def search_public_peers_sync(self, query: str, limit: int = 24, timeout: float = 12.0) -> List[Dict[str, Any]]:
         if not (self._enabled and self._client and self._loop):
             return []
-        needle = str(query or "").strip()
+        ref = parse_telegram_reference(query)
+        needle = str(ref.search_term or query or "").strip()
         if not needle:
             return []
         try:
@@ -1270,13 +2178,87 @@ class TelegramAdapter:
         async def _run() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
             seen: set[int] = set()
-            try:
-                resp = await self._client.invoke(raw_fn.contacts.Search(q=needle, limit=limit_int))
-            except Exception:
-                resp = None
+            stored_rows: List[Dict[str, Any]] = []
 
-            users = list(getattr(resp, "users", None) or []) if resp is not None else []
-            chats = list(getattr(resp, "chats", None) or []) if resp is not None else []
+            def _append_public_row(
+                row: Optional[Dict[str, Any]],
+                *,
+                fallback_username: str = "",
+                linked_from: str = "",
+                linked_rank: int = 0,
+            ) -> None:
+                if not isinstance(row, dict):
+                    return
+                try:
+                    pid = int(row.get("id"))
+                except Exception:
+                    pid = 0
+                if pid == 0 or pid in seen:
+                    return
+                seen.add(pid)
+                stored_rows.append(dict(row))
+                out.append(
+                    {
+                        "id": str(pid),
+                        "title": str(row.get("title") or pid),
+                        "type": str(row.get("type") or "private"),
+                        "username": str(row.get("username") or fallback_username),
+                        "photo_small_id": row.get("photo_small"),
+                        "members_count": row.get("members_count"),
+                        "linked_from": str(linked_from or "").strip(),
+                        "linked_rank": int(linked_rank or 0),
+                    }
+                )
+
+            query_norm = re.sub(r"[^a-zа-яё0-9]+", "", str(ref.username or needle or "").casefold())
+            username_variants: List[str] = self._username_lookup_variants(ref.username) if ref.is_username and ref.username else []
+            if ref.is_username:
+                exact_entity = None
+                exact_row = await self._resolve_username_row(ref.username)
+                if not exact_row:
+                    try:
+                        exact_entity = await self._client.get_chat(ref.username)
+                    except Exception:
+                        exact_entity = None
+                    exact_row = self._peer_row_from_entity(exact_entity)
+                linked_row = self._peer_row_from_entity(getattr(exact_entity, "linked_chat", None)) if exact_entity is not None else None
+                if linked_row:
+                    _append_public_row(
+                        linked_row,
+                        linked_from=str(exact_row.get("id") or ref.username or ""),
+                        linked_rank=1,
+                    )
+                _append_public_row(exact_row, fallback_username=ref.username)
+                for variant in username_variants[1:]:
+                    variant_row = await self._resolve_username_row(variant)
+                    if not variant_row:
+                        try:
+                            variant_entity = await self._client.get_chat(variant)
+                        except Exception:
+                            variant_entity = None
+                        variant_row = self._peer_row_from_entity(variant_entity)
+                    if not variant_row:
+                        continue
+                    _append_public_row(variant_row, fallback_username=variant)
+            search_queries: List[str] = [needle]
+            if ref.is_username and ref.username:
+                for variant in username_variants[1:]:
+                    normalized_variant = str(variant or "").strip()
+                    if normalized_variant and normalized_variant not in search_queries:
+                        search_queries.append(normalized_variant)
+
+            users: List[Any] = []
+            chats: List[Any] = []
+            if not self._public_lookups_blocked():
+                queries_to_run = [needle] if out else search_queries[:4]
+                for search_query in queries_to_run:
+                    try:
+                        resp = await self._client.invoke(raw_fn.contacts.Search(q=search_query, limit=limit_int))
+                    except Exception as exc:
+                        self._handle_public_lookup_exception(exc, context="contacts.Search")
+                        continue
+                    users.extend(list(getattr(resp, "users", None) or []))
+                    chats.extend(list(getattr(resp, "chats", None) or []))
 
             for user in users:
                 row = self._user_to_peer_row(user)
@@ -1289,6 +2271,16 @@ class TelegramAdapter:
                 if pid in seen:
                     continue
                 seen.add(pid)
+                stored_rows.append(
+                    {
+                        "id": pid,
+                        "type": str(row.get("type") or "private"),
+                        "username": str(row.get("username") or "").strip() or None,
+                        "title": str(row.get("title") or pid),
+                        "photo_small": row.get("photo_small"),
+                        "members_count": row.get("members_count"),
+                    }
+                )
                 out.append(
                     {
                         "id": str(pid),
@@ -1296,10 +2288,9 @@ class TelegramAdapter:
                         "type": str(row.get("type") or "private"),
                         "username": str(row.get("username") or ""),
                         "photo_small_id": row.get("photo_small"),
+                        "members_count": row.get("members_count"),
                     }
                 )
-                if len(out) >= limit_int:
-                    return out
 
             for chat in chats:
                 row = self._chat_to_peer_row(chat)
@@ -1312,6 +2303,16 @@ class TelegramAdapter:
                 if pid in seen:
                     continue
                 seen.add(pid)
+                stored_rows.append(
+                    {
+                        "id": pid,
+                        "type": str(row.get("type") or "group"),
+                        "username": str(row.get("username") or "").strip() or None,
+                        "title": str(row.get("title") or pid),
+                        "photo_small": row.get("photo_small"),
+                        "members_count": row.get("members_count"),
+                    }
+                )
                 out.append(
                     {
                         "id": str(pid),
@@ -1319,10 +2320,9 @@ class TelegramAdapter:
                         "type": str(row.get("type") or "group"),
                         "username": str(row.get("username") or ""),
                         "photo_small_id": row.get("photo_small"),
+                        "members_count": row.get("members_count"),
                     }
                 )
-                if len(out) >= limit_int:
-                    return out
 
             # Fallback for explicit @username / numeric ID.
             fallback = needle.lstrip("@")
@@ -1333,6 +2333,15 @@ class TelegramAdapter:
                     entity = None
                 if entity:
                     try:
+                        entity_row = self._peer_row_from_entity(entity)
+                        if entity_row:
+                            try:
+                                pid = int(entity_row.get("id"))
+                            except Exception:
+                                pid = 0
+                            if pid > 0 and pid not in seen:
+                                seen.add(pid)
+                                stored_rows.append(dict(entity_row))
                         title = (
                             str(getattr(entity, "title", "") or "").strip()
                             or " ".join(
@@ -1356,10 +2365,48 @@ class TelegramAdapter:
                                 "type": ctype or "private",
                                 "username": str(getattr(entity, "username", "") or "").strip(),
                                 "photo_small_id": getattr(getattr(entity, "photo", None), "small_file_id", None),
+                                "members_count": entity_row.get("members_count") if entity_row else None,
                             }
                         )
                     except Exception:
                         pass
+            def _score_public_row(item: Dict[str, Any]) -> tuple[int, int]:
+                username = str(item.get("username") or "").strip().casefold()
+                title = str(item.get("title") or "").strip().casefold()
+                username_norm = re.sub(r"[^a-zа-яё0-9]+", "", username)
+                title_norm = re.sub(r"[^a-zа-яё0-9]+", "", title)
+                try:
+                    members_value = int(item.get("members_count") or 0)
+                except Exception:
+                    members_value = 0
+                score = 0
+                if int(item.get("linked_rank") or 0) > 0:
+                    score += 1000
+                if ref.is_username and ref.username:
+                    if username == ref.username.casefold():
+                        score += 120
+                    if query_norm and username_norm == query_norm:
+                        score += 240
+                        if "_" in username:
+                            score += 220
+                    elif query_norm and username_norm.startswith(query_norm):
+                        score += 120
+                    elif query_norm and query_norm in username_norm:
+                        score += 70
+                    if query_norm and query_norm in title_norm:
+                        score += 40
+                if str(item.get("type") or "").strip().lower() == "channel":
+                    score += 25
+                if members_value > 0:
+                    score += min(500, members_value // 250)
+                return score, members_value
+
+            out.sort(key=_score_public_row, reverse=True)
+            if stored_rows:
+                try:
+                    self._storage.upsert_peers(stored_rows) if self._storage else None
+                except Exception:
+                    log.exception("[TG] Failed to persist public peer search rows")
             return out[:limit_int]
 
         try:
@@ -1456,102 +2503,115 @@ class TelegramAdapter:
             return None
 
         async def _run() -> Optional[Dict[str, Any]]:
-            chat = await self._client.get_chat(int(chat_id))
-            if not chat:
-                return None
-            try:
-                cid = int(getattr(chat, "id"))
-            except Exception:
-                return None
-            ctype = getattr(chat, "type", None)
-            if hasattr(ctype, "name"):
-                ctype = (ctype.name or "").lower()
-            else:
-                ctype = str(ctype or "").lower()
-            username = str(getattr(chat, "username", "") or "").strip()
-            title = (
-                str(getattr(chat, "title", None) or "").strip()
-                or " ".join(
-                    [
-                        str(getattr(chat, "first_name", "") or "").strip(),
-                        str(getattr(chat, "last_name", "") or "").strip(),
-                    ]
+            for target in self._history_target_variants(chat_id, include_username_fallback=True):
+                try:
+                    chat = await self._client.get_chat(target)
+                except Exception as exc:
+                    if self._is_peer_id_invalid(exc) or self._is_chat_access_denied(exc):
+                        continue
+                    raise
+                if not chat:
+                    continue
+                try:
+                    cid = int(getattr(chat, "id"))
+                except Exception:
+                    continue
+                ctype = getattr(chat, "type", None)
+                if hasattr(ctype, "name"):
+                    ctype = (ctype.name or "").lower()
+                else:
+                    ctype = str(ctype or "").lower()
+                username = str(getattr(chat, "username", "") or "").strip()
+                title = (
+                    str(getattr(chat, "title", None) or "").strip()
+                    or " ".join(
+                        [
+                            str(getattr(chat, "first_name", "") or "").strip(),
+                            str(getattr(chat, "last_name", "") or "").strip(),
+                        ]
+                    ).strip()
+                    or username
+                    or str(cid)
+                )
+                about = str(
+                    getattr(chat, "bio", None)
+                    or getattr(chat, "description", None)
+                    or getattr(chat, "about", None)
+                    or ""
                 ).strip()
-                or username
-                or str(cid)
-            )
-            about = str(
-                getattr(chat, "bio", None)
-                or getattr(chat, "description", None)
-                or getattr(chat, "about", None)
-                or ""
-            ).strip()
-            is_verified = bool(getattr(chat, "is_verified", False))
-            is_scam = bool(getattr(chat, "is_scam", False))
-            is_fake = bool(getattr(chat, "is_fake", False))
-            is_restricted = bool(getattr(chat, "is_restricted", False))
-            is_premium = bool(getattr(chat, "is_premium", False))
-            is_creator = bool(getattr(chat, "is_creator", False))
-            phone_value = str(getattr(chat, "phone_number", None) or getattr(chat, "phone", None) or "")
+                is_verified = bool(getattr(chat, "is_verified", False))
+                is_scam = bool(getattr(chat, "is_scam", False))
+                is_fake = bool(getattr(chat, "is_fake", False))
+                is_restricted = bool(getattr(chat, "is_restricted", False))
+                is_premium = bool(getattr(chat, "is_premium", False))
+                is_creator = bool(getattr(chat, "is_creator", False))
+                phone_value = str(getattr(chat, "phone_number", None) or getattr(chat, "phone", None) or "")
 
-            # For private chats/bots get explicit user flags (verified/premium/type).
-            if ctype in {"private", "user", "bot"}:
-                try:
-                    user = await self._client.get_users(int(cid))
-                except Exception:
-                    user = None
-                if user:
-                    first = str(getattr(user, "first_name", "") or "").strip()
-                    last = str(getattr(user, "last_name", "") or "").strip()
-                    user_username = str(getattr(user, "username", "") or "").strip()
-                    user_title = (f"{first} {last}".strip() or user_username or title).strip()
-                    if user_title:
-                        title = user_title
-                    if user_username:
-                        username = user_username
-                    phone_value = str(getattr(user, "phone_number", None) or getattr(user, "phone", None) or phone_value or "")
-                    is_verified = bool(getattr(user, "is_verified", is_verified))
-                    is_scam = bool(getattr(user, "is_scam", is_scam))
-                    is_fake = bool(getattr(user, "is_fake", is_fake))
-                    is_restricted = bool(getattr(user, "is_restricted", is_restricted))
-                    is_premium = bool(getattr(user, "is_premium", is_premium))
-                    is_creator = bool(getattr(user, "is_self", False) or is_creator)
-                    ctype = "bot" if bool(getattr(user, "is_bot", False)) else "private"
+                # For private chats/bots get explicit user flags (verified/premium/type).
+                if ctype in {"private", "user", "bot"}:
+                    try:
+                        user = await self._client.get_users(int(cid))
+                    except Exception:
+                        user = None
+                    if user:
+                        first = str(getattr(user, "first_name", "") or "").strip()
+                        last = str(getattr(user, "last_name", "") or "").strip()
+                        user_username = str(getattr(user, "username", "") or "").strip()
+                        user_title = (f"{first} {last}".strip() or user_username or title).strip()
+                        if user_title:
+                            title = user_title
+                        if user_username:
+                            username = user_username
+                        phone_value = str(getattr(user, "phone_number", None) or getattr(user, "phone", None) or phone_value or "")
+                        is_verified = bool(getattr(user, "is_verified", is_verified))
+                        is_scam = bool(getattr(user, "is_scam", is_scam))
+                        is_fake = bool(getattr(user, "is_fake", is_fake))
+                        is_restricted = bool(getattr(user, "is_restricted", is_restricted))
+                        is_premium = bool(getattr(user, "is_premium", is_premium))
+                        is_creator = bool(getattr(user, "is_self", False) or is_creator)
+                        ctype = "bot" if bool(getattr(user, "is_bot", False)) else "private"
 
-            members = getattr(chat, "members_count", None)
-            try:
-                members_count = int(members) if members is not None else None
-            except Exception:
-                members_count = None
-            photo = getattr(chat, "photo", None)
-            photo_small = getattr(photo, "small_file_id", None) if photo else None
-            photo_big = getattr(photo, "big_file_id", None) if photo else None
-            available_reactions: List[str] = []
-            for item in list(getattr(chat, "available_reactions", None) or []):
+                members = getattr(chat, "members_count", None)
                 try:
-                    emoji = str(getattr(item, "emoji", None) or "").strip()
+                    members_count = int(members) if members is not None else None
                 except Exception:
-                    emoji = ""
-                if emoji:
-                    available_reactions.append(emoji)
-            return {
-                "id": str(cid),
-                "title": title,
-                "type": ctype or "chat",
-                "username": username,
-                "about": about,
-                "members_count": members_count,
-                "phone": phone_value,
-                "is_verified": is_verified,
-                "is_scam": is_scam,
-                "is_fake": is_fake,
-                "is_restricted": is_restricted,
-                "is_premium": is_premium,
-                "is_creator": is_creator,
-                "photo_small_id": photo_small,
-                "photo_big_id": photo_big,
-                "available_reactions": available_reactions,
-            }
+                    members_count = None
+                photo = getattr(chat, "photo", None)
+                photo_small = getattr(photo, "small_file_id", None) if photo else None
+                photo_big = getattr(photo, "big_file_id", None) if photo else None
+                available_reactions = self._extract_available_reactions(getattr(chat, "available_reactions", None))
+                linked_chat = getattr(chat, "linked_chat", None)
+                linked_chat_row = self._peer_row_from_entity(linked_chat) if linked_chat is not None else None
+                if linked_chat_row:
+                    self._persist_peer_row(linked_chat_row)
+                send_as_chat = getattr(chat, "send_as_chat", None)
+                send_as_row = self._peer_row_from_entity(send_as_chat) if send_as_chat is not None else None
+                if send_as_row:
+                    self._persist_peer_row(send_as_row)
+                return {
+                    "id": str(cid),
+                    "title": title,
+                    "type": ctype or "chat",
+                    "username": username,
+                    "about": about,
+                    "members_count": members_count,
+                    "phone": phone_value,
+                    "is_verified": is_verified,
+                    "is_scam": is_scam,
+                    "is_fake": is_fake,
+                    "is_restricted": is_restricted,
+                    "is_premium": is_premium,
+                    "is_creator": is_creator,
+                    "photo_small_id": photo_small,
+                    "photo_big_id": photo_big,
+                    "invite_link": str(getattr(chat, "invite_link", None) or "").strip(),
+                    "linked_chat_id": str((linked_chat_row or {}).get("id") or "").strip(),
+                    "linked_chat": dict(linked_chat_row or {}),
+                    "send_as_chat_id": str((send_as_row or {}).get("id") or "").strip(),
+                    "send_as_chat": dict(send_as_row or {}),
+                    "available_reactions": available_reactions,
+                }
+            return None
 
         try:
             return self._call(_run(), timeout)
@@ -1741,7 +2801,16 @@ class TelegramAdapter:
     # -------------------- AUTH: phone + code (+2FA) --------------------
     def send_login_code_sync(self, phone: str, timeout: float = 20.0) -> str:
         phone_number = self._normalize_phone_number(phone)
+        had_auth_invalid = bool(self._auth_invalid)
+        had_auth_challenge = bool(self._auth_challenge_pending)
         self._current_phone_hash = None
+        self._current_login_delivery_hint = ""
+        self._current_password_hint = ""
+        self._auth_challenge_pending = False
+        if had_auth_invalid or had_auth_challenge:
+            self._prepare_current_session_for_manual_login(self._session_name)
+        if not self._wait_for_client_connection(timeout=min(15.0, max(3.0, float(timeout)))):
+            raise RuntimeError("Telegram-клиент ещё не готов к авторизации. Попробуйте ещё раз.")
 
         async def _send():
             sent = await self._client.send_code(phone_number)
@@ -1749,9 +2818,17 @@ class TelegramAdapter:
             if not phone_hash:
                 raise RuntimeError("Telegram не вернул phone_code_hash для входа.")
             self._current_phone_hash = phone_hash
+            self._current_login_delivery_hint = self._describe_sent_code_delivery(getattr(sent, "type", None))
             return phone_hash
 
-        result = self._call(_send(), timeout)
+        try:
+            result = self._call_with_options(_send(), timeout, allow_auth_exceptions=True)
+        except Exception as exc:
+            if isinstance(exc, UserVisibleAuthError):
+                raise
+            if self._is_expected_auth_flow_error(exc):
+                raise UserVisibleAuthError(str(exc)) from None
+            raise
         phone_hash = str(result or "").strip()
         if not phone_hash:
             raise RuntimeError("Не удалось запросить код подтверждения у Telegram.")
@@ -1762,6 +2839,10 @@ class TelegramAdapter:
     ) -> bool:
         phone_number = self._normalize_phone_number(phone)
         login_code = self._normalize_phone_code(code)
+        self._current_password_hint = ""
+        self._auth_challenge_pending = False
+        if not self._wait_for_client_connection(timeout=min(15.0, max(3.0, float(timeout)))):
+            raise RuntimeError("Telegram-клиент ещё не готов завершить авторизацию. Попробуйте ещё раз.")
 
         async def _signin():
             if not self._current_phone_hash:
@@ -1773,19 +2854,38 @@ class TelegramAdapter:
                     phone_code=login_code,
                 )
             except SessionPasswordNeeded:
+                self._auth_challenge_pending = True
+                try:
+                    self._current_password_hint = str(await self._client.get_password_hint() or "").strip()
+                except Exception:
+                    self._current_password_hint = ""
                 if not password:
-                    raise
+                    message = "Telegram запросил пароль облачной 2FA для этого аккаунта."
+                    if self._current_password_hint:
+                        message += f" Подсказка Telegram: {self._current_password_hint}"
+                    raise UserVisibleAuthError(message) from None
                 await self._client.check_password(password=password)
             await self._initialize_updates()
             return True
-        ok = bool(self._call(_signin(), timeout))
+        try:
+            ok = bool(self._call_with_options(_signin(), timeout, allow_auth_exceptions=True))
+        except Exception as exc:
+            if isinstance(exc, UserVisibleAuthError):
+                raise
+            if self._is_expected_auth_flow_error(exc):
+                raise UserVisibleAuthError(str(exc)) from None
+            raise
         if ok:
             self._auth_invalid = False
+            self._auth_challenge_pending = False
             self._finalize_authenticated_session()
         return ok
 
     def reset_phone_login_state(self) -> None:
         self._current_phone_hash = None
+        self._current_login_delivery_hint = ""
+        self._current_password_hint = ""
+        self._auth_challenge_pending = False
 
     @staticmethod
     def _normalize_phone_number(phone: str) -> str:
@@ -2056,9 +3156,38 @@ class TelegramAdapter:
             ctype = (ctype.name or "").lower()
         else:
             ctype = str(ctype or "").lower()
+        if ctype.startswith("chattype."):
+            ctype = ctype.split(".", 1)[1].strip()
+        class_name = str(getattr(getattr(chat, "__class__", None), "__name__", "") or "").lower()
+        if class_name == "channel":
+            if bool(getattr(chat, "broadcast", False)):
+                ctype = "channel"
+            else:
+                ctype = "supergroup"
+            if cid > 0 and pyrogram_utils is not None:
+                try:
+                    cid = int(pyrogram_utils.get_channel_id(cid))
+                except Exception:
+                    pass
+        elif class_name == "channelforbidden":
+            ctype = "channel"
+            if cid > 0 and pyrogram_utils is not None:
+                try:
+                    cid = int(pyrogram_utils.get_channel_id(cid))
+                except Exception:
+                    pass
+        elif class_name in {"chat", "chatforbidden"} and ctype not in {"channel", "supergroup", "megagroup", "private", "bot"}:
+            ctype = "group"
+            if cid > 0:
+                cid = -cid
         photo = getattr(chat, "photo", None)
         photo_small = getattr(photo, "small_file_id", None) if photo else None
         photo_big = getattr(photo, "big_file_id", None) if photo else None
+        members_count = getattr(chat, "members_count", None)
+        try:
+            members_count = int(members_count) if members_count is not None else None
+        except Exception:
+            members_count = None
         return {
             "id": cid,
             "type": ctype or "chat",
@@ -2066,6 +3195,7 @@ class TelegramAdapter:
             "title": title,
             "photo_small": photo_small,
             "photo_big": photo_big,
+            "members_count": members_count,
         }
 
     def _user_to_peer_row(self, user) -> Optional[Dict[str, Any]]:
@@ -2748,10 +3878,12 @@ class TelegramAdapter:
     async def _ensure_avatar(
         self, *, file_id: Optional[str], fetcher: Callable[[], Awaitable[Optional[str]]], prefix: str, size: str
     ) -> Optional[str]:
-        if not (self._client and self._avatar_dir):
+        if not (self._client and self._avatar_dir) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
 
         async def _try_download(target_id: str) -> Optional[str]:
+            if self._file_downloads_blocked():
+                return None
             digest = hashlib.sha1(f"{target_id}:{size}".encode("utf-8", "ignore")).hexdigest()
             dest = self._avatar_dir / f"{prefix}_{digest}.jpg"
             if dest.exists():
@@ -2765,6 +3897,8 @@ class TelegramAdapter:
                     return str(Path(result_path))
                 return str(dest)
             except Exception as exc:
+                if self._handle_file_download_exception(exc, context=f"avatar:{prefix}"):
+                    return None
                 log.debug("[TG] avatar download failed (%s): %s", prefix, exc)
                 if dest.exists():
                     with contextlib.suppress(Exception):
@@ -2782,7 +3916,9 @@ class TelegramAdapter:
 
         try:
             fresh_id = await fetcher()
-        except Exception:
+        except Exception as exc:
+            if self._handle_authorized_call_exception(exc):
+                return None
             fresh_id = None
         fresh_norm = str(fresh_id or "").strip()
         if not fresh_norm or fresh_norm == target_id:
@@ -2832,10 +3968,31 @@ class TelegramAdapter:
         prefix = f"user_{user_id}"
         return await self._ensure_avatar(file_id=file_id, fetcher=_fetch, prefix=prefix, size=size)
 
+    def _cached_avatar_path(self, *, prefix: str, file_id: Optional[str], size: str) -> Optional[str]:
+        if not self._avatar_dir:
+            return None
+        target_id = str(file_id or "").strip()
+        if target_id:
+            digest = hashlib.sha1(f"{target_id}:{size}".encode("utf-8", "ignore")).hexdigest()
+            candidate = self._avatar_dir / f"{prefix}_{digest}.jpg"
+            if candidate.exists():
+                return str(candidate)
+        try:
+            matches = sorted(
+                self._avatar_dir.glob(f"{prefix}_*.jpg"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            matches = []
+        if matches:
+            return str(matches[0])
+        return None
+
     def ensure_chat_avatar_sync(
         self, chat_id: str, *, file_id: Optional[str] = None, size: str = "small"
     ) -> Optional[str]:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
 
         async def _run() -> Optional[str]:
@@ -2846,10 +4003,15 @@ class TelegramAdapter:
         except Exception:
             return None
 
+    def get_cached_chat_avatar_sync(
+        self, chat_id: str, *, file_id: Optional[str] = None, size: str = "small"
+    ) -> Optional[str]:
+        return self._cached_avatar_path(prefix=f"chat_{chat_id}", file_id=file_id, size=size)
+
     def ensure_user_avatar_sync(
         self, user_id: str, *, file_id: Optional[str] = None, size: str = "small"
     ) -> Optional[str]:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
 
         async def _run() -> Optional[str]:
@@ -2860,17 +4022,39 @@ class TelegramAdapter:
         except Exception:
             return None
 
+    def get_cached_user_avatar_sync(
+        self, user_id: str, *, file_id: Optional[str] = None, size: str = "small"
+    ) -> Optional[str]:
+        return self._cached_avatar_path(prefix=f"user_{user_id}", file_id=file_id, size=size)
+
     def list_all_chats_sync(self, limit: Optional[int] = 400, timeout: float = 20.0) -> List[Dict[str, Any]]:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked():
             return []
 
         async def _collect():
             out: List[Dict[str, Any]] = []
+            completed = False
             try:
                 async for info in self._iter_dialogs(limit):
                     out.append(info)
-            except Exception:
-                pass
+                completed = True
+            except Exception as exc:
+                self._handle_authorized_call_exception(exc)
+            if (
+                completed
+                and self._storage is not None
+                and (limit is None or len(out) < int(limit))
+            ):
+                try:
+                    self._storage.prune_dialogs_to_snapshot(
+                        [
+                            int(str(row.get("id") or "").strip())
+                            for row in out
+                            if str(row.get("id") or "").strip().lstrip("-").isdigit()
+                        ]
+                    )
+                except Exception:
+                    log.exception("[TG] Failed to prune dialogs snapshot after list_all_chats_sync")
             return out
 
         try:
@@ -2882,7 +4066,7 @@ class TelegramAdapter:
         self, on_batch: Callable[[List[Dict[str, Any]]], None], on_done: Optional[Callable[[], None]] = None,
         limit: Optional[int] = 400, batch_size: int = 50
     ) -> None:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked():
             if on_done:
                 try:
                     on_done()
@@ -2892,22 +4076,40 @@ class TelegramAdapter:
 
         async def _stream():
             batch: List[Dict[str, Any]] = []
+            seen_ids: List[int] = []
+            completed = False
             try:
                 async for info in self._iter_dialogs(limit):
                     batch.append(info)
+                    cid = str(info.get("id") or "").strip()
+                    if cid.lstrip("-").isdigit():
+                        try:
+                            seen_ids.append(int(cid))
+                        except Exception:
+                            pass
                     if len(batch) >= batch_size:
                         try:
                             on_batch(list(batch))
                         finally:
                             batch.clear()
-            except Exception:
-                pass
+                completed = True
+            except Exception as exc:
+                self._handle_authorized_call_exception(exc)
             finally:
                 if batch:
                     try:
                         on_batch(list(batch))
                     except Exception:
                         pass
+                if (
+                    completed
+                    and self._storage is not None
+                    and (limit is None or len(seen_ids) < int(limit))
+                ):
+                    try:
+                        self._storage.prune_dialogs_to_snapshot(seen_ids)
+                    except Exception:
+                        log.exception("[TG] Failed to prune dialogs snapshot after stream_dialogs")
                 if on_done:
                     try:
                         on_done()
@@ -3194,6 +4396,19 @@ class TelegramAdapter:
                 return False
 
         return bool(self._call(_mark(), timeout))
+
+    def pin_message_sync(self, chat_id: str, message_id: int, timeout: float = 15.0) -> bool:
+        if not (self._enabled and self._client and self._loop):
+            return False
+
+        async def _pin():
+            try:
+                await self._client.pin_message(int(chat_id), int(message_id))
+                return True
+            except Exception:
+                return False
+
+        return bool(self._call(_pin(), timeout))
 
     def _send_media_sync(
             self,
@@ -3889,7 +5104,7 @@ class TelegramAdapter:
 
     def download_file_id_sync(self, file_id: str, *, file_name: str, timeout: float = 20.0) -> Optional[str]:
         """Скачать медиа по file_id (используется для превью стикеров)."""
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
         file_id = str(file_id or "").strip()
         if not file_id:
@@ -3905,7 +5120,9 @@ class TelegramAdapter:
                 if path:
                     return str(path)
                 return str(target) if os.path.isfile(target) else None
-            except Exception:
+            except Exception as exc:
+                if self._handle_file_download_exception(exc, context="file-id-download"):
+                    return None
                 return None
 
         try:
@@ -4002,66 +5219,73 @@ class TelegramAdapter:
     ) -> List[Dict[str, Any]]:
         if not (self._enabled and self._client and self._loop):
             return []
-        if self._auth_invalid or not self._connected:
+        if self._authorized_requests_blocked():
             return []
 
         media_root = pathlib.Path(self._media_root) / str(chat_id)
         media_root.mkdir(parents=True, exist_ok=True)
 
         async def _hist():
-            out: List[Dict[str, Any]] = []
-            async for m in self._client.get_chat_history(int(chat_id), limit=limit):
-                media_type, _media_id, file_size, _mime, duration, waveform = self._extract_media_meta(m)
-                reactions = self._extract_reactions(m)
-                poll = self._extract_poll(m)
-                views, forwards = self._extract_message_counters(m)
-                reply_markup = self._reply_markup_to_dict(getattr(m, "reply_markup", None))
-                item = {
-                    "id": m.id,
-                    "date": int(m.date.timestamp()) if m.date else None,
-                    "sender_id": str(m.from_user.id) if m.from_user else "",
-                    "sender": (m.from_user.username if (m.from_user and m.from_user.username) else
-                               (m.from_user.first_name if m.from_user else "")),
-                    "type": media_type or "text",
-                    "text": (m.text or m.caption or "") or "",
-                    "entities": self._entities_to_dicts(
-                        getattr(m, "entities", None) if (media_type or "text") == "text" else getattr(m, "caption_entities", None)
-                    ),
-                    "file_path": None,
-                    "thumb_path": None,
-                    "file_size": int(file_size or 0),
-                    "reply_to": self._extract_reply_to_id(m),
-                    "forward_info": self._extract_forward_info(m),
-                    "file_name": self._extract_file_name(m),
-                    "is_deleted": False,
-                    "reply_markup": reply_markup,
-                    "duration": int(duration) if duration else None,
-                    "waveform": waveform,
-                    "reactions": reactions,
-                    "poll": poll,
-                    "views": views,
-                    "forwards": forwards,
-                    "media_group_id": self._extract_media_group_id(m),
-                }
+            for target in self._history_target_variants(chat_id):
+                out: List[Dict[str, Any]] = []
+                try:
+                    async for m in self._client.get_chat_history(target, limit=limit):
+                        media_type, _media_id, file_size, _mime, duration, waveform = self._extract_media_meta(m)
+                        reactions = self._extract_reactions(m)
+                        poll = self._extract_poll(m)
+                        views, forwards = self._extract_message_counters(m)
+                        reply_markup = self._reply_markup_to_dict(getattr(m, "reply_markup", None))
+                        item = {
+                            "id": m.id,
+                            "date": int(m.date.timestamp()) if m.date else None,
+                            "sender_id": str(m.from_user.id) if m.from_user else "",
+                            "sender": (m.from_user.username if (m.from_user and m.from_user.username) else
+                                       (m.from_user.first_name if m.from_user else "")),
+                            "type": media_type or "text",
+                            "text": (m.text or m.caption or "") or "",
+                            "entities": self._entities_to_dicts(
+                                getattr(m, "entities", None) if (media_type or "text") == "text" else getattr(m, "caption_entities", None)
+                            ),
+                            "file_path": None,
+                            "thumb_path": None,
+                            "file_size": int(file_size or 0),
+                            "reply_to": self._extract_reply_to_id(m),
+                            "forward_info": self._extract_forward_info(m),
+                            "file_name": self._extract_file_name(m),
+                            "is_deleted": False,
+                            "reply_markup": reply_markup,
+                            "duration": int(duration) if duration else None,
+                            "waveform": waveform,
+                            "reactions": reactions,
+                            "poll": poll,
+                            "views": views,
+                            "forwards": forwards,
+                            "media_group_id": self._extract_media_group_id(m),
+                        }
 
-                if item["type"] != "text":
-                    cached = self._find_cached_media_file(media_root, m.id)
-                    if cached:
-                        item["file_path"] = cached
-                    if not item["file_size"]:
-                        size = self._estimate_media_size(m)
-                        if size:
-                            item["file_size"] = int(size)
+                        if item["type"] != "text":
+                            cached = self._find_cached_media_file(media_root, m.id)
+                            if cached:
+                                item["file_path"] = cached
+                            if not item["file_size"]:
+                                size = self._estimate_media_size(m)
+                                if size:
+                                    item["file_size"] = int(size)
 
-                if download_media and item["type"] != "text" and not item["file_path"]:
-                    try:
-                        fp = await m.download(file_name=str(media_root / f"{m.id}"))
-                        item["file_path"] = fp
-                    except Exception:
-                        pass
-                self._store_message_record(m, file_path=item.get("file_path"))
-                out.append(item)
-            return out
+                        if download_media and item["type"] != "text" and not item["file_path"]:
+                            try:
+                                fp = await m.download(file_name=str(media_root / f"{m.id}"))
+                                item["file_path"] = fp
+                            except Exception:
+                                pass
+                        self._store_message_record(m, file_path=item.get("file_path"))
+                        out.append(item)
+                    return out
+                except Exception as exc:
+                    if self._is_peer_id_invalid(exc) or self._is_chat_access_denied(exc):
+                        continue
+                    raise
+            return []
 
         try:
             result = self._call(_hist(), timeout)
@@ -4077,8 +5301,9 @@ class TelegramAdapter:
             )
             return []
         except Exception as exc:
-            if self._is_auth_issue(exc):
-                self._notify_auth_issue(exc)
+            if self._is_peer_id_invalid(exc) or self._is_chat_access_denied(exc):
+                return []
+            if self._handle_authorized_call_exception(exc):
                 return []
             if "closed database" in str(exc).lower():
                 return []
@@ -4091,10 +5316,11 @@ class TelegramAdapter:
         limit: int = 0,
         chunk_size: int = 200,
         timeout: float = 600.0,
+        incremental: bool = True,
     ) -> int:
         if not (self._enabled and self._client and self._loop and self._storage):
             return 0
-        if self._auth_invalid or not self._connected:
+        if self._authorized_requests_blocked():
             return 0
 
         media_root = pathlib.Path(self._media_root) / str(chat_id)
@@ -4102,59 +5328,80 @@ class TelegramAdapter:
 
         async def _scan() -> int:
             peer_id = int(chat_id)
-            total = 0
-            newest_id: Optional[int] = None
-            newest_date: Optional[int] = None
-            message_batch: List[Dict[str, Any]] = []
-            peer_rows: Dict[int, Dict[str, Any]] = {}
-
-            def _flush() -> None:
-                if peer_rows:
-                    self._storage.upsert_peers(list(peer_rows.values()))
-                    peer_rows.clear()
-                if message_batch:
-                    self._storage.upsert_messages(peer_id, list(message_batch))
-                    message_batch.clear()
-
-            async for m in self._client.get_chat_history(int(chat_id), limit=int(limit or 0)):
-                if newest_id is None:
+            latest_known_id = 0
+            if incremental and self._storage is not None:
+                getter = getattr(self._storage, "get_chat_latest_message_id", None)
+                if callable(getter):
                     try:
-                        newest_id = int(getattr(m, "id"))
+                        latest_known_id = int(getter(peer_id) or 0)
                     except Exception:
-                        newest_id = None
-                    try:
-                        newest_date = int(m.date.timestamp()) if getattr(m, "date", None) else None
-                    except Exception:
-                        newest_date = None
+                        latest_known_id = 0
+            for target in self._history_target_variants(chat_id):
+                total = 0
+                newest_id: Optional[int] = None
+                newest_date: Optional[int] = None
+                message_batch: List[Dict[str, Any]] = []
+                peer_rows: Dict[int, Dict[str, Any]] = {}
+                reached_known_history = False
+
+                def _flush() -> None:
+                    if peer_rows:
+                        self._storage.upsert_peers(list(peer_rows.values()))
+                        peer_rows.clear()
+                    if message_batch:
+                        self._storage.upsert_messages(peer_id, list(message_batch))
+                        message_batch.clear()
 
                 try:
-                    chat_row = self._chat_to_peer_row(getattr(m, "chat", None))
-                    if chat_row and chat_row.get("id") is not None:
-                        peer_rows[int(chat_row["id"])] = chat_row
-                except Exception:
-                    pass
-                for candidate in (
-                    self._user_to_peer_row(getattr(m, "from_user", None)),
-                    self._chat_to_peer_row(getattr(m, "sender_chat", None)),
-                ):
-                    try:
-                        if candidate and candidate.get("id") is not None:
-                            peer_rows[int(candidate["id"])] = candidate
-                    except Exception:
+                    async for m in self._client.get_chat_history(target, limit=int(limit or 0)):
+                        try:
+                            mid = int(getattr(m, "id") or 0)
+                        except Exception:
+                            mid = 0
+                        if latest_known_id > 0 and mid > 0 and mid <= latest_known_id:
+                            reached_known_history = True
+                            break
+                        if newest_id is None:
+                            newest_id = mid if mid > 0 else None
+                            try:
+                                newest_date = int(m.date.timestamp()) if getattr(m, "date", None) else None
+                            except Exception:
+                                newest_date = None
+
+                        try:
+                            chat_row = self._chat_to_peer_row(getattr(m, "chat", None))
+                            if chat_row and chat_row.get("id") is not None:
+                                peer_rows[int(chat_row["id"])] = chat_row
+                        except Exception:
+                            pass
+                        for candidate in (
+                            self._user_to_peer_row(getattr(m, "from_user", None)),
+                            self._chat_to_peer_row(getattr(m, "sender_chat", None)),
+                        ):
+                            try:
+                                if candidate and candidate.get("id") is not None:
+                                    peer_rows[int(candidate["id"])] = candidate
+                            except Exception:
+                                continue
+
+                        cached_path = self._find_cached_media_file(media_root, getattr(m, "id", 0))
+                        record = self._message_to_storage_dict(peer_id, m, file_path=cached_path)
+                        if record:
+                            message_batch.append(record)
+                            total += 1
+                        if len(message_batch) >= max(20, int(chunk_size or 200)):
+                            _flush()
+                except Exception as exc:
+                    if self._is_peer_id_invalid(exc) or self._is_chat_access_denied(exc):
                         continue
+                    raise
 
-                cached_path = self._find_cached_media_file(media_root, getattr(m, "id", 0))
-                record = self._message_to_storage_dict(peer_id, m, file_path=cached_path)
-                if record:
-                    message_batch.append(record)
-                    total += 1
-                if len(message_batch) >= max(20, int(chunk_size or 200)):
-                    _flush()
-
-            _flush()
-            if newest_id is not None or newest_date is not None:
-                self._storage.update_dialog_last_ts(peer_id, newest_date, top_message_id=newest_id)
-            return total
+                _flush()
+                if newest_id is not None or newest_date is not None:
+                    self._storage.update_dialog_last_ts(peer_id, newest_date, top_message_id=newest_id)
+                if total > 0 or reached_known_history or latest_known_id <= 0:
+                    return total
+            return 0
 
         try:
             result = self._call(_scan(), timeout)
@@ -4170,15 +5417,16 @@ class TelegramAdapter:
             )
             return 0
         except Exception as exc:
-            if self._is_auth_issue(exc):
-                self._notify_auth_issue(exc)
+            if self._is_chat_access_denied(exc):
+                return 0
+            if self._handle_authorized_call_exception(exc):
                 return 0
             if "closed database" in str(exc).lower():
                 return 0
             raise
 
     def download_media_sync(self, chat_id: str, message_id: int, timeout: float = 180.0) -> Optional[str]:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
 
         media_root = pathlib.Path(self._media_root) / str(chat_id)
@@ -4202,7 +5450,8 @@ class TelegramAdapter:
                 path = await msg_obj.download(file_name=str(file_name))
                 self._store_message_record(msg_obj, file_path=path)
                 return path
-            except Exception:
+            except Exception as exc:
+                self._handle_file_download_exception(exc, context=f"media:{chat_id}/{message_id}")
                 if msg_obj is not None:
                     self._store_message_record(msg_obj)
                 return None
@@ -4223,6 +5472,9 @@ class TelegramAdapter:
         Возвращает путь к превью или None.
         """
 
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
+            return None
+
         async def _do():
             msg = await self._client.get_messages(int(chat_id), int(message_id))
             media_dir = Path(self._media_root) / str(chat_id)
@@ -4235,7 +5487,9 @@ class TelegramAdapter:
                     return str(out)
                 try:
                     path = await self._client.download_media(photo, file_name=str(out))
-                except Exception:
+                except Exception as exc:
+                    if self._handle_file_download_exception(exc, context=f"thumb:{chat_id}/{message_id}"):
+                        return None
                     path = await msg.download(file_name=str(out))
                 return path
 
@@ -4264,10 +5518,20 @@ class TelegramAdapter:
             out = media_dir / f"{message_id}_thumb"
             if out.exists():
                 return str(out)
-            path = await self._client.download_media(target, file_name=str(out))
+            try:
+                path = await self._client.download_media(target, file_name=str(out))
+            except Exception as exc:
+                if self._handle_file_download_exception(exc, context=f"thumb:{chat_id}/{message_id}"):
+                    return None
+                raise
             return path
 
-        return self._call(_do(), timeout)
+        try:
+            return self._call(_do(), timeout)
+        except Exception as exc:
+            if self._handle_file_download_exception(exc, context=f"thumb:{chat_id}/{message_id}"):
+                return None
+            raise
 
     def start_media_download(
         self,
@@ -4276,7 +5540,7 @@ class TelegramAdapter:
         message_id: int,
         progress_cb: Callable[[str, Dict[str, Any]], None],
     ) -> Optional[str]:
-        if not (self._enabled and self._client and self._loop):
+        if not (self._enabled and self._client and self._loop) or self._authorized_requests_blocked() or self._file_downloads_blocked():
             return None
 
         media_root = pathlib.Path(self._media_root) / str(chat_id)
@@ -4469,6 +5733,7 @@ class TelegramAdapter:
                     target_path.unlink()
             return
         except Exception as exc:
+            self._handle_file_download_exception(exc, context=f"media-job:{job.chat_id}/{job.message_id}")
             job.state = "error"
             await self._emit_download_event(job, "error", error=str(exc))
             log.exception("[TG] download job failed (%s/%s): %s", job.chat_id, job.message_id, exc)

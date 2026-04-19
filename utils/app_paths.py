@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -143,6 +144,22 @@ def db_dir() -> Path:
     return ensure_dir(db_path().parent)
 
 
+def _sanitize_session_component(session_name: Optional[str]) -> str:
+    raw = str(session_name or "").strip()
+    if not raw:
+        return "default"
+    cleaned = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in {"_", "-"})) else "_" for ch in raw).strip("._-")
+    if cleaned:
+        return cleaned
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"session_{digest}"
+
+
+def session_db_path(session_name: Optional[str]) -> Path:
+    safe_name = _sanitize_session_component(session_name)
+    return ensure_dir(get_data_dir() / "data" / "accounts" / safe_name) / "drago.db"
+
+
 def media_dir() -> Path:
     return ensure_dir(get_data_dir() / "media")
 
@@ -157,6 +174,14 @@ def avatars_dir() -> Path:
 
 def chats_dir() -> Path:
     return ensure_dir(get_data_dir() / "chats")
+
+
+def exports_dir() -> Path:
+    return ensure_dir(get_data_dir() / "exports")
+
+
+def scans_dir() -> Path:
+    return ensure_dir(get_data_dir() / "scans")
 
 
 def telegram_workdir() -> Path:

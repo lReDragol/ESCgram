@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from bisect import bisect_left
 import ctypes
+from datetime import datetime
 import json
 import mimetypes
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -19,10 +21,10 @@ from typing import Any, Dict, List, Optional, Iterable
 from utils import app_paths
 
 from PySide6.QtCore import (
-    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl,
-    QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property
+    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl, QSize,
+    QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property, QStandardPaths
 )
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter, QLinearGradient
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -34,8 +36,10 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -59,6 +63,7 @@ from utils.zwc import (
 )
 from utils.text_markup import parse_tg_style_markup
 from ui.account_manager import AccountManagerDialog
+from ui.ayugram_assets import load_ayugram_icon
 from ui.auth_dialog import AuthDialog
 from ui.avatar_cache import AvatarCache
 from ui.chat_sidebar import ChatSidebarMixin
@@ -70,6 +75,7 @@ from ui.dialog_workers import (
     BulkAvatarRefreshWorker,
     BulkChatStatisticsWorker,
     ChatProfileLoadWorker,
+    CommunityScanWorker,
     DialogsStreamWorker,
     FfmpegInstallWorker,
     GlobalPeerSearchWorker,
@@ -83,7 +89,9 @@ from ui.account_workers import AccountProfileWorker
 from ui.event_pump import EventPump
 from utils.app_meta import get_app_version, get_update_repo, resolve_app_icon_path
 from utils.logging_setup import configure_logging, current_log_dir, current_log_files
+from utils.telegram_links import parse_telegram_reference
 from ui.message_feed import MessageFeedMixin
+import ui.media_render as media_render_module
 import ui.message_widgets as message_widgets_module
 from ui.message_widgets import (
     DEFAULT_BUBBLE_THEME,
@@ -106,6 +114,7 @@ from ui.chat_panels import (
 from ui.send_media_inline_preview import InlineMediaPreviewBar
 from ui.send_media_workers import FfmpegConvertWorker, MediaBatchSendWorker, MediaSendWorker
 from ui.styles import StyleManager, apply_theme
+from ui.qt_threading import invoke_in_gui_thread
 from ui.components.avatar import AvatarWidget
 
 try:
@@ -162,6 +171,30 @@ class ChatInputTextEdit(QTextEdit):
             painter.end()
 
 
+class ChatSurface(QWidget):
+    """Painted chat backdrop inspired by Telegram/AyuGram gradients."""
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            gradient = QLinearGradient(0, 0, self.width(), self.height())
+            gradient.setColorAt(0.0, QColor("#12202d"))
+            gradient.setColorAt(0.35, QColor("#142737"))
+            gradient.setColorAt(1.0, QColor("#0f1b27"))
+            painter.fillRect(self.rect(), gradient)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(108, 164, 218, 22))
+            painter.drawEllipse(-60, 40, 280, 280)
+            painter.setBrush(QColor(77, 120, 160, 20))
+            painter.drawEllipse(self.width() - 220, 140, 280, 280)
+            painter.setBrush(QColor(255, 255, 255, 10))
+            painter.drawEllipse(self.width() // 2 - 120, self.height() - 260, 240, 240)
+        finally:
+            painter.end()
+
+
 class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def __init__(self, server, tg_adapter, config: Optional[Dict[str, Any]] = None):
         # базовая инициализация
@@ -211,6 +244,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         width  = int(window_cfg.get("width",  1000) or 1000)
         height = int(window_cfg.get("height",  700) or  700)
         self.resize(width, height)
+        self._main_window_width = max(100, width)
+        self._main_window_height = max(100, height)
+        self._auth_window_width = 620
+        self._auth_window_height = 680
 
         # --- анти-мерцание и тёмный фон (убираем белые полосы при анимации) ---
         # используем Qt6-путь с перечислениями WidgetAttribute
@@ -271,6 +308,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._reply_bar: Optional[QFrame] = None
         self._reply_preview_widget: Optional[ReplyPreviewWidget] = None
         self._chat_header: Optional[ChatHeaderBar] = None
+        self._chat_header_menu_popup: Optional[QWidget] = None
         self._chat_header_info_cache: Dict[str, Dict[str, Any]] = {}
         self._media_preview_bar: Optional[InlineMediaPreviewBar] = None
         self._bot_keyboard_bar: Optional[MessageReplyMarkupWidget] = None
@@ -280,6 +318,19 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._pending_account_revert: Optional[str] = None
         self._startup_auth_retries: int = 0
         self._startup_auth_retry_reason: str = ""
+        try:
+            self._rendered_session_name: str = str(self.tg.current_session_name() or "").strip()
+        except Exception:
+            self._rendered_session_name = ""
+        self._mode_stack: Optional[QStackedWidget] = None
+        self._main_shell: Optional[QWidget] = None
+        self._auth_shell: Optional[QWidget] = None
+        self._auth_mount: Optional[QWidget] = None
+        self._auth_mount_layout: Optional[QVBoxLayout] = None
+        self._auth_dialog_widget: Optional[AuthDialog] = None
+        self._auth_page_active: bool = False
+        self._auth_page_reason: str = ""
+        self._account_manager_dialog: Optional[AccountManagerDialog] = None
         self._media_popup: Optional[MediaPickerPopup] = None
         self._settings_window: Optional[SettingsWindow] = None
         self._active_account_user_id: str = ""
@@ -301,7 +352,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._media_busy_last_toast_at: float = 0.0
         self._media_active_tmpdir: Optional[str] = None
         self._local_media_seq: int = 0
-        self._input_min_height = 34
+        self._input_min_height = 48
         self._input_max_height = 260
         self._pending_reply_updates: set[int] = set()
         self._pending_local_deletes: set[int] = set()
@@ -387,6 +438,21 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self.settings_panel.set_streamer_mode_checked(self._streamer_mode_enabled)
             if hasattr(self.settings_panel, "set_show_my_avatar_checked"):
                 self.settings_panel.set_show_my_avatar_checked(self._show_my_avatar_enabled)
+            features = self._config.get("features", {})
+            if hasattr(self.settings_panel, "set_ayu_save_deleted_checked"):
+                self.settings_panel.set_ayu_save_deleted_checked(bool(features.get("ayu_save_deleted", True)))
+            if hasattr(self.settings_panel, "set_ayu_save_edits_checked"):
+                self.settings_panel.set_ayu_save_edits_checked(bool(features.get("ayu_save_edits", True)))
+            if hasattr(self.settings_panel, "set_ayu_media_private_checked"):
+                self.settings_panel.set_ayu_media_private_checked(bool(features.get("ayu_media_private", True)))
+            if hasattr(self.settings_panel, "set_ayu_media_group_checked"):
+                self.settings_panel.set_ayu_media_group_checked(bool(features.get("ayu_media_group", True)))
+            if hasattr(self.settings_panel, "set_ayu_media_channel_checked"):
+                self.settings_panel.set_ayu_media_channel_checked(bool(features.get("ayu_media_channel", True)))
+            if hasattr(self.settings_panel, "set_ayu_send_online_checked"):
+                self.settings_panel.set_ayu_send_online_checked(bool(features.get("ayu_send_online", False)))
+            if hasattr(self.settings_panel, "set_ayu_send_typing_checked"):
+                self.settings_panel.set_ayu_send_typing_checked(bool(features.get("ayu_send_typing", False)))
             if hasattr(self.settings_panel, "update_requested"):
                 try:
                     self.settings_panel.update_requested.connect(self._on_update_button_clicked)
@@ -697,6 +763,27 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if cached:
             self.on_dialogs_batch(cached)
 
+    def _has_cached_telegram_state(self) -> bool:
+        server = getattr(self, "server", None)
+        if server is not None and hasattr(server, "list_cached_dialogs"):
+            try:
+                if server.list_cached_dialogs(limit=1):
+                    return True
+            except Exception:
+                pass
+
+        tg = getattr(self, "tg", None)
+        if tg is not None and hasattr(tg, "get_active_account_meta"):
+            try:
+                meta = tg.get_active_account_meta() or {}
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict):
+                for key in ("title", "phone", "username", "full_name"):
+                    if str(meta.get(key) or "").strip():
+                        return True
+        return False
+
     def _init_voice_controls(self) -> None:
         # Telegram-like behaviour:
         # - hold → record voice
@@ -816,8 +903,108 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _persist_window_config(self) -> None:
         window_cfg = self._config.setdefault("window", {})
-        window_cfg["width"] = int(max(100, self.width()))
-        window_cfg["height"] = int(max(100, self.height()))
+        if self._auth_page_active:
+            width = int(max(100, getattr(self, "_main_window_width", self.width())))
+            height = int(max(100, getattr(self, "_main_window_height", self.height())))
+        else:
+            width = int(max(100, self.width()))
+            height = int(max(100, self.height()))
+        window_cfg["width"] = width
+        window_cfg["height"] = height
+
+    def _destroy_auth_dialog_widget(self) -> None:
+        dlg = getattr(self, "_auth_dialog_widget", None)
+        if dlg is None or not _qt_is_valid(dlg):
+            self._auth_dialog_widget = None
+            return
+        try:
+            dlg.hide()
+        except Exception:
+            pass
+        layout = getattr(self, "_auth_mount_layout", None)
+        if layout is not None:
+            try:
+                layout.removeWidget(dlg)
+            except Exception:
+                pass
+        self._auth_dialog_widget = None
+        try:
+            dlg.deleteLater()
+        except Exception:
+            pass
+
+    def _ensure_auth_dialog_widget(self) -> AuthDialog:
+        dlg = getattr(self, "_auth_dialog_widget", None)
+        if dlg is not None and _qt_is_valid(dlg) and dlg.isVisible():
+            return dlg
+
+        self._destroy_auth_dialog_widget()
+        parent = getattr(self, "_auth_mount", None) or self
+        dlg = AuthDialog(self.tg, parent, embedded=True)
+        dlg.login_success.connect(self._handle_login_success)
+        dlg.rejected.connect(self._handle_auth_rejected)
+        layout = getattr(self, "_auth_mount_layout", None)
+        if layout is not None:
+            layout.addWidget(dlg, 0, Qt.AlignmentFlag.AlignCenter)
+        self._auth_dialog_widget = dlg
+        return dlg
+
+    def _show_main_page(self, *, resize_window: bool = True) -> None:
+        if not self._auth_page_active:
+            stack = getattr(self, "_mode_stack", None)
+            main_shell = getattr(self, "_main_shell", None)
+            if stack is not None and main_shell is not None:
+                stack.setCurrentWidget(main_shell)
+            return
+
+        stack = getattr(self, "_mode_stack", None)
+        main_shell = getattr(self, "_main_shell", None)
+        if stack is not None and main_shell is not None:
+            stack.setCurrentWidget(main_shell)
+        self._auth_page_active = False
+        self._auth_page_reason = ""
+        self._destroy_auth_dialog_widget()
+
+        if resize_window:
+            self.resize(
+                int(max(100, getattr(self, "_main_window_width", self.width()))),
+                int(max(100, getattr(self, "_main_window_height", self.height()))),
+            )
+
+    def _close_account_manager_dialog(self) -> None:
+        dlg = getattr(self, "_account_manager_dialog", None)
+        if dlg is None or not _qt_is_valid(dlg):
+            self._account_manager_dialog = None
+            return
+        try:
+            dlg.reject()
+        except Exception:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+        self._account_manager_dialog = None
+
+    def _show_auth_page(self, prompt_reason: str = "manual") -> None:
+        self._close_account_manager_dialog()
+        stack = getattr(self, "_mode_stack", None)
+        auth_shell = getattr(self, "_auth_shell", None)
+        if stack is None or auth_shell is None:
+            return
+
+        if not self._auth_page_active:
+            self._main_window_width = int(max(100, self.width()))
+            self._main_window_height = int(max(100, self.height()))
+
+        dlg = self._ensure_auth_dialog_widget()
+        stack.setCurrentWidget(auth_shell)
+        self._auth_page_active = True
+        self._auth_page_reason = str(prompt_reason or "manual")
+        dlg.show()
+        self.resize(
+            int(max(520, self._auth_window_width)),
+            int(max(600, self._auth_window_height)),
+        )
 
     # ===== АНИМАЦИЯ РАСКРЫТИЯ ОКНА =====
 
@@ -998,6 +1185,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        self._mode_stack = QStackedWidget(self)
+        root.addWidget(self._mode_stack, 1)
+
+        self._main_shell = QWidget(self)
+        main_layout = QVBoxLayout(self._main_shell)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_sidebar())
 
@@ -1011,7 +1206,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         center_body_layout.setContentsMargins(0, 0, 0, 0)
         center_body_layout.setSpacing(0)
 
-        chat_area = QWidget(center_body)
+        chat_area = ChatSurface(center_body)
+        chat_area.setObjectName("chatSurface")
         chat_area_layout = QVBoxLayout(chat_area)
         chat_area_layout.setContentsMargins(0, 0, 0, 0)
         chat_area_layout.setSpacing(0)
@@ -1039,11 +1235,36 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
         splitter.addWidget(center)
         splitter.setStretchFactor(1, 1)
-        root.addWidget(splitter, 1)
+        main_layout.addWidget(splitter, 1)
+        self._mode_stack.addWidget(self._main_shell)
+
+        self._auth_shell = QWidget(self)
+        auth_layout = QVBoxLayout(self._auth_shell)
+        auth_layout.setContentsMargins(24, 24, 24, 24)
+        auth_layout.setSpacing(0)
+        auth_layout.addStretch(1)
+
+        auth_row = QHBoxLayout()
+        auth_row.setContentsMargins(0, 0, 0, 0)
+        auth_row.setSpacing(0)
+        auth_row.addStretch(1)
+
+        self._auth_mount = QWidget(self._auth_shell)
+        self._auth_mount_layout = QVBoxLayout(self._auth_mount)
+        self._auth_mount_layout.setContentsMargins(0, 0, 0, 0)
+        self._auth_mount_layout.setSpacing(0)
+        auth_row.addWidget(self._auth_mount, 0)
+        auth_row.addStretch(1)
+
+        auth_layout.addLayout(auth_row)
+        auth_layout.addStretch(1)
+        self._mode_stack.addWidget(self._auth_shell)
 
         if self.tg.is_authorized_sync():
+            self._show_main_page(resize_window=False)
             QTimer.singleShot(1000, self.refresh_telegram_chats_async)
         else:
+            self._show_auth_page(prompt_reason="startup")
             QTimer.singleShot(0, lambda: self._ensure_authorized(prompt_reason="startup"))
 
         self._shortcut_find = QShortcut(QKeySequence.Find, self)
@@ -1058,6 +1279,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _build_chat_header(self) -> QWidget:
         header = ChatHeaderBar(self)
         header.infoRequested.connect(self._show_current_chat_info)
+        header.searchRequested.connect(self.show_message_search)
         header.menuRequested.connect(self._show_chat_header_menu)
         self._chat_header = header
         self._refresh_chat_header()
@@ -1180,21 +1402,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         return None
 
     def _schedule_bubble_width_update(self) -> None:
-        timer = getattr(self, "_bubble_width_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._apply_bubble_widths)
-            self._bubble_width_timer = timer
-        try:
-            timer.start(0)
-        except Exception:
-            pass
+        def _start() -> None:
+            timer = getattr(self, "_bubble_width_timer", None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._apply_bubble_widths)
+                self._bubble_width_timer = timer
+            try:
+                timer.start(0)
+            except Exception:
+                pass
+        invoke_in_gui_thread(_start)
 
     def _bubble_max_width(self) -> int:
         viewport = getattr(getattr(self, "chat_scroll", None), "viewport", lambda: None)()
         vw = int(viewport.width()) if viewport is not None else int(self.width())
-        ratio = float(StyleManager.instance().metric("message_widgets.metrics.bubble_max_ratio", 0.54) or 0.54)
+        ratio = float(StyleManager.instance().metric("message_widgets.metrics.bubble_max_ratio", 0.68) or 0.68)
         maxw = int(vw * ratio)
         return max(280, min(920, maxw))
 
@@ -1272,10 +1496,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         host.setFixedWidth(438)
         host.setStyleSheet(
-            "QFrame#chatDetailsHost{background-color:#102033;border-left:1px solid rgba(255,255,255,0.06);}"
-            "QPushButton{background-color:rgba(255,255,255,0.05);color:#dfe7f5;border:none;border-radius:14px;padding:6px 10px;}"
+            "QFrame#chatDetailsHost{background-color:#232326;border-left:1px solid rgba(255,255,255,0.06);}"
+            "QPushButton{background-color:rgba(255,255,255,0.05);color:#f1f1f1;border:none;border-radius:14px;padding:6px 10px;}"
             "QPushButton:hover{background-color:rgba(255,255,255,0.11);}"
-            "QLabel#chatDetailsHeader{color:#f4f7ff;font-size:16px;font-weight:700;}"
+            "QLabel#chatDetailsHeader{color:#ffffff;font-size:16px;font-weight:700;}"
         )
         layout = QVBoxLayout(host)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1286,10 +1510,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 10, 12, 10)
         header_layout.setSpacing(8)
-        btn_back = QPushButton("←", header)
-        btn_back.setFixedWidth(40)
-        btn_back.clicked.connect(self._close_chat_details)
-        header_layout.addWidget(btn_back, 0)
         title = QLabel("Профиль", header)
         title.setObjectName("chatDetailsHeader")
         header_layout.addWidget(title, 1)
@@ -1474,21 +1694,32 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _build_bottom_row(self) -> QHBoxLayout:
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 8, 0, 8)
-        bottom_row.setSpacing(6)
+        bottom_row.setContentsMargins(12, 8, 12, 10)
+        bottom_row.setSpacing(8)
 
-        self.btn_attach = QToolButton()
-        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_attach.setText("📎")
-        self.btn_attach.setToolTip("Отправить файлы")
-        self.btn_attach.clicked.connect(self._pick_files_and_send)
-        bottom_row.addWidget(self.btn_attach)
+        compose_shell = QFrame()
+        compose_shell.setObjectName("chatComposeShell")
+        compose_shell.setMinimumHeight(48)
+        compose_shell.setStyleSheet(
+            "QFrame#chatComposeShell{background-color:#17212b;border:1px solid rgba(255,255,255,0.05);border-radius:24px;}"
+        )
+        compose_layout = QHBoxLayout(compose_shell)
+        compose_layout.setContentsMargins(0, 0, 0, 0)
+        compose_layout.setSpacing(0)
+
+        self.btn_media = QToolButton()
+        self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_media.setToolTip("Эмодзи / стикеры / GIF")
+        self.btn_media.clicked.connect(self._toggle_media_picker)
+        self._style_compose_embedded_button(self.btn_media, icon_name="emoji.png")
+        compose_layout.addWidget(self.btn_media, 0)
 
         self.user_input = ChatInputTextEdit()
         self.user_input.setMinimumHeight(self._input_min_height)
         self.user_input.setMaximumHeight(self._input_max_height)
         self.user_input.setStyleSheet(
-            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;"
+            "QTextEdit{background:transparent;border:none;color:#edf5ff;padding:11px 0 12px 0;"
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;font-size:18px;}"
         )
         self._default_input_placeholder = "Сообщение..."
         self.user_input.setPlaceholderText(self._default_input_placeholder)
@@ -1497,33 +1728,55 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
         self.user_input.textChanged.connect(self._adjust_input_height)
         try:
-            self.user_input.document().setDocumentMargin(4.0)
+            self.user_input.document().setDocumentMargin(0.0)
         except Exception:
             pass
-        bottom_row.addWidget(self.user_input, 1)
+        compose_layout.addWidget(self.user_input, 1)
 
-        self.btn_media = QToolButton()
-        self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_media.setText("😊")
-        self.btn_media.setToolTip("Эмодзи / стикеры / GIF")
-        self.btn_media.clicked.connect(self._toggle_media_picker)
-        bottom_row.addWidget(self.btn_media)
+        self.btn_attach = QToolButton()
+        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach.setToolTip("Отправить файлы")
+        self.btn_attach.clicked.connect(self._pick_files_and_send)
+        self._style_compose_embedded_button(self.btn_attach, icon_name="attach.png")
+        compose_layout.addWidget(self.btn_attach, 0)
 
-        self.btn_send = QPushButton("Отправить")
-        self._send_button_label = self.btn_send.text()
-        self.btn_send.setAutoDefault(False)
-        self.btn_send.pressed.connect(self._send_pressed)
-        self.btn_send.released.connect(self._send_released)
-        bottom_row.addWidget(self.btn_send)
+        bottom_row.addWidget(compose_shell, 1)
 
-        self.auto_ai_checkbox = QCheckBox("🤖")
+        self.auto_ai_checkbox = QCheckBox("AI")
         self.auto_ai_checkbox.setToolTip("Автоответ AI для текущего чата")
         self.auto_ai_checkbox.stateChanged.connect(self.on_auto_ai_changed)
-        bottom_row.addWidget(self.auto_ai_checkbox)
+        self.auto_ai_checkbox.setStyleSheet(
+            "QCheckBox{color:#7fa8d4;background-color:#17212b;border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:24px;padding:0 14px 0 14px;min-height:48px;font-size:12px;font-weight:700;spacing:0;}"
+            "QCheckBox::indicator{width:0;height:0;}"
+            "QCheckBox:hover{background-color:#1d2b39;}"
+            "QCheckBox:checked{color:#ffffff;background-color:#2b5278;border-color:rgba(110,201,255,0.45);}"
+        )
+        bottom_row.addWidget(self.auto_ai_checkbox, 0)
+
+        self.btn_send = QToolButton()
+        self._send_button_label = ""
+        self.btn_send.pressed.connect(self._send_pressed)
+        self.btn_send.released.connect(self._send_released)
+        self._style_compose_action_button(
+            self.btn_send,
+            icon_name="send.png",
+            tooltip="Отправить",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        bottom_row.addWidget(self.btn_send)
 
         self.btn_voice = QToolButton()
         self.btn_voice.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_voice.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._style_compose_action_button(
+            self.btn_voice,
+            icon_name="mic.png",
+            tooltip="Голосовое сообщение",
+            accent=True,
+            icon_tint="#ffffff",
+        )
         voice_action = self.btn_voice.addAction("Отправить аудио…")
         voice_action.triggered.connect(self._pick_mp3_and_send)
         video_action = self.btn_voice.addAction("Отправить кружок…")
@@ -1533,6 +1786,49 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         QTimer.singleShot(0, self._adjust_input_height)
 
         return bottom_row
+
+    def _style_compose_embedded_button(self, button: QToolButton, *, icon_name: str) -> None:
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setFixedSize(48, 48)
+        button.setIcon(load_ayugram_icon(icon_name, tint="#8ea5bf", size=22))
+        button.setIconSize(QSize(22, 22))
+        button.setStyleSheet(
+            "QToolButton{border:none;background:transparent;border-radius:24px;padding:0;}"
+            "QToolButton:hover{background-color:rgba(122,184,255,0.12);}"
+            "QToolButton:pressed{background-color:rgba(122,184,255,0.2);}"
+        )
+
+    def _style_compose_action_button(
+        self,
+        button: QToolButton,
+        *,
+        icon_name: str,
+        tooltip: str,
+        accent: bool,
+        icon_tint: str,
+        background: Optional[str] = None,
+    ) -> None:
+        bg = background or ("#58a8f6" if accent else "#1d2b39")
+        hover = "#69b2fa" if accent else "#223244"
+        pressed = "#4f9ee8" if accent else "#1b2a3a"
+        button.setToolTip(tooltip)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setAutoRaise(True)
+        button.setFixedSize(48, 48)
+        button.setIcon(load_ayugram_icon(icon_name, tint=icon_tint, size=20))
+        button.setIconSize(QSize(20, 20))
+        button.setStyleSheet(
+            "QToolButton{border:none;border-radius:24px;padding:0;background-color:"
+            + bg
+            + ";}"
+            "QToolButton:hover{background-color:"
+            + hover
+            + ";}"
+            "QToolButton:pressed{background-color:"
+            + pressed
+            + ";}"
+        )
 
     @Slot()
     def _adjust_input_height(self) -> None:
@@ -1555,6 +1851,23 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         editor.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded if need_scroll else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self._refresh_compose_actions()
+
+    def _refresh_compose_actions(self) -> None:
+        editor = getattr(self, "user_input", None)
+        text_present = False
+        if isinstance(editor, QTextEdit):
+            try:
+                text_present = bool(str(editor.toPlainText() or "").strip())
+            except Exception:
+                text_present = False
+        recording = bool(getattr(self, "_recording", False))
+        send_btn = getattr(self, "btn_send", None)
+        voice_btn = getattr(self, "btn_voice", None)
+        if send_btn is not None:
+            send_btn.setVisible(text_present and not recording)
+        if voice_btn is not None:
+            voice_btn.setVisible(recording or not text_present)
 
     @staticmethod
     def _classify_attachment_kind(path: str) -> str:
@@ -1799,6 +2112,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 pass
         for signal_name, handler in (
             ("commandActivated", self._handle_message_command),
+            ("urlActivated", self._handle_message_link),
             ("replyMarkupButtonActivated", self._handle_reply_markup_action),
         ):
             signal = getattr(widget, signal_name, None)
@@ -1817,15 +2131,58 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         self.server.gui_send_message(chat_id=chat_id, user_id="me", text=text)
 
+    @Slot(str)
+    def _handle_message_link(self, url: str) -> None:
+        self._open_url_or_route_in_app(url)
+
+    def _open_url_or_route_in_app(self, url: str) -> bool:
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        ref = parse_telegram_reference(raw)
+        if ref.is_username or ref.is_invite:
+            chat_id: Optional[str] = None
+            row = None
+            resolver = getattr(self.server, "resolve_chat_reference", None)
+            if callable(resolver):
+                try:
+                    row = resolver(raw, join=True)
+                except Exception:
+                    row = None
+            if isinstance(row, dict):
+                chat_id = self._merge_discovered_peer_rows([row], query=raw)
+            if not chat_id:
+                search_public = getattr(self.tg, "search_public_peers_sync", None)
+                if callable(search_public):
+                    try:
+                        chat_id = self._merge_discovered_peer_rows(
+                            list(search_public(raw, limit=8) or []),
+                            query=raw,
+                        )
+                    except Exception:
+                        chat_id = None
+            if chat_id:
+                self.switch_chat(str(chat_id))
+                if ref.message_id:
+                    try:
+                        mid = int(ref.message_id)
+                    except Exception:
+                        mid = 0
+                    if mid > 0:
+                        QTimer.singleShot(180, lambda message_id=mid: self._jump_to_chat_message(message_id))
+                QTimer.singleShot(120, self.refresh_telegram_chats_async)
+                return True
+        try:
+            return bool(QDesktopServices.openUrl(QUrl(raw)))
+        except Exception:
+            return False
+
     @Slot(dict)
     def _handle_reply_markup_action(self, payload: Dict[str, Any]) -> None:
         action = dict(payload or {})
         url = str(action.get("url") or action.get("web_app_url") or action.get("login_url") or "").strip()
         if url:
-            try:
-                QDesktopServices.openUrl(QUrl(url))
-            except Exception:
-                pass
+            self._open_url_or_route_in_app(url)
             return
         switch_query = str(action.get("switch_inline_query_current_chat") or action.get("switch_inline_query") or "").strip()
         if switch_query:
@@ -1970,24 +2327,26 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._resort_timer.start()
 
     def _schedule_chat_list_refresh(self, delay_ms: int = 120) -> None:
-        self._chat_list_refresh_pending = True
-        # Coalesce frequent updates to avoid expensive full chat-list rebuilds on bursts.
-        now = time.monotonic()
-        if bool(getattr(self, "_dialogs_stream_active", False)):
-            min_gap = 0.90
-        else:
-            min_gap = 0.30
-        elapsed = now - float(getattr(self, "_chat_list_last_refresh_at", 0.0) or 0.0)
-        effective_delay = max(0, int(delay_ms))
-        if bool(getattr(self, "_dialogs_stream_active", False)):
-            effective_delay = max(effective_delay, 220)
-        if elapsed < min_gap:
-            effective_delay = max(effective_delay, int((min_gap - elapsed) * 1000))
-        try:
-            self._repaint_timer.start(effective_delay)
-        except Exception:
-            self._chat_list_refresh_pending = False
-            self.populate_chat_list()
+        def _start() -> None:
+            self._chat_list_refresh_pending = True
+            # Coalesce frequent updates to avoid expensive full chat-list rebuilds on bursts.
+            now = time.monotonic()
+            if bool(getattr(self, "_dialogs_stream_active", False)):
+                min_gap = 0.90
+            else:
+                min_gap = 0.30
+            elapsed = now - float(getattr(self, "_chat_list_last_refresh_at", 0.0) or 0.0)
+            effective_delay = max(0, int(delay_ms))
+            if bool(getattr(self, "_dialogs_stream_active", False)):
+                effective_delay = max(effective_delay, 220)
+            if elapsed < min_gap:
+                effective_delay = max(effective_delay, int((min_gap - elapsed) * 1000))
+            try:
+                self._repaint_timer.start(effective_delay)
+            except Exception:
+                self._chat_list_refresh_pending = False
+                self.populate_chat_list()
+        invoke_in_gui_thread(_start)
 
     @Slot()
     def _flush_chat_list_refresh(self) -> None:
@@ -2096,6 +2455,79 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._start_global_peer_search()
         return True
 
+    def _merge_discovered_peer_rows(self, rows: List[Dict[str, Any]], *, query: str = "") -> Optional[str]:
+        updated = False
+        first_chat_id: Optional[str] = None
+        exact_chat_id: Optional[str] = None
+        ref = parse_telegram_reference(query)
+        search_hint = ref.username if ref.is_username else ""
+        query_norm = re.sub(r"[^a-zа-яё0-9]+", "", str(ref.username or query or "").casefold())
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            if first_chat_id is None:
+                first_chat_id = cid
+            username_norm = re.sub(r"[^a-zа-яё0-9]+", "", str(row.get("username") or "").strip().casefold())
+            title_norm = re.sub(r"[^a-zа-яё0-9]+", "", str(row.get("title") or "").strip().casefold())
+            if query_norm and query_norm in {username_norm, title_norm} and exact_chat_id is None:
+                exact_chat_id = cid
+            prev = self._ensure_chat_meta(cid)
+            title = str(row.get("title") or prev.get("title") or cid).strip() or cid
+            ctype = str(row.get("type") or prev.get("type") or "private").strip().lower() or "private"
+            username = str(row.get("username") or prev.get("username") or "").strip()
+            photo_small = row.get("photo_small_id") or prev.get("photo_small_id") or prev.get("photo_small")
+            self.all_chats[cid] = {
+                "title": title,
+                "type": ctype,
+                "last_ts": int(prev.get("last_ts") or 0),
+                "username": username,
+                "search_hint": search_hint or str(prev.get("search_hint") or "").strip(),
+                "photo_small_id": photo_small,
+                "members_count": row.get("members_count") if row.get("members_count") is not None else prev.get("members_count"),
+                "pinned": bool(prev.get("pinned", False)),
+                "unread_count": max(0, int(prev.get("unread_count") or 0)),
+            }
+            updated = True
+        if updated:
+            self._schedule_chat_list_refresh(0)
+        if exact_chat_id:
+            return exact_chat_id
+        if ref.is_username or ref.is_invite:
+            return None
+        return first_chat_id
+
+    def on_sidebar_search_submitted(self, text: str) -> bool:
+        query = str(text or "").strip()
+        if not query:
+            return False
+        ref = parse_telegram_reference(query)
+        resolver = getattr(self.server, "resolve_chat_reference", None)
+        if callable(resolver) and (ref.is_username or ref.is_invite):
+            try:
+                row = resolver(query, join=True)
+            except Exception:
+                row = None
+            if isinstance(row, dict):
+                chat_id = self._merge_discovered_peer_rows([row], query=query)
+                self._apply_filter(query)
+                if chat_id:
+                    self.switch_chat(chat_id)
+                    QTimer.singleShot(100, self.refresh_telegram_chats_async)
+                    return True
+            return False
+        for idx in range(self.chat_list.count()):
+            item = self.chat_list.item(idx)
+            if item is None or item.isHidden():
+                continue
+            chat_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if chat_id:
+                self.switch_chat(chat_id)
+                return True
+        return False
+
     @Slot()
     def _start_global_peer_search(self) -> None:
         query = str(getattr(self, "_global_search_query", "") or "").strip()
@@ -2135,30 +2567,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         current_query = str(getattr(self, "search", None).text() if hasattr(self, "search") else "")
         if current_query.strip().lower() != str(query or "").strip().lower():
             return
-        updated = False
-        for row in list(rows or []):
-            if not isinstance(row, dict):
-                continue
-            cid = str(row.get("id") or "").strip()
-            if not cid:
-                continue
-            prev = self._ensure_chat_meta(cid)
-            title = str(row.get("title") or prev.get("title") or cid).strip() or cid
-            ctype = str(row.get("type") or prev.get("type") or "private").strip().lower() or "private"
-            username = str(row.get("username") or prev.get("username") or "").strip()
-            photo_small = row.get("photo_small_id") or prev.get("photo_small_id") or prev.get("photo_small")
-            self.all_chats[cid] = {
-                "title": title,
-                "type": ctype,
-                "last_ts": int(prev.get("last_ts") or 0),
-                "username": username,
-                "photo_small_id": photo_small,
-                "pinned": bool(prev.get("pinned", False)),
-                "unread_count": max(0, int(prev.get("unread_count") or 0)),
-            }
-            updated = True
-        if updated:
-            self._schedule_chat_list_refresh(0)
+        self._merge_discovered_peer_rows(rows, query=query)
         self._apply_filter(current_query)
 
     # ------------------------------------------------------------------ #
@@ -2246,6 +2655,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             avatar = None
         callbacks = {
             "show_stats": self._show_current_chat_statistics,
+            "export": self._export_current_chat_statistics,
+            "open_link": self._open_url_or_route_in_app,
             "mark_read": lambda: self._mark_current_chat_read(local=False),
             "leave_chat": self._leave_current_chat_from_profile,
             "jump_to_message": self._jump_to_chat_message,
@@ -2271,7 +2682,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         title.setStyleSheet("color:#dfefff;font-size:15px;font-weight:700;")
         note = QLabel("Подгружаю медиа, файлы, ссылки и участников в фоне.", box)
         note.setWordWrap(True)
-        note.setStyleSheet("color:#8da8c4;font-size:12px;")
+        note.setStyleSheet("color:#868686;font-size:12px;")
         layout.addWidget(title, 0)
         layout.addWidget(note, 0)
         layout.addStretch(1)
@@ -2395,6 +2806,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             avatar = None
         callbacks = {
             "show_stats": self._show_current_chat_statistics,
+            "export": self._export_current_chat_statistics,
             "mark_read": lambda: self._mark_current_chat_read(local=False),
             "leave_chat": self._leave_current_chat_from_profile,
             "jump_to_message": self._jump_to_chat_message,
@@ -2459,9 +2871,165 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             stats,
             parent=self,
             embedded=True,
-            callbacks={"scan": lambda: self._show_current_chat_statistics(scan=True)},
+            callbacks={
+                "scan": lambda: self._show_current_chat_statistics(scan=True),
+                "export": self._export_current_chat_statistics,
+            },
         )
         self._set_chat_details_widget("Статистика", panel)
+
+    @staticmethod
+    def _sanitize_stats_export_name(value: str) -> str:
+        invalid = '<>:"/\\|?*'
+        cleaned = "".join("_" if ch in invalid else ch for ch in str(value or "")).strip()
+        cleaned = cleaned.strip(". ")
+        return cleaned or "chat_statistics"
+
+    def _export_current_chat_statistics(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        exporter = getattr(self.server, "export_chat_statistics_report", None)
+        if not callable(exporter):
+            QMessageBox.warning(self, "Экспорт статистики", "Экспорт недоступен в этой сборке.")
+            return
+        title = str(self._current_chat_meta().get("title") or chat_id)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suggested_name = f"{self._sanitize_stats_export_name(title)}_{stamp}.html"
+        initial_path = str(app_paths.exports_dir() / suggested_name)
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт статистики чата",
+            initial_path,
+            "HTML report (*.html)",
+        )
+        if not path:
+            return
+        result = exporter(chat_id, output_path=path, title=title)
+        if not isinstance(result, dict) or not bool(result.get("ok")):
+            QMessageBox.warning(
+                self,
+                "Экспорт статистики",
+                str((result or {}).get("error") or "Не удалось сохранить отчёт."),
+            )
+            return
+        saved_files = [
+            str(result.get("html_path") or "").strip(),
+            str(result.get("json_path") or "").strip(),
+            str(result.get("users_csv_path") or "").strip(),
+            str(result.get("daily_csv_path") or "").strip(),
+            str(result.get("hourly_csv_path") or "").strip(),
+            str(result.get("sender_daily_csv_path") or "").strip(),
+            str(result.get("suspicious_csv_path") or "").strip(),
+            str(result.get("risk_csv_path") or "").strip(),
+        ]
+        saved_files = [item for item in saved_files if item]
+        self._toast("Экспорт статистики сохранён")
+        QMessageBox.information(
+            self,
+            "Экспорт статистики",
+            "Сохранены файлы:\n" + "\n".join(saved_files),
+        )
+
+    def _export_current_chat_history(self) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        exporter = getattr(self.server, "export_chat_history", None)
+        if not callable(exporter):
+            QMessageBox.warning(self, "Выгрузка чата", "Выгрузка недоступна.")
+            return
+        title = str(self._current_chat_meta().get("title") or chat_id)
+
+        from ui.export_dialog import ExportSettingsDialog
+        dialog = ExportSettingsDialog(title, parent=self)
+        dialog.set_output_dir(str(app_paths.exports_dir()))
+        settings: Optional[Dict[str, Any]] = None
+
+        def _on_settings(s: Dict[str, Any]) -> None:
+            nonlocal settings
+            settings = s
+
+        dialog.export_requested.connect(_on_settings)
+        dialog.exec()
+        if settings is None:
+            return
+
+        out_dir = settings.get("output_dir") or str(app_paths.exports_dir())
+        progress = QProgressDialog("Выгрузка чата...", "Отмена", 0, 100, self)
+        progress.setWindowTitle("Выгрузка чата")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        last_progress = [0]
+
+        def _on_event(evt: Dict[str, Any]) -> None:
+            if evt.get("type") == "gui_export_progress":
+                done = int(evt.get("done") or 0)
+                total = max(1, int(evt.get("total") or 1))
+                pct = min(100, int(done * 100 / total))
+                if pct > last_progress[0]:
+                    last_progress[0] = pct
+                    progress.setValue(pct)
+                    progress.setLabelText(str(evt.get("text") or f"{done}/{total}"))
+            elif evt.get("type") == "gui_export_done":
+                progress.setValue(100)
+
+        self.server.events.put = lambda e: (_on_event(e), type(self.server.events).put(e))
+
+        import threading
+        result_holder = [None]
+        error_holder = [None]
+
+        def _run_export() -> None:
+            try:
+                result_holder[0] = exporter(
+                    chat_id,
+                    output_dir=out_dir,
+                    sync_remote=True,
+                    copy_media=True,
+                    formats=settings.get("formats", ["html", "json"]),
+                    media_types=settings.get("media_types"),
+                    max_media_size_mb=settings.get("max_media_size_mb", 8),
+                    date_from=settings.get("date_from"),
+                    date_to=settings.get("date_to"),
+                    dark_theme=settings.get("dark_theme", True),
+                )
+            except Exception as exc:
+                error_holder[0] = exc
+
+        t = threading.Thread(target=_run_export, daemon=True)
+        t.start()
+
+        while t.is_alive():
+            QApplication.processEvents()
+            t.join(timeout=0.05)
+            if progress.wasCanceled():
+                break
+
+        try:
+            del self.server.events.put
+        except Exception:
+            pass
+
+        result = result_holder[0]
+        if error_holder[0]:
+            QMessageBox.warning(self, "Выгрузка чата", f"Ошибка: {error_holder[0]}")
+            return
+        if not isinstance(result, dict) or not bool(result.get("ok")):
+            QMessageBox.warning(
+                self,
+                "Выгрузка чата",
+                str((result or {}).get("error") or "Не удалось выгрузить чат."),
+            )
+            return
+        files = result.get("files", {})
+        file_list = [v for v in files.values() if v]
+        msg = f"Чат «{title}» выгружен в:\n{result.get('output_dir', out_dir)}"
+        if file_list:
+            msg += "\n\nФайлы:\n" + "\n".join(file_list)
+        self._toast("Выгрузка чата завершена")
+        QMessageBox.information(self, "Выгрузка чата", msg)
 
     def _show_message_statistics(self, message_id: int) -> None:
         chat_id = str(self.current_chat_id or "")
@@ -2553,21 +3121,45 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _show_chat_header_menu(self, global_pos: QPoint) -> None:
         if not self.current_chat_id:
             return
-        menu = build_header_menu(self)
-        menu.addAction("Открыть профиль").triggered.connect(self._show_current_chat_info)
-        menu.addAction("Статистика чата").triggered.connect(self._show_current_chat_statistics)
-        menu.addAction("Анти-накрутка").triggered.connect(self._show_current_chat_statistics)
-        menu.addSeparator()
-        menu.addAction("Обновить историю").triggered.connect(lambda: self.load_chat_history_async(reset=True))
-        menu.addAction("Пометить прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
-        menu.addAction("Покинуть чат").triggered.connect(self._leave_current_chat_from_profile)
-        try:
-            menu.exec(global_pos)
-        finally:
+        existing = getattr(self, "_chat_header_menu_popup", None)
+        if existing is not None:
             try:
-                menu.deleteLater()
+                existing.close()
             except Exception:
                 pass
+        menu = build_header_menu(self)
+        self._chat_header_menu_popup = menu
+        try:
+            menu.closed.connect(lambda: setattr(self, "_chat_header_menu_popup", None))
+        except Exception:
+            pass
+        menu.add_action("Открыть профиль", self._show_current_chat_info, icon_name="profile.png")
+        menu.add_action("Статистика чата", self._show_current_chat_statistics, icon_name="stats.png")
+        menu.add_action(
+            "Анти-накрутка",
+            lambda: self._show_current_chat_statistics(scan=True),
+            icon_name="warning.png",
+        )
+        menu.add_separator()
+        menu.add_action("Выгрузить чат", self._export_current_chat_history, icon_name="export.png")
+        menu.add_separator()
+        menu.add_action(
+            "Обновить историю",
+            lambda: self.load_chat_history_async(reset=True),
+            icon_name="refresh.png",
+        )
+        menu.add_action(
+            "Пометить прочитанным",
+            lambda: self._mark_current_chat_read(local=False),
+            icon_name="read.png",
+        )
+        menu.add_action(
+            "Покинуть чат",
+            self._leave_current_chat_from_profile,
+            icon_name="leave.png",
+            destructive=True,
+        )
+        menu.show_at(global_pos, align_right=True)
 
     def update_ai_controls_state(self) -> None:
         if not self.current_chat_id:
@@ -2704,8 +3296,38 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._keep_deleted_messages = previous
             self._toast("Не удалось сохранить настройку удалённых сообщений")
             return
-            if self.current_chat_id:
-                self.load_chat_history_async()
+        if self.current_chat_id:
+            self.load_chat_history_async()
+
+    def _ayu_toggle(self, key: str, checked: bool, label: str) -> None:
+        previous = bool(getattr(self._config.get("features", {}), key, False))
+        if previous == checked:
+            return
+        if not self._persist_feature_flag(key, checked):
+            self._toast(f"Не удалось сохранить: {label}")
+            return
+        self._toast(f"{label}: {'вкл' if checked else 'выкл'}")
+
+    def on_ayu_save_deleted_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_save_deleted", checked, "Сохранять удалённые")
+
+    def on_ayu_save_edits_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_save_edits", checked, "Сохранять правки")
+
+    def on_ayu_media_private_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_media_private", checked, "Медиа: личные")
+
+    def on_ayu_media_group_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_media_group", checked, "Медиа: группы")
+
+    def on_ayu_media_channel_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_media_channel", checked, "Медиа: каналы")
+
+    def on_ayu_send_online_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_send_online", checked, "Показывать онлайн")
+
+    def on_ayu_send_typing_changed(self, checked: bool) -> None:
+        self._ayu_toggle("ayu_send_typing", checked, "Показывать набор")
 
     def on_media_volume_setting_changed(self, value: int) -> None:
         try:
@@ -4995,14 +5617,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                     candidate_ids.update(set(getattr(self, "_chat_id_aliases")(target_id)))
                 except Exception:
                     pass
-            for cid in list(getattr(self, "_chat_items_by_id", {}).keys()):
-                try:
-                    aliases = set(getattr(self, "_chat_id_aliases")(cid))
-                except Exception:
-                    aliases = {cid}
-                if not (candidate_ids & aliases):
-                    continue
-                item = self._chat_items_by_id.get(cid)
+            for cid in list(candidate_ids):
+                item = getattr(self, "_chat_items_by_id", {}).get(cid)
                 if not item:
                     continue
                 item_info = item.data(Qt.ItemDataRole.UserRole + 1) or {}
@@ -5055,10 +5671,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 try:
                     if kind == "chat":
                         info = self.all_chats.get(entity_id, {"title": entity_id})
-                        pixmap = self.avatar_cache.chat(entity_id, info)
+                        pixmap = self.avatar_cache.chat(entity_id, info, allow_fetch=False)
                     elif kind == "user":
                         header = avatar.toolTip() or entity_id
-                        pixmap = self.avatar_cache.user(entity_id, header)
+                        pixmap = self.avatar_cache.user(entity_id, header, allow_fetch=False)
                     else:
                         continue
                     avatar.set_pixmap(pixmap)
@@ -5068,10 +5684,66 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     @Slot()
     def _on_dialogs_stream_done(self) -> None:
+        self._sync_dialog_sidebar_snapshot()
         self.sidebar_ui.loading_label.setText("Готово")
         self._schedule_chat_list_refresh(0)
         if not self._resort_timer.isActive():
             self._resort_timer.start()
+
+    def _sync_dialog_sidebar_snapshot(self) -> None:
+        try:
+            rows = self.server.list_cached_dialogs(limit=400)
+        except Exception:
+            rows = []
+
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            snapshot[cid] = dict(row)
+
+        for cid, info in list(self.all_chats.items()):
+            if not isinstance(info, dict) or not bool(info.get("_is_dialog")):
+                continue
+            if cid in snapshot:
+                continue
+            self.all_chats.pop(cid, None)
+            self._chat_last_message_id.pop(cid, None)
+            self._chat_header_info_cache.pop(cid, None)
+            self._bot_reply_markup_by_chat.pop(cid, None)
+            if str(self.current_chat_id or "") == cid:
+                self.current_chat_id = None
+                self._close_chat_details()
+                self.clear_feed()
+
+        for cid, row in snapshot.items():
+            prev = dict(self.all_chats.get(cid, {}))
+            last_ts = row.get("last_ts")
+            if last_ts is None:
+                last_ts = row.get("last_message_date")
+            if last_ts is None:
+                last_ts = prev.get("last_ts", 0)
+            try:
+                merged_last_ts = max(int(prev.get("last_ts") or 0), int(last_ts or 0))
+            except Exception:
+                merged_last_ts = int(last_ts or 0)
+            self.all_chats[cid] = {
+                "title": row.get("title") or prev.get("title") or cid,
+                "type": row.get("type") or prev.get("type") or "",
+                "last_ts": merged_last_ts,
+                "username": row.get("username") or prev.get("username"),
+                "photo_small_id": row.get("photo_small_id") or row.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
+                "pinned": bool(row.get("pinned", prev.get("pinned", False))),
+                "unread_count": max(0, int(row.get("unread_count") or prev.get("unread_count") or 0)),
+                "_is_dialog": True,
+            }
+
+        if not self.current_chat_id:
+            self._refresh_chat_header()
+            self.update_ai_controls_state()
 
     @Slot(list)
     def on_dialogs_batch(self, chunk: List[Dict[str, Any]]) -> None:
@@ -5106,6 +5778,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 "photo_small_id": info.get("photo_small_id") or info.get("photo_small") or prev.get("photo_small_id") or prev.get("photo_small"),
                 "pinned": bool(info.get("pinned", prev.get("pinned", False))),
                 "unread_count": merged_unread,
+                "_is_dialog": True,
             }
         self._schedule_chat_list_refresh(60)
         if active_chat and active_chat in self.all_chats:
@@ -5377,6 +6050,207 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             ok = False
         self._toast("Реакция отправлена" if ok else "Не удалось отправить реакцию")
 
+    def _save_message_media(self, message_id: int, *, target: str = "downloads") -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        cached = self._message_cache.get(mid, {})
+        fpath = str(cached.get("file_path") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            try:
+                if target == "gallery":
+                    pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+                    dest_dir = os.path.join(pictures, "ESCgram")
+                else:
+                    downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+                    dest_dir = os.path.join(downloads, "ESCgram")
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, os.path.basename(fpath))
+                if os.path.abspath(fpath) != os.path.abspath(dest):
+                    shutil.copy2(fpath, dest)
+                self._toast(f"Сохранено: {dest}")
+            except Exception as exc:
+                self._toast(f"Ошибка сохранения: {exc}")
+        else:
+            ok = False
+            if hasattr(self.server, "download_media"):
+                try:
+                    path = self.server.download_media(chat_id, mid)
+                    if path and os.path.isfile(path):
+                        if target == "gallery":
+                            pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+                            dest_dir = os.path.join(pictures, "ESCgram")
+                        else:
+                            downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+                            dest_dir = os.path.join(downloads, "ESCgram")
+                        os.makedirs(dest_dir, exist_ok=True)
+                        dest = os.path.join(dest_dir, os.path.basename(path))
+                        if os.path.abspath(path) != os.path.abspath(dest):
+                            shutil.copy2(path, dest)
+                        ok = True
+                except Exception:
+                    pass
+            self._toast("Медиа сохранено" if ok else "Не удалось сохранить медиа")
+
+    def _copy_message_photo(self, message_id: int) -> None:
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        cached = self._message_cache.get(mid, {})
+        fpath = str(cached.get("file_path") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            pixmap = QPixmap(fpath)
+            if not pixmap.isNull():
+                QApplication.clipboard().setPixmap(pixmap)
+                self._toast("Фото скопировано в буфер")
+                return
+        chat_id = str(self.current_chat_id or "")
+        if hasattr(self.server, "download_media"):
+            try:
+                path = self.server.download_media(chat_id, mid)
+                if path and os.path.isfile(path):
+                    pixmap = QPixmap(path)
+                    if not pixmap.isNull():
+                        QApplication.clipboard().setPixmap(pixmap)
+                        self._toast("Фото скопировано в буфер")
+                        return
+            except Exception:
+                pass
+        self._toast("Не удалось скопировать фото")
+
+    def _copy_message_sticker(self, message_id: int) -> None:
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        cached = self._message_cache.get(mid, {})
+        fpath = str(cached.get("file_path") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            try:
+                pixmap = QPixmap(fpath)
+                if not pixmap.isNull():
+                    QApplication.clipboard().setPixmap(pixmap)
+                    self._toast("Стикер скопирован в буфер")
+                    return
+            except Exception:
+                pass
+        self._toast("Не удалось скопировать стикер")
+
+    def _ghost_read_until(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        ok = False
+        ghost_was = bool(getattr(self, "_ghost_mode_enabled", False))
+        try:
+            if hasattr(self.tg, "mark_chat_read_sync"):
+                if ghost_was and hasattr(self.tg, "set_ghost_mode"):
+                    self.tg.set_ghost_mode(False)
+                ok = bool(self.tg.mark_chat_read_sync(chat_id))
+        except Exception:
+            ok = False
+        finally:
+            if ghost_was and hasattr(self.tg, "set_ghost_mode"):
+                try:
+                    self.tg.set_ghost_mode(True)
+                except Exception:
+                    pass
+        self._toast("Прочитано до этого сообщения" if ok else "Не удалось отправить отметку")
+
+    def _pin_message(self, message_id: int) -> None:
+        chat_id = str(self.current_chat_id or "")
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        ok = False
+        if hasattr(self.server, "pin_message"):
+            try:
+                ok = bool(self.server.pin_message(chat_id, mid))
+            except Exception:
+                pass
+        elif hasattr(self.tg, "pin_message_sync"):
+            try:
+                ok = bool(self.tg.pin_message_sync(chat_id, mid))
+            except Exception:
+                pass
+        self._toast("Сообщение закреплено" if ok else "Не удалось закрепить сообщение")
+
+    def _show_edit_history(self, message_id: int) -> None:
+        chat_id = self.current_chat_id
+        if not chat_id:
+            return
+        try:
+            mid = int(message_id)
+        except Exception:
+            return
+        if mid <= 0:
+            return
+        revisions = []
+        if self.server and hasattr(self.server, "_storage") and self.server._storage:
+            try:
+                peer_id = int(chat_id)
+                revisions = self.server._storage.get_edited_message_revisions(peer_id, mid)
+            except Exception:
+                pass
+        if not revisions:
+            self._toast("Нет сохранённых правок")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Правки сообщения #{mid}")
+        dialog.setStyleSheet(
+            "QDialog{background-color:#0f0f10;color:#f1f1f1;}"
+            "QLabel{color:#f1f1f1;background:transparent;}"
+            "QPushButton{background:rgba(255,255,255,0.05);color:#f1f1f1;border:none;border-radius:8px;padding:7px 10px;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.10);}"
+        )
+        dialog.resize(420, 400)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        for rev in revisions[:30]:
+            ts = rev.get("edited_at", 0)
+            try:
+                dt = datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M:%S")
+            except Exception:
+                dt = str(ts)
+            text = str(rev.get("text") or "(пусто)")
+            frame = QFrame(dialog)
+            frame.setStyleSheet("QFrame{border-bottom:1px solid rgba(255,255,255,0.06);}")
+            fl = QVBoxLayout(frame)
+            fl.setContentsMargins(0, 4, 0, 6)
+            fl.setSpacing(3)
+            header_lbl = QLabel(f"✏️ {dt}")
+            header_lbl.setStyleSheet("color:#868686;font-size:11px;")
+            fl.addWidget(header_lbl)
+            body_lbl = QLabel(text[:500])
+            body_lbl.setWordWrap(True)
+            body_lbl.setStyleSheet("color:#f1f1f1;font-size:13px;")
+            fl.addWidget(body_lbl)
+            layout.addWidget(frame)
+        layout.addStretch(1)
+        close_btn = QPushButton("Закрыть", dialog)
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec()
+
     def _set_message_selected(self, msg_id: int, selected: bool) -> None:
         try:
             mid = int(msg_id)
@@ -5569,20 +6443,6 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             QMessageBox.information(self, "Скриншот", "Не удалось получить выделенные сообщения.")
             return
 
-        target_rect: Optional[QRect] = None
-        for wrap in wraps:
-            rect = wrap.geometry()
-            target_rect = rect if target_rect is None else target_rect.united(rect)
-        if target_rect is None:
-            QMessageBox.information(self, "Скриншот", "Не удалось подготовить область скриншота.")
-            return
-        target_rect.adjust(-8, -8, 8, 8)
-        bounds = self.chat_history_wrap.rect()
-        target_rect = target_rect.intersected(bounds)
-        if target_rect.isEmpty():
-            QMessageBox.information(self, "Скриншот", "Пустая область скриншота.")
-            return
-
         default_name = f"escgram_selected_{int(time.time())}.png"
         out_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -5594,11 +6454,37 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             return
         if not out_path.lower().endswith(".png"):
             out_path += ".png"
-        pix = self.chat_history_wrap.grab(target_rect)
-        if pix.isNull():
+
+        padding = 16
+        spacing = 6
+        total_height = padding * 2 + spacing * (len(wraps) - 1)
+        max_width = 0
+        for wrap in wraps:
+            total_height += wrap.height()
+            if wrap.width() > max_width:
+                max_width = wrap.width()
+        canvas_w = max_width + padding * 2
+        canvas_h = total_height
+        if canvas_w <= 0 or canvas_h <= 0:
             QMessageBox.warning(self, "Скриншот", "Не удалось создать скриншот.")
             return
-        if pix.save(out_path, "PNG"):
+
+        pixmap = QPixmap(canvas_w, canvas_h)
+        pixmap.fill(QColor("#0f0f10"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        y = padding
+        for wrap in wraps:
+            selection_overlay = QColor(100, 181, 239, 35)
+            grab = wrap.grab()
+            painter.drawPixmap(padding, y, grab)
+            painter.fillRect(padding, y, wrap.width(), wrap.height(), selection_overlay)
+            y += wrap.height() + spacing
+
+        painter.end()
+        if pixmap.save(out_path, "PNG"):
             self._toast("Скриншот сохранён")
         else:
             QMessageBox.warning(self, "Скриншот", "Не удалось сохранить файл.")
@@ -5749,11 +6635,44 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             for emoji in ("👍", "❤️", "🔥", "😂", "😢", "😡"):
                 reaction_menu.addAction(emoji).triggered.connect(lambda _, e=emoji, mid=mid: self._set_message_reaction(mid, e))
             menu.addSeparator()
+
+            cached_msg = self._message_cache.get(mid, {})
+            is_deleted = bool(cached_msg.get("is_deleted"))
+            has_media = cached_msg.get("kind") in ("photo", "image", "video", "animation", "gif", "voice", "audio", "document", "video_note")
+            is_photo = cached_msg.get("kind") in ("photo", "image")
+            is_sticker = cached_msg.get("kind") == "sticker"
+            is_mine = str(cached_msg.get("sender") or "") == "me"
+
             menu.addAction("Статистика сообщения").triggered.connect(lambda: self._show_message_statistics(mid))
-            menu.addAction("Анти-накрутка / аналитика").triggered.connect(lambda: self._show_message_statistics(mid))
-            menu.addAction("Удалить сообщение").triggered.connect(lambda: self._delete_message(mid))
+            menu.addAction("Анти-накрутка / аналитика").triggered.connect(lambda: self._show_current_chat_statistics(scan=True))
+
+            if is_photo and not is_deleted:
+                menu.addAction("Копировать фото").triggered.connect(lambda: self._copy_message_photo(mid))
+            if is_sticker and not is_deleted:
+                menu.addAction("Копировать стикер").triggered.connect(lambda: self._copy_message_sticker(mid))
+
+            if has_media and not is_deleted:
+                save_menu = menu.addMenu("Сохранить")
+                save_menu.addAction("В галерею").triggered.connect(lambda: self._save_message_media(mid, target="gallery"))
+                save_menu.addAction("В загрузки").triggered.connect(lambda: self._save_message_media(mid, target="downloads"))
+
+            if not is_deleted:
+                menu.addAction("Удалить сообщение").triggered.connect(lambda: self._delete_message(mid))
             menu.addAction("Копировать ссылку на сообщение").triggered.connect(lambda: self._copy_message_link(mid))
-            menu.addAction("Переслать").triggered.connect(lambda: self._forward_message(mid))
+            if not is_deleted:
+                menu.addAction("Переслать").triggered.connect(lambda: self._forward_message(mid))
+
+            if self._ghost_mode_enabled and not is_mine and not is_deleted:
+                menu.addSeparator()
+                menu.addAction("Прочитать до сюда").triggered.connect(lambda: self._ghost_read_until(mid))
+
+            pin_action = menu.addAction("Закрепить сообщение")
+            pin_action.triggered.connect(lambda: self._pin_message(mid))
+
+            if not is_deleted:
+                edit_history_action = menu.addAction("История правок")
+                edit_history_action.triggered.connect(lambda: self._show_edit_history(mid))
+
             if mid in self._selected_message_ids:
                 menu.addAction("Снять выделение").triggered.connect(lambda: self._toggle_message_selection(mid))
             else:
@@ -5778,6 +6697,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             menu.addAction(f"Удалить выбранные ({len(self._selected_message_ids)})").triggered.connect(self._delete_selected_messages)
             menu.addAction(f"Переслать выбранные ({len(self._selected_message_ids)})").triggered.connect(self._forward_selected_messages)
             menu.addAction(f"Скриншот выбранных ({len(self._selected_message_ids)})").triggered.connect(self._capture_selected_messages_screenshot)
+            if self._ghost_mode_enabled:
+                menu.addAction(f"Прочитать до выбранного ({len(self._selected_message_ids)})").triggered.connect(lambda: self._ghost_read_until(max(self._selected_message_ids)))
             menu.addAction("Снять выделение со всех").triggered.connect(self._clear_message_selection)
 
         menu.addSeparator()
@@ -6111,7 +7032,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _send_long(self) -> None:
         self._send_long_mode = True
         try:
-            self.btn_send.setText("\u0421\u043a\u0440\u044b\u0442\u043e")
+            self._style_compose_action_button(
+                self.btn_send,
+                icon_name="send.png",
+                tooltip="Отправка невидимого сообщения",
+                accent=True,
+                icon_tint="#ffffff",
+                background="#8a5cf6",
+            )
         except Exception:
             pass
 
@@ -6125,7 +7053,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             if txt:
                 self.send_message_invisible()
         self._send_long_mode = False
-        QTimer.singleShot(200, lambda: self.btn_send.setText(self._send_button_label))
+        self._style_compose_action_button(
+            self.btn_send,
+            icon_name="send.png",
+            tooltip="Отправить",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        self._refresh_compose_actions()
 
     def send_message_invisible(self) -> None:
         text = (self.user_input.toPlainText() or "").strip()
@@ -6218,11 +7153,24 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _update_voice_button(self) -> None:
         if self._recording:
-            self.btn_voice.setText("⏺️")
-            self.btn_voice.setToolTip("Идёт запись… отпустите, чтобы отправить")
+            self._style_compose_action_button(
+                self.btn_voice,
+                icon_name="mic.png",
+                tooltip="Идёт запись… отпустите, чтобы отправить",
+                accent=True,
+                icon_tint="#ffffff",
+                background="#d66072",
+            )
+            self._refresh_compose_actions()
             return
-        self.btn_voice.setText("🎙")
-        self.btn_voice.setToolTip("Удерживать — запись голосового; клик — меню (аудио/кружок)")
+        self._style_compose_action_button(
+            self.btn_voice,
+            icon_name="mic.png",
+            tooltip="Удерживать — запись голосового; клик — меню (аудио/кружок)",
+            accent=True,
+            icon_tint="#ffffff",
+        )
+        self._refresh_compose_actions()
 
     def _start_recording(self) -> None:
         if not self.current_chat_id:
@@ -6249,7 +7197,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             )
             self._rec_stream.start()
             self._recording = True
-            self.btn_voice.setText("⏺️")
+            self._update_voice_button()
             self._toast("Запись… отпустите кнопку, чтобы отправить как голосовое")
         except Exception as exc:
             self._recording = False
@@ -7033,12 +7981,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         if self.tg.is_authorized_sync():
             self._startup_auth_retries = 0
             self._startup_auth_retry_reason = ""
+            self._show_main_page()
             self._refresh_account_profile_async()
             self.refresh_telegram_chats_async()
             return
+        self._show_auth_page(prompt_reason=prompt_reason)
         # A just-started/switched Telegram client may still be warming up.
         # Delay auth prompt a bit unless user explicitly requested adding a new account.
         if prompt_reason != "add_account":
+            tg_enabled = bool(getattr(self.tg, "_enabled", False))
             auth_invalid = bool(getattr(self.tg, "_auth_invalid", False))
             pending_new_session = bool(getattr(self.tg, "_pending_session_name", None))
             has_known_session = False
@@ -7058,28 +8009,67 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                         has_known_session = bool(checker(current))
                     except Exception:
                         has_known_session = False
+            has_cached_state = has_known_session or ChatWindow._has_cached_telegram_state(self)
 
             reason_prev = str(getattr(self, "_startup_auth_retry_reason", "") or "")
             if reason_prev != prompt_reason:
                 self._startup_auth_retries = 0
             self._startup_auth_retry_reason = prompt_reason
             retries = int(getattr(self, "_startup_auth_retries", 0) or 0)
-            if has_known_session and not auth_invalid and not pending_new_session and retries < 5:
+            if prompt_reason == "startup" and tg_enabled and has_cached_state and not auth_invalid and not pending_new_session:
+                starter = getattr(self.tg, "start", None)
+                if callable(starter) and not getattr(self.tg, "_thread", None):
+                    try:
+                        starter()
+                    except Exception:
+                        log.warning("Failed to restart Telegram adapter during cached startup recovery", exc_info=True)
                 self._startup_auth_retries = retries + 1
-                QTimer.singleShot(1200, lambda: self._ensure_authorized(prompt_reason=prompt_reason))
+                retry_delay_ms = min(8000, 1500 + min(retries, 20) * 500)
+                QTimer.singleShot(retry_delay_ms, lambda: self._ensure_authorized(prompt_reason=prompt_reason))
+                return
+            if tg_enabled and has_known_session and not auth_invalid and not pending_new_session:
+                starter = getattr(self.tg, "start", None)
+                if callable(starter) and not getattr(self.tg, "_thread", None):
+                    try:
+                        starter()
+                    except Exception:
+                        log.warning("Failed to restart Telegram adapter during auth warmup", exc_info=True)
+                self._startup_auth_retries = retries + 1
+                extra_retries = max(0, retries - 4)
+                retry_delay_ms = min(5000, 1200 + extra_retries * 400)
+                QTimer.singleShot(retry_delay_ms, lambda: self._ensure_authorized(prompt_reason=prompt_reason))
                 return
             self._startup_auth_retries = 0
             self._startup_auth_retry_reason = ""
+        self._show_auth_page(prompt_reason=prompt_reason)
 
-        dlg = AuthDialog(self.tg, self)
-        dlg.login_success.connect(self._handle_login_success)
-        dlg.exec()
-        if not self.tg.is_authorized_sync() and self._pending_account_revert:
+    def _handle_login_success(self) -> None:
+        try:
+            current_session = str(self.tg.current_session_name() or "").strip()
+        except Exception:
+            current_session = ""
+        if current_session and current_session != str(getattr(self, "_rendered_session_name", "") or ""):
+            self._reset_state_after_account_change()
+            self._sync_account_card()
+        self._pending_account_revert = None
+        self._startup_auth_retries = 0
+        self._startup_auth_retry_reason = ""
+        self._show_main_page()
+        self._refresh_account_profile_async()
+        self.refresh_telegram_chats_async()
+
+    def _handle_auth_rejected(self) -> None:
+        self._startup_auth_retries = 0
+        self._startup_auth_retry_reason = ""
+        self._destroy_auth_dialog_widget()
+
+        pending_revert = self._pending_account_revert
+        if pending_revert:
             try:
                 if hasattr(self.tg, "cancel_pending_account_session"):
-                    self.tg.cancel_pending_account_session(self._pending_account_revert)
+                    self.tg.cancel_pending_account_session(pending_revert)
                 else:
-                    self.tg.switch_account(self._pending_account_revert)
+                    self.tg.switch_account(pending_revert)
             except Exception:
                 log.warning("Failed to revert to previous account", exc_info=True)
             finally:
@@ -7087,12 +8077,15 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 self._reset_state_after_account_change()
                 self._sync_account_card()
 
-    def _handle_login_success(self) -> None:
-        self._pending_account_revert = None
-        self._startup_auth_retries = 0
-        self._startup_auth_retry_reason = ""
-        self._refresh_account_profile_async()
-        self.refresh_telegram_chats_async()
+            if self.tg.is_authorized_sync():
+                self._show_main_page()
+                self._refresh_account_profile_async()
+                self.refresh_telegram_chats_async()
+            else:
+                self._show_auth_page(prompt_reason="switch")
+            return
+
+        self.close()
 
     def _refresh_account_profile_async(self) -> None:
         if not hasattr(self.tg, "refresh_active_account_profile"):
@@ -7152,6 +8145,10 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             self._refresh_account_profile_async()
 
     def _reset_state_after_account_change(self) -> None:
+        try:
+            self._rendered_session_name = str(self.tg.current_session_name() or "").strip()
+        except Exception:
+            self._rendered_session_name = ""
         self._history_save_pending = False
         timer = getattr(self, "_history_save_timer", None)
         if timer is not None:
@@ -7159,6 +8156,45 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 timer.stop()
             except Exception:
                 pass
+        try:
+            self._stop_history_worker(wait_ms=1500)
+        except Exception:
+            pass
+        dialog_workers = list(getattr(self, "_dialogs_workers", set()) or [])
+        for worker in dialog_workers:
+            if worker is not None and hasattr(worker, "stop"):
+                try:
+                    worker.stop()
+                except Exception:
+                    pass
+        dialog_threads = list(getattr(self, "_dialogs_threads", set()) or [])
+        for thread in dialog_threads:
+            try:
+                if thread is not None and _qt_is_valid(thread) and thread.isRunning():
+                    thread.quit()
+                    thread.wait(1200)
+            except Exception:
+                pass
+        self._dialogs_workers.clear()
+        self._dialogs_threads.clear()
+        self._dialogs_stream_active = False
+        ts_worker = getattr(self, "_ts_worker", None)
+        if ts_worker is not None and hasattr(ts_worker, "stop"):
+            try:
+                ts_worker.stop()
+            except Exception:
+                pass
+        ts_thread = getattr(self, "_ts_thread", None)
+        try:
+            if ts_thread is not None and _qt_is_valid(ts_thread) and ts_thread.isRunning():
+                ts_thread.quit()
+                ts_thread.wait(1000)
+        except Exception:
+            pass
+        self._ts_worker = None
+        self._ts_thread = None
+        self._loading_history = False
+        self._ts_warmup_done = False
         try:
             self._stop_active_media_playback()
         except Exception:
@@ -7178,7 +8214,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._chat_last_message_id.clear()
 
     def _open_account_manager(self) -> None:
+        dlg = getattr(self, "_account_manager_dialog", None)
+        if dlg is not None and _qt_is_valid(dlg):
+            try:
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+            return
+
         dlg = AccountManagerDialog(self.tg, self)
+        self._account_manager_dialog = dlg
+        dlg.finished.connect(lambda *_args: setattr(self, "_account_manager_dialog", None))
         dlg.account_switched.connect(self._handle_account_switched)
         dlg.account_add_requested.connect(self._handle_account_add_requested)
         dlg.account_deleted.connect(self._sync_account_card)
@@ -7247,6 +8294,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
             "install_voice_deps": self._install_voice_dependencies_from_settings,
             "refresh_all_avatars": self._refresh_all_avatars_from_settings,
             "scan_all_chats": self._scan_all_chats_from_settings,
+            "scan_selected_community": self._scan_selected_community_from_settings,
+            "export_selected_community_scan": self._export_selected_community_scan_from_settings,
             "send_bug_report": self._send_bug_report_from_settings,
         }
         if hasattr(self, "auto_ai_checkbox"):
@@ -7362,7 +8411,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._sync_settings_tool_state(str(key))
 
     def _tools_job_running(self) -> bool:
-        for attr_name in ("_bulk_avatar_thread", "_bulk_stats_thread"):
+        for attr_name in ("_bulk_avatar_thread", "_bulk_stats_thread", "_community_scan_thread"):
             thread = getattr(self, attr_name, None)
             if thread is None:
                 continue
@@ -7583,6 +8632,135 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         )
         self._set_settings_tools_busy(False)
 
+    def _scan_selected_community_from_settings(self, query: str, export_dir: str) -> tuple[bool, str]:
+        if self._tools_job_running():
+            msg = "Уже выполняется другая операция Tools."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        raw_query = str(query or "").strip()
+        if not raw_query:
+            msg = "Укажите ссылку или username сообщества."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        self._last_selected_scan_export_dir = str(export_dir or "").strip()
+        try:
+            thread = QThread(self)
+            thread.setObjectName("community_scan_thread")
+            worker = CommunityScanWorker(self.server, query=raw_query, max_related=32, max_depth=2)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_selected_scan_progress)
+            worker.finished.connect(self._on_selected_scan_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_community_scan_worker", None))
+            thread.finished.connect(lambda: setattr(self, "_community_scan_thread", None))
+            self._community_scan_worker = worker
+            self._community_scan_thread = thread
+            thread.start()
+        except Exception:
+            log.exception("Failed to start selected community scan")
+            self._community_scan_worker = None
+            self._community_scan_thread = None
+            msg = "Не удалось запустить выборочный скан сообщества."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        self._set_settings_tools_busy(True)
+        self._set_settings_tools_progress("Скан сообщества: подготовка…", 0, 1)
+        msg = f"Запущен скан сообщества: {raw_query}"
+        self._set_settings_tools_status(msg)
+        return True, msg
+
+    def _export_selected_community_scan_from_settings(self, query: str, export_dir: str) -> tuple[bool, str]:
+        raw_query = str(query or "").strip()
+        scan_key = str(getattr(self, "_last_selected_scan_key", "") or "").strip()
+        if not scan_key and raw_query:
+            try:
+                scan_key = str(self.server._slugify_scan_key(raw_query))
+            except Exception:
+                scan_key = ""
+        if not scan_key:
+            msg = "Сначала выполните скан сообщества."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        out_dir = str(export_dir or getattr(self, "_last_selected_scan_export_dir", "") or "").strip()
+        if not out_dir:
+            msg = "Укажите папку выгрузки."
+            self._set_settings_tools_status(msg)
+            return False, msg
+        try:
+            result = self.server.export_community_scan(scan_key, output_dir=out_dir)
+        except Exception:
+            log.exception("Failed to export selected community scan")
+            result = {"ok": False, "error": "Не удалось выгрузить скан сообщества."}
+        if not bool(result.get("ok")):
+            msg = str(result.get("error") or "Не удалось выгрузить скан сообщества.")
+            self._set_settings_tools_status(msg)
+            return False, msg
+        msg = f"Выгрузка сохранена: {result.get('html_path')}"
+        self._set_settings_tools_status(msg)
+        try:
+            QMessageBox.information(
+                self,
+                "Экспорт сообщества",
+                "Выгрузка завершена.\n"
+                + "\n".join(
+                    [
+                        str(result.get("html_path") or ""),
+                        str(result.get("css_path") or ""),
+                        str(result.get("sql_path") or ""),
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+        return True, msg
+
+    @Slot(int, int, str)
+    def _on_selected_scan_progress(self, done: int, total: int, text: str) -> None:
+        total_value = max(1, int(total or 1))
+        msg = str(text or "Скан сообщества…")
+        self._set_settings_tools_progress(msg, int(done or 0), total_value)
+        self._set_settings_tools_status(msg)
+
+    @Slot(dict)
+    def _on_selected_scan_finished(self, payload: Dict[str, Any]) -> None:
+        data = dict(payload or {})
+        ok = bool(data.get("ok"))
+        scan_key = str(data.get("scan_key") or "").strip()
+        if scan_key:
+            self._last_selected_scan_key = scan_key
+        self._persist_tool_state(
+            "scan_selected_community",
+            ok=ok,
+            message=str(data.get("error") or f"Чатов: {int((data.get('summary') or {}).get('total_chats') or 0)}, новых сообщений: {int((data.get('summary') or {}).get('new_messages') or 0)}"),
+            total=int((data.get("summary") or {}).get("total_chats") or 0),
+            done=int((data.get("summary") or {}).get("accessible_chats") or 0),
+            failed=0 if ok else 1,
+            stopped=False,
+        )
+        if ok:
+            total_chats = int((data.get("summary") or {}).get("total_chats") or 0)
+            accessible = int((data.get("summary") or {}).get("accessible_chats") or 0)
+            new_messages = int((data.get("summary") or {}).get("new_messages") or 0)
+            msg = f"Скан сообщества завершён: чатов {total_chats}, доступно {accessible}, новых сообщений {new_messages}"
+            self._set_settings_tools_progress(msg, max(1, accessible), max(1, total_chats))
+            self._set_settings_tools_status(msg)
+            try:
+                QMessageBox.information(
+                    self,
+                    "Скан сообщества завершён",
+                    msg + "\nТеперь можно выгрузить результат в указанную папку кнопкой «Выгрузить последний скан».",
+                )
+            except Exception:
+                pass
+        else:
+            msg = str(data.get("error") or "Скан сообщества завершился ошибкой.")
+            self._set_settings_tools_progress(msg, 0, 1)
+            self._set_settings_tools_status(msg)
+        self._set_settings_tools_busy(False)
+
     @staticmethod
     def _read_log_tail(path: str, *, max_lines: int = 260, max_chars: int = 40000) -> str:
         try:
@@ -7701,6 +8879,27 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
                 return bool(getattr(thread, "isRunning")())
             except Exception:
                 return False
+
+        def _drain_tracked_threads(threads: Iterable[object], wait_ms: int) -> None:
+            active_threads: List[QThread] = []
+            for thread in list(threads or []):
+                if not _thread_is_running(thread):
+                    continue
+                try:
+                    if hasattr(thread, "requestInterruption"):
+                        thread.requestInterruption()
+                except Exception:
+                    pass
+                try:
+                    thread.quit()
+                except Exception:
+                    pass
+                active_threads.append(thread)
+            for thread in active_threads:
+                try:
+                    thread.wait(max(0, int(wait_ms or 0)))
+                except Exception:
+                    pass
 
         for timer_name in (
             "_timer",
@@ -7875,6 +9074,14 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
         try:
             self.clear_feed()
+        except Exception:
+            pass
+        try:
+            _drain_tracked_threads(getattr(message_widgets_module, "_MESSAGE_WIDGET_THREADS", set()), wait_ms=2500)
+        except Exception:
+            pass
+        try:
+            _drain_tracked_threads(getattr(media_render_module, "_MEDIA_RENDER_THREADS", set()), wait_ms=2500)
         except Exception:
             pass
 

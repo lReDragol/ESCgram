@@ -25,6 +25,8 @@ def _log_exception(fn: Callable[..., Any], exc: BaseException) -> None:
     """Log exception with the fully qualified function name and re-raise."""
     if isinstance(exc, (asyncio.CancelledError, FuturesCancelledError)):
         return
+    if bool(getattr(exc, "__suppress_error_guard__", False)):
+        return
     try:
         qualifier = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
         module = getattr(fn, "__module__", None)

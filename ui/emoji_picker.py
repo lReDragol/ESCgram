@@ -144,7 +144,7 @@ class EmojiPickerPopup(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            "QFrame#emojiPicker{background-color:#0f1b27;border:1px solid rgba(255,255,255,0.08);"
+            "QFrame#emojiPicker{background-color:#0f0f10;border:1px solid rgba(255,255,255,0.08);"
             "border-radius:12px;padding:8px;}"
             "QToolButton{background:transparent;border:none;font-size:18px;padding:6px;}"
             "QToolButton:hover{background-color:rgba(255,255,255,0.08);border-radius:10px;}"

@@ -103,11 +103,11 @@ class MediaPickerPopup(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            "QFrame#mediaPicker{background-color:#0f1b27;border:1px solid rgba(255,255,255,0.08);"
+            "QFrame#mediaPicker{background-color:#0f0f10;border:1px solid rgba(255,255,255,0.08);"
             "border-radius:14px;padding:10px;}"
             "QTabWidget::pane{border:0;}"
             "QTabBar::tab{background:transparent;color:#bfc8d6;padding:6px 10px;margin-right:6px;}"
-            "QTabBar::tab:selected{color:#f4f7ff;background-color:rgba(255,255,255,0.06);border-radius:10px;}"
+            "QTabBar::tab:selected{color:#ffffff;background-color:rgba(255,255,255,0.06);border-radius:10px;}"
             "QToolButton{background:transparent;border:none;font-size:18px;padding:6px;}"
             "QToolButton:hover{background-color:rgba(255,255,255,0.08);border-radius:10px;}"
         )
@@ -257,7 +257,7 @@ class MediaPickerPopup(QFrame):
         row = 0
         if self._recent_emojis:
             recent_lbl = QLabel("Недавние")
-            recent_lbl.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
+            recent_lbl.setStyleSheet("color:#f1f1f1;font-weight:600;font-size:12px;")
             grid.addWidget(recent_lbl, row, 0, 1, cols)
             row += 1
             for idx, emoji in enumerate(self._recent_emojis):
@@ -276,7 +276,7 @@ class MediaPickerPopup(QFrame):
             if not rows:
                 continue
             label = QLabel(str(_EMOJI_SECTION_TITLES.get(section_key) or section_key))
-            label.setStyleSheet("color:#dfe7f5;font-weight:600;font-size:12px;")
+            label.setStyleSheet("color:#f1f1f1;font-weight:600;font-size:12px;")
             grid.addWidget(label, row, 0, 1, cols)
             row += 1
             for idx, emoji in enumerate(rows):

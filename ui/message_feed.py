@@ -45,6 +45,7 @@ class MessageFeedMixin:
     _message_widgets: Dict[int, ChatItemWidget]
     avatar_cache: AvatarCache
     _avatar_size: int
+    _message_order_max_size: int = 500   # cap for _message_order list
 
     def _build_feed(self) -> QWidget:
         layout = QVBoxLayout()
@@ -411,7 +412,7 @@ class MessageFeedMixin:
             elif role == "me":
                 avatar_kind = "user"
                 avatar_id = str(user_id or getattr(self, "_my_id", "me"))
-                avatar = self.avatar_cache.user(avatar_id, header or "Вы")
+                avatar = self.avatar_cache.user(avatar_id, header or "Вы", allow_fetch=False)
             elif user_id:
                 normalized_sender = str(user_id)
                 # sender_id can be a chat/channel id (negative) when messages are sent
@@ -420,16 +421,16 @@ class MessageFeedMixin:
                     avatar_kind = "chat"
                     avatar_id = normalized_sender
                     info = self.all_chats.get(avatar_id, {"title": header})
-                    avatar = self.avatar_cache.chat(avatar_id, info)
+                    avatar = self.avatar_cache.chat(avatar_id, info, allow_fetch=False)
                 else:
                     avatar_kind = "user"
                     avatar_id = normalized_sender
-                    avatar = self.avatar_cache.user(avatar_id, header)
+                    avatar = self.avatar_cache.user(avatar_id, header, allow_fetch=False)
             elif chat_id:
                 avatar_kind = "chat"
                 avatar_id = str(chat_id)
                 info = self.all_chats.get(avatar_id, {"title": header})
-                avatar = self.avatar_cache.chat(avatar_id, info)
+                avatar = self.avatar_cache.chat(avatar_id, info, allow_fetch=False)
             else:
                 avatar = self.avatar_cache.assistant()
 
@@ -484,6 +485,25 @@ class MessageFeedMixin:
         self._message_order.insert(insert_at, content)
         self.chat_history_layout.insertWidget(insert_at, wrap)
         setattr(content, "_row_wrap", wrap)
+
+        # Trim oldest widgets when the order list exceeds the cap
+        max_size = getattr(self, "_message_order_max_size", 500)
+        while len(self._message_order) > max_size:
+            oldest = self._message_order.pop(0)
+            # Also remove from _message_widgets if tracked
+            mid = getattr(oldest, "_message_id", None) or getattr(oldest, "msg_id", None)
+            if mid is not None:
+                self._message_widgets.pop(int(mid), None)
+            oldest_wrap = getattr(oldest, "_row_wrap", None)
+            target = oldest_wrap if oldest_wrap is not None else oldest
+            try:
+                self.chat_history_layout.removeWidget(target)
+            except Exception:
+                pass
+            try:
+                target.deleteLater()
+            except Exception:
+                pass
 
     def _is_private_dialog(self, chat_id: Optional[str]) -> bool:
         return self._dialog_type(chat_id) == "private"

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -27,13 +28,15 @@ class AuthDialog(QDialog):
     sig_qr_png = Signal(bytes)
     sig_qr_status = Signal(str)
     sig_qr_done = Signal(bool)
+    sig_session_import_done = Signal(bool, str, bool)
 
     PHONE_STEP_START = "start"
     PHONE_STEP_CODE = "code"
 
-    def __init__(self, tg_adapter, parent=None):
+    def __init__(self, tg_adapter, parent=None, *, embedded: bool = False):
         super().__init__(parent)
         self.tg = tg_adapter
+        self._embedded = bool(embedded)
         self.setWindowTitle("Вход в Telegram")
         icon_path = resolve_app_icon_path()
         if icon_path:
@@ -41,7 +44,11 @@ class AuthDialog(QDialog):
                 self.setWindowIcon(QIcon(icon_path))
             except Exception:
                 pass
-        self.setModal(True)
+        if self._embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setModal(False)
+        else:
+            self.setModal(True)
         self.resize(460, 540)
 
         self._phone_step = self.PHONE_STEP_START
@@ -51,6 +58,8 @@ class AuthDialog(QDialog):
         self._qr_thread_started = False
         self._qr_needs_secret = False
         self._qr_login_done = False
+        self._auth_watch_completed = False
+        self._session_import_running = False
 
         root = QVBoxLayout(self)
 
@@ -60,19 +69,57 @@ class AuthDialog(QDialog):
 
         self._build_phone_tab()
         self._build_qr_tab()
+        self._build_session_tab()
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.sig_qr_png.connect(self._on_qr_png)
-        self.sig_qr_status.connect(self._on_qr_status)
-        self.sig_qr_done.connect(self._on_qr_done)
+        self.sig_qr_png.connect(self._on_qr_png, Qt.ConnectionType.QueuedConnection)
+        self.sig_qr_status.connect(self._on_qr_status, Qt.ConnectionType.QueuedConnection)
+        self.sig_qr_done.connect(self._on_qr_done, Qt.ConnectionType.QueuedConnection)
+        self.sig_session_import_done.connect(self._on_session_import_done, Qt.ConnectionType.QueuedConnection)
 
         self._telegram_enabled = bool(getattr(self.tg, "_enabled", False))
         if not self._telegram_enabled:
             self._apply_disabled_auth_state()
+            self._auth_watch_timer = None
+        else:
+            self._auth_watch_timer = QTimer(self)
+            self._auth_watch_timer.setInterval(1200)
+            self._auth_watch_timer.timeout.connect(self._poll_existing_authorization)
+            self._auth_watch_timer.start()
+            QTimer.singleShot(0, self._poll_existing_authorization)
+
+    def _stop_auth_watch_timer(self) -> None:
+        timer = getattr(self, "_auth_watch_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+
+    def _poll_existing_authorization(self) -> None:
+        if not self._telegram_enabled or self._auth_watch_completed:
+            return
+        checker = getattr(self.tg, "is_authorized_sync", None)
+        if not callable(checker):
+            return
+        try:
+            try:
+                authorized = bool(checker(timeout=1.0))
+            except TypeError:
+                authorized = bool(checker())
+        except Exception:
+            return
+        if not authorized:
+            return
+        self._auth_watch_completed = True
+        self._stop_auth_watch_timer()
+        self.login_success.emit()
+        self.accept()
 
     def _build_phone_tab(self) -> None:
         tab = QWidget()
@@ -199,6 +246,41 @@ class AuthDialog(QDialog):
 
         self._qr_tab_index = self.tabs.addTab(tab, "По QR-коду")
 
+    def _build_session_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        lbl_hint = QLabel(
+            "Выберите `.session` файл Telethon или Pyrogram. "
+            "Приложение импортирует его и сразу переключится на этот аккаунт."
+        )
+        lbl_hint.setWordWrap(True)
+        layout.addWidget(lbl_hint)
+
+        file_row = QWidget()
+        file_row_layout = QHBoxLayout(file_row)
+        file_row_layout.setContentsMargins(0, 0, 0, 0)
+        file_row_layout.setSpacing(8)
+
+        self.ed_session_path = QLineEdit()
+        self.ed_session_path.setReadOnly(True)
+        self.ed_session_path.setPlaceholderText("Файл .session")
+        file_row_layout.addWidget(self.ed_session_path, 1)
+
+        self.btn_session_file = QPushButton("Выбрать .session")
+        self.btn_session_file.clicked.connect(self._choose_session_file)
+        file_row_layout.addWidget(self.btn_session_file)
+        layout.addWidget(file_row)
+
+        self.lbl_session_status = QLabel("")
+        self.lbl_session_status.setWordWrap(True)
+        layout.addWidget(self.lbl_session_status)
+        layout.addStretch(1)
+
+        self._session_tab_index = self.tabs.addTab(tab, "По .session")
+
     def _set_phone_step(self, step: str) -> None:
         self._phone_step = step
         is_start = step == self.PHONE_STEP_START
@@ -217,6 +299,33 @@ class AuthDialog(QDialog):
         text = str(exc or "").upper()
         return "PASSWORD_HASH_INVALID" in text or "PASSWORD" in text and "INVALID" in text
 
+    @staticmethod
+    def _is_invalid_phone_code(exc: Exception) -> bool:
+        text = str(exc or "").upper()
+        return "PHONE_CODE_INVALID" in text or "CODE_INVALID" in text
+
+    @staticmethod
+    def _is_expired_phone_code(exc: Exception) -> bool:
+        text = str(exc or "").upper()
+        return "PHONE_CODE_EXPIRED" in text or "CODE_EXPIRED" in text
+
+    @staticmethod
+    def _is_phone_code_hash_issue(exc: Exception) -> bool:
+        text = str(exc or "").upper()
+        return "PHONE_CODE_HASH_EMPTY" in text or "PHONE_CODE_HASH_INVALID" in text
+
+    def _current_password_hint_suffix(self) -> str:
+        getter = getattr(self.tg, "current_login_password_hint", None)
+        if not callable(getter):
+            return ""
+        try:
+            hint = str(getter() or "").strip()
+        except Exception:
+            hint = ""
+        if not hint:
+            return ""
+        return f" Подсказка Telegram: {hint}"
+
     def _apply_disabled_auth_state(self) -> None:
         hint = (
             "Telegram API не настроен: не найден telegram_api_id/telegram_api_hash.\n"
@@ -234,11 +343,13 @@ class AuthDialog(QDialog):
             self.ed_phone_code,
             self.ed_phone_code_password,
             self.ed_qr_secret,
+            self.ed_session_path,
             self.btn_phone_request_code,
             self.btn_phone_login,
             self.btn_qr_submit,
             self.btn_qr_restart,
             self.btn_qr_refresh,
+            self.btn_session_file,
         ):
             widget.setEnabled(False)
 
@@ -255,7 +366,15 @@ class AuthDialog(QDialog):
         try:
             self.tg.send_login_code_sync(phone)
             self._set_phone_step(self.PHONE_STEP_CODE)
-            self.lbl_phone_status.setText("Код отправлен. Введите код из Telegram/SMS.")
+            delivery_getter = getattr(self.tg, "current_login_delivery_hint", None)
+            try:
+                delivery_hint = str(delivery_getter() or "").strip() if callable(delivery_getter) else ""
+            except Exception:
+                delivery_hint = ""
+            if delivery_hint:
+                self.lbl_phone_status.setText(f"Код отправлен {delivery_hint}. Введите полученный код.")
+            else:
+                self.lbl_phone_status.setText("Код отправлен. Введите код из Telegram/SMS.")
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка", str(exc))
         finally:
@@ -283,15 +402,42 @@ class AuthDialog(QDialog):
                 return
             QMessageBox.critical(self, "Ошибка", "Не удалось выполнить вход.")
         except Exception as exc:
+            if self._is_invalid_phone_code(exc):
+                self.lbl_phone_status.setText("Неверный код. Запросите новый код и попробуйте снова.")
+                self.ed_phone_code.setFocus()
+                return
+            if self._is_expired_phone_code(exc):
+                self.lbl_phone_status.setText("Срок действия кода истёк. Запросите новый код.")
+                self._set_phone_step(self.PHONE_STEP_START)
+                self.ed_phone_code.clear()
+                self.ed_phone_code.setFocus()
+                return
+            if self._is_phone_code_hash_issue(exc):
+                self.lbl_phone_status.setText("Сессия подтверждения устарела. Запросите код ещё раз.")
+                self._set_phone_step(self.PHONE_STEP_START)
+                self.ed_phone_code.clear()
+                self.ed_phone_code.setFocus()
+                return
             if self._is_session_password_needed(exc):
-                self.lbl_phone_status.setText("Нужен пароль 2FA. Введите пароль и повторите вход.")
+                self._phone_cached_password = ""
+                self.ed_phone_password.clear()
+                self.lbl_phone_status.setText(
+                    "Telegram запросил пароль облачной 2FA для этого аккаунта."
+                    + self._current_password_hint_suffix()
+                )
                 self.lbl_phone_code_password.setVisible(True)
                 self.ed_phone_code_password.setVisible(True)
                 self.ed_phone_code_password.setFocus()
                 self.adjustSize()
                 return
             if self._is_invalid_password(exc):
-                self.lbl_phone_status.setText("Неверный пароль 2FA. Проверьте и попробуйте снова.")
+                self._phone_cached_password = ""
+                self.ed_phone_password.clear()
+                self.ed_phone_code_password.clear()
+                self.lbl_phone_status.setText(
+                    "Неверный пароль 2FA. Проверьте и попробуйте снова."
+                    + self._current_password_hint_suffix()
+                )
                 self.lbl_phone_code_password.setVisible(True)
                 self.ed_phone_code_password.setVisible(True)
                 self.ed_phone_code_password.setFocus()
@@ -315,7 +461,57 @@ class AuthDialog(QDialog):
         self.ed_phone_code_password.setVisible(False)
         self.lbl_phone_status.setText("")
 
+    def _choose_session_file(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Выберите session-файл",
+            "",
+            "Telegram sessions (*.session);;All files (*)",
+        )
+        if not path:
+            return
+        self.ed_session_path.setText(path)
+        self._import_session_file(path)
+
+    def _import_session_file(self, path: str) -> None:
+        importer = getattr(self.tg, "import_session_file_sync", None)
+        if not callable(importer):
+            QMessageBox.critical(self, "Ошибка", "Импорт session-файлов не поддерживается текущим адаптером.")
+            return
+        if self._session_import_running:
+            return
+
+        self._session_import_running = True
+        self.btn_session_file.setEnabled(False)
+        self.lbl_session_status.setText("Импортируем session-файл и проверяем авторизацию...")
+
+        def worker() -> None:
+            try:
+                result = importer(path)
+                if isinstance(result, dict) and bool(result.get("requires_login")):
+                    message = str(
+                        result.get("message")
+                        or "Сессия импортирована, но требует повторной авторизации по номеру."
+                    ).strip()
+                    self.sig_session_import_done.emit(False, message, True)
+                    return
+                title = ""
+                if isinstance(result, dict):
+                    title = str(
+                        result.get("title")
+                        or result.get("full_name")
+                        or result.get("username")
+                        or result.get("phone")
+                        or ""
+                    ).strip()
+                self.sig_session_import_done.emit(True, title, False)
+            except Exception as exc:
+                self.sig_session_import_done.emit(False, str(exc), False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def reject(self) -> None:  # type: ignore[override]
+        self._stop_auth_watch_timer()
         try:
             resetter = getattr(self.tg, "reset_phone_login_state", None)
             if callable(resetter):
@@ -323,6 +519,10 @@ class AuthDialog(QDialog):
         except Exception:
             pass
         super().reject()
+
+    def accept(self) -> None:  # type: ignore[override]
+        self._stop_auth_watch_timer()
+        super().accept()
 
     def _on_tab_changed(self, index: int) -> None:
         if not self._telegram_enabled:
@@ -418,3 +618,43 @@ class AuthDialog(QDialog):
             self.accept()
         elif not self._qr_needs_secret:
             self.lbl_qr_status.setText("QR вход не завершен. Нажмите «Обновить QR» и повторите.")
+
+    @Slot(bool, str, bool)
+    def _on_session_import_done(self, ok: bool, message: str, requires_login: bool) -> None:
+        self._session_import_running = False
+        self.btn_session_file.setEnabled(True)
+
+        if requires_login:
+            info = message or (
+                "Сессия импортирована, но требует повторного входа. "
+                "Введите номер телефона и код из Telegram."
+            )
+            self.lbl_session_status.setText(info)
+            self.lbl_phone_status.setText(info)
+            self.lbl_phone_step1_hint.setText(
+                "Импортированная сессия требует подтверждения. "
+                "Введите номер телефона, получите код в Telegram и завершите вход."
+            )
+            self._set_phone_step(self.PHONE_STEP_START)
+            self.tabs.setCurrentIndex(self._phone_tab_index)
+            self.ed_phone.setFocus()
+            return
+
+        if ok:
+            if self._auth_watch_completed:
+                return
+            self._auth_watch_completed = True
+            self._stop_auth_watch_timer()
+            self.lbl_session_status.setText(
+                f"Импорт выполнен{': ' + message if message else ''}."
+            )
+            self.login_success.emit()
+            self.accept()
+            return
+
+        self.lbl_session_status.setText(f"Импорт не выполнен: {message}")
+        QMessageBox.critical(
+            self,
+            "Ошибка импорта",
+            message or "Не удалось импортировать session-файл.",
+        )

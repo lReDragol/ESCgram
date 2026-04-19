@@ -58,6 +58,16 @@ _DEFAULT_TOOLS = {
         "last_stopped": False,
         "last_message": "",
     },
+    "scan_selected_community": {
+        "has_run": False,
+        "last_run_at": 0,
+        "last_ok": False,
+        "last_total": 0,
+        "last_done": 0,
+        "last_failed": 0,
+        "last_stopped": False,
+        "last_message": "",
+    },
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -72,7 +82,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "me": {
                 "bg": "#2b5278",
                 "border": "#3a71a1",
-                "text": "#f4f7ff",
+                "text": "#ffffff",
                 "link": "#59b7ff",
             },
             "assistant": {

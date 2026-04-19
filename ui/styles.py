@@ -6,11 +6,12 @@ import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
 from utils import app_paths
+from ui.qt_threading import single_shot_in_gui
 
 
 def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
@@ -338,7 +339,7 @@ class StyleManager(QObject):
             self._bindings_refresh_pending = False
             self._refresh_bindings()
 
-        QTimer.singleShot(0, _run)
+        single_shot_in_gui(0, _run)
 
     def _notify_subscribers(self) -> None:
         for callback in list(self._subscribers):

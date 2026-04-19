@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QVBoxLayout,
 )
+from ui.qt_threading import invoke_in_gui_thread
 
 
 class AccountManagerDialog(QDialog):
@@ -58,6 +59,7 @@ class AccountManagerDialog(QDialog):
     def _populate(self) -> None:
         self.list_widget.clear()
         accounts = self.tg.list_accounts() if hasattr(self.tg, "list_accounts") else []
+        active_item = None
         for account in accounts:
             session = account.get("session", "")
             title = account.get("title") or session
@@ -67,7 +69,12 @@ class AccountManagerDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole + 1, bool(account.get("is_active")))
             if account.get("is_active"):
                 item.setSelected(True)
+                active_item = item
             self.list_widget.addItem(item)
+        if active_item is not None:
+            self.list_widget.setCurrentItem(active_item)
+        elif self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
         self._update_buttons()
 
     def _selected_session(self) -> str:
@@ -87,7 +94,7 @@ class AccountManagerDialog(QDialog):
         active_needs_login = is_active and (not self._is_active_session_authorized())
         self.btn_use.setText("Войти" if active_needs_login else "Использовать")
         self.btn_use.setEnabled((not is_active) or active_needs_login)
-        self.btn_delete.setEnabled(not is_active)
+        self.btn_delete.setEnabled(True)
 
     def _is_active_session_authorized(self) -> bool:
         checker = getattr(self.tg, "is_authorized_sync", None)
@@ -105,8 +112,8 @@ class AccountManagerDialog(QDialog):
         return not bool(getattr(self.tg, "_auth_invalid", False))
 
     def _emit_add(self) -> None:
-        self.account_add_requested.emit()
         self.accept()
+        invoke_in_gui_thread(self.account_add_requested.emit)
 
     def _switch_selected(self) -> None:
         session = self._selected_session()
@@ -121,8 +128,8 @@ class AccountManagerDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "Аккаунты", str(exc))
             return
-        self.account_switched.emit()
         self.accept()
+        invoke_in_gui_thread(self.account_switched.emit)
 
     def _delete_selected(self) -> None:
         session = self._selected_session()
@@ -132,14 +139,15 @@ class AccountManagerDialog(QDialog):
 
         item = self.list_widget.currentItem()
         is_active = bool(item.data(Qt.ItemDataRole.UserRole + 1)) if item else False
-        if is_active:
-            QMessageBox.warning(self, "Аккаунты", "Нельзя удалить активный аккаунт. Сначала переключитесь на другой.")
-            return
 
         answer = QMessageBox.question(
             self,
             "Удалить аккаунт",
-            "Удалить выбранный аккаунт из менеджера и удалить его session-файлы?",
+            (
+                "Удалить активный аккаунт и выйти из него?"
+                if is_active
+                else "Удалить выбранный аккаунт из менеджера и удалить его session-файлы?"
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -153,6 +161,12 @@ class AccountManagerDialog(QDialog):
                 raise RuntimeError("Удаление аккаунта недоступно в этой сборке.")
         except Exception as exc:
             QMessageBox.critical(self, "Аккаунты", str(exc))
+            return
+
+        if is_active:
+            self.accept()
+            invoke_in_gui_thread(self.account_deleted.emit)
+            invoke_in_gui_thread(self.account_switched.emit)
             return
 
         self._populate()

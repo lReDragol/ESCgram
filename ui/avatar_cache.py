@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QPixmap
 
 from ui.components.avatar import make_avatar_pixmap
@@ -24,12 +24,14 @@ class _AvatarMeta:
     title: str
     initials: str
     background: QColor
+    size: int
 
 
-_AVATAR_RETRY_BACKOFF_SEC = 20.0
+_AVATAR_RETRY_BACKOFF_SEC = 12.0
+_AVATAR_CACHE_MAX_SIZE = 512
 
 
-class AvatarCache:
+class AvatarCache(QObject):
     """Resolve and cache avatar pixmaps without blocking the GUI thread."""
 
     def __init__(
@@ -38,8 +40,9 @@ class AvatarCache:
         size: int = 40,
         *,
         on_ready: Optional[Callable[[str, str], None]] = None,
-        max_workers: int = 2,
+        max_workers: int = 3,
     ) -> None:
+        super().__init__()
         self._server = server
         self._size = max(16, size)
         self._cache: Dict[str, QPixmap] = {}
@@ -51,15 +54,14 @@ class AvatarCache:
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="avatar-cache")
         self._signal = _DownloadSignal()
-        self._signal.ready.connect(self._on_download_ready)
+        self._signal.ready.connect(self._on_download_ready, Qt.ConnectionType.QueuedConnection)
 
     def shutdown(self) -> None:
         with self._lock:
             self._pending.clear()
         try:
-            self._executor.shutdown(wait=False, cancel_futures=True)  # type: ignore[call-arg]
+            self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # Python < 3.9 compatibility (cancel_futures unavailable)
             self._executor.shutdown(wait=False)
 
     def assistant(self) -> QPixmap:
@@ -73,19 +75,30 @@ class AvatarCache:
             )
         return self._cache[key]
 
-    def chat(self, chat_id: str, info: Dict[str, Any]) -> QPixmap:
+    def chat(
+        self,
+        chat_id: str,
+        info: Dict[str, Any],
+        *,
+        allow_fetch: bool = True,
+        size: Optional[int] = None,
+    ) -> QPixmap:
+        target_size = max(16, int(size or self._size))
         ctype = str(info.get("type") or "").strip().lower()
         photo_small = info.get("photo_small_id") or info.get("photo_small")
         if ctype in {"private", "user", "bot"}:
             title = str(info.get("title") or chat_id)
-            return self.user(str(chat_id), title, file_id=(str(photo_small) if photo_small else None))
+            return self.user(
+                str(chat_id),
+                title,
+                file_id=(str(photo_small) if photo_small else None),
+                allow_fetch=allow_fetch,
+                size=target_size,
+            )
         title = str(info.get("title") or chat_id)
-        cache_key = f"chat:{chat_id}:{photo_small or 'none'}"
+        cache_key = f"chat:{chat_id}:{photo_small or 'none'}:{target_size}"
         entity_key = f"chat:{chat_id}"
-        if photo_small:
-            path = self._paths.get(cache_key)
-        else:
-            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
         background = self._color(f"chat:{chat_id}")
         initials = self._initials(title)
 
@@ -93,18 +106,18 @@ class AvatarCache:
             pix = self._cache.get(cache_key)
             if pix:
                 return pix
-            pix = make_avatar_pixmap(self._size, path, initials, background=background)
+            pix = make_avatar_pixmap(target_size, path, initials, background=background)
             self._cache[cache_key] = pix
             return pix
 
         placeholder = self._cache.get(cache_key)
         if placeholder is None:
-            placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
+            placeholder = make_avatar_pixmap(target_size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
         can_retry = (time.time() - failed_at) >= _AVATAR_RETRY_BACKOFF_SEC
-        if can_retry:
+        if can_retry and allow_fetch:
             self._schedule_download(
                 cache_key=cache_key,
                 kind="chat",
@@ -112,39 +125,46 @@ class AvatarCache:
                 title=title,
                 initials=initials,
                 background=background,
+                size=target_size,
                 fetch_args={"chat_id": str(chat_id), "file_id": (str(photo_small) if photo_small else None)},
             )
 
         return placeholder
 
-    def user(self, user_id: str, header: str, *, file_id: Optional[str] = None) -> QPixmap:
+    def user(
+        self,
+        user_id: str,
+        header: str,
+        *,
+        file_id: Optional[str] = None,
+        allow_fetch: bool = True,
+        size: Optional[int] = None,
+    ) -> QPixmap:
+        target_size = max(16, int(size or self._size))
         normalized_id = user_id or "unknown"
         normalized_file_id = str(file_id or "").strip()
-        cache_key = f"user:{normalized_id}:{normalized_file_id or 'auto'}"
+        cache_key = f"user:{normalized_id}:{normalized_file_id or 'auto'}:{target_size}"
         entity_key = f"user:{normalized_id}"
-        background = self._color(cache_key)
+        background = self._color(f"user:{normalized_id}")
         initials = self._initials(header)
-        if normalized_file_id:
-            path = self._paths.get(cache_key)
-        else:
-            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
 
         if path:
             pix = self._cache.get(cache_key)
             if pix:
                 return pix
-            pix = make_avatar_pixmap(self._size, path, initials, background=background)
+            pix = make_avatar_pixmap(target_size, path, initials, background=background)
             self._cache[cache_key] = pix
             return pix
 
         placeholder = self._cache.get(cache_key)
         if placeholder is None:
-            placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
+            placeholder = make_avatar_pixmap(target_size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
         can_retry = (time.time() - failed_at) >= _AVATAR_RETRY_BACKOFF_SEC
-        if (cache_key not in self._paths or not path) and can_retry:
+        if (cache_key not in self._paths or not path) and can_retry and allow_fetch:
             self._schedule_download(
                 cache_key=cache_key,
                 kind="user",
@@ -152,10 +172,18 @@ class AvatarCache:
                 title=header,
                 initials=initials,
                 background=background,
+                size=target_size,
                 fetch_args={"user_id": normalized_id, "file_id": normalized_file_id or None},
             )
 
         return placeholder
+
+    def prefetch_chats(self, items: List[Dict[str, Any]]) -> None:
+        for info in items[:60]:
+            chat_id = str(info.get("id") or "")
+            if not chat_id:
+                continue
+            self.chat(chat_id, info, allow_fetch=True)
 
     def _schedule_download(
         self,
@@ -166,6 +194,7 @@ class AvatarCache:
         title: str,
         initials: str,
         background: QColor,
+        size: int,
         fetch_args: Dict[str, Any],
     ) -> None:
         with self._lock:
@@ -182,6 +211,7 @@ class AvatarCache:
                 title=title,
                 initials=initials,
                 background=background,
+                size=max(16, int(size or self._size)),
             )
 
         def _task() -> None:
@@ -222,7 +252,7 @@ class AvatarCache:
             return
 
         if normalized:
-            pix = make_avatar_pixmap(self._size, path, meta.initials, background=meta.background)
+            pix = make_avatar_pixmap(meta.size, path, meta.initials, background=meta.background)
             self._cache[cache_key] = pix
 
         if self._on_ready:
