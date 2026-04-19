@@ -24,6 +24,7 @@ class _AvatarMeta:
     title: str
     initials: str
     background: QColor
+    size: int
 
 
 _AVATAR_RETRY_BACKOFF_SEC = 12.0
@@ -74,7 +75,15 @@ class AvatarCache(QObject):
             )
         return self._cache[key]
 
-    def chat(self, chat_id: str, info: Dict[str, Any], *, allow_fetch: bool = True) -> QPixmap:
+    def chat(
+        self,
+        chat_id: str,
+        info: Dict[str, Any],
+        *,
+        allow_fetch: bool = True,
+        size: Optional[int] = None,
+    ) -> QPixmap:
+        target_size = max(16, int(size or self._size))
         ctype = str(info.get("type") or "").strip().lower()
         photo_small = info.get("photo_small_id") or info.get("photo_small")
         if ctype in {"private", "user", "bot"}:
@@ -84,14 +93,12 @@ class AvatarCache(QObject):
                 title,
                 file_id=(str(photo_small) if photo_small else None),
                 allow_fetch=allow_fetch,
+                size=target_size,
             )
         title = str(info.get("title") or chat_id)
-        cache_key = f"chat:{chat_id}:{photo_small or 'none'}"
+        cache_key = f"chat:{chat_id}:{photo_small or 'none'}:{target_size}"
         entity_key = f"chat:{chat_id}"
-        if photo_small:
-            path = self._paths.get(cache_key)
-        else:
-            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
         background = self._color(f"chat:{chat_id}")
         initials = self._initials(title)
 
@@ -99,13 +106,13 @@ class AvatarCache(QObject):
             pix = self._cache.get(cache_key)
             if pix:
                 return pix
-            pix = make_avatar_pixmap(self._size, path, initials, background=background)
+            pix = make_avatar_pixmap(target_size, path, initials, background=background)
             self._cache[cache_key] = pix
             return pix
 
         placeholder = self._cache.get(cache_key)
         if placeholder is None:
-            placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
+            placeholder = make_avatar_pixmap(target_size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
@@ -118,6 +125,7 @@ class AvatarCache(QObject):
                 title=title,
                 initials=initials,
                 background=background,
+                size=target_size,
                 fetch_args={"chat_id": str(chat_id), "file_id": (str(photo_small) if photo_small else None)},
             )
 
@@ -130,29 +138,28 @@ class AvatarCache(QObject):
         *,
         file_id: Optional[str] = None,
         allow_fetch: bool = True,
+        size: Optional[int] = None,
     ) -> QPixmap:
+        target_size = max(16, int(size or self._size))
         normalized_id = user_id or "unknown"
         normalized_file_id = str(file_id or "").strip()
-        cache_key = f"user:{normalized_id}:{normalized_file_id or 'auto'}"
+        cache_key = f"user:{normalized_id}:{normalized_file_id or 'auto'}:{target_size}"
         entity_key = f"user:{normalized_id}"
-        background = self._color(cache_key)
+        background = self._color(f"user:{normalized_id}")
         initials = self._initials(header)
-        if normalized_file_id:
-            path = self._paths.get(cache_key)
-        else:
-            path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
+        path = self._paths.get(cache_key) or self._entity_paths.get(entity_key)
 
         if path:
             pix = self._cache.get(cache_key)
             if pix:
                 return pix
-            pix = make_avatar_pixmap(self._size, path, initials, background=background)
+            pix = make_avatar_pixmap(target_size, path, initials, background=background)
             self._cache[cache_key] = pix
             return pix
 
         placeholder = self._cache.get(cache_key)
         if placeholder is None:
-            placeholder = make_avatar_pixmap(self._size, None, initials, background=background)
+            placeholder = make_avatar_pixmap(target_size, None, initials, background=background)
             self._cache[cache_key] = placeholder
 
         failed_at = float(self._failed_at.get(cache_key, 0.0) or 0.0)
@@ -165,6 +172,7 @@ class AvatarCache(QObject):
                 title=header,
                 initials=initials,
                 background=background,
+                size=target_size,
                 fetch_args={"user_id": normalized_id, "file_id": normalized_file_id or None},
             )
 
@@ -186,6 +194,7 @@ class AvatarCache(QObject):
         title: str,
         initials: str,
         background: QColor,
+        size: int,
         fetch_args: Dict[str, Any],
     ) -> None:
         with self._lock:
@@ -202,6 +211,7 @@ class AvatarCache(QObject):
                 title=title,
                 initials=initials,
                 background=background,
+                size=max(16, int(size or self._size)),
             )
 
         def _task() -> None:
@@ -242,7 +252,7 @@ class AvatarCache(QObject):
             return
 
         if normalized:
-            pix = make_avatar_pixmap(self._size, path, meta.initials, background=meta.background)
+            pix = make_avatar_pixmap(meta.size, path, meta.initials, background=meta.background)
             self._cache[cache_key] = pix
 
         if self._on_ready:

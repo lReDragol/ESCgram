@@ -53,13 +53,12 @@ def _tint_pixmap(source: QPixmap, color: QColor) -> QPixmap:
     return QPixmap.fromImage(image)
 
 
-def load_ayugram_pixmap(
-    name: str,
+def load_pixmap_from_path(
+    path: Path,
     *,
     tint: Optional[QColor | str] = None,
     size: Optional[int | QSize] = None,
 ) -> QPixmap:
-    path = ayugram_icon_path(name)
     pixmap = QPixmap(str(path)) if path.exists() else QPixmap()
     color = _to_color(tint)
     if color is not None and not pixmap.isNull():
@@ -78,6 +77,15 @@ def load_ayugram_pixmap(
     )
 
 
+def load_ayugram_pixmap(
+    name: str,
+    *,
+    tint: Optional[QColor | str] = None,
+    size: Optional[int | QSize] = None,
+) -> QPixmap:
+    return load_pixmap_from_path(ayugram_icon_path(name), tint=tint, size=size)
+
+
 def load_ayugram_icon(
     name: str,
     *,
@@ -85,6 +93,19 @@ def load_ayugram_icon(
     size: Optional[int | QSize] = None,
 ) -> QIcon:
     pixmap = load_ayugram_pixmap(name, tint=tint, size=size)
+    if pixmap.isNull():
+        return QIcon()
+    return QIcon(pixmap)
+
+
+def load_icon_from_dir(
+    directory: Path,
+    name: str,
+    *,
+    tint: Optional[QColor | str] = None,
+    size: Optional[int | QSize] = None,
+) -> QIcon:
+    pixmap = load_pixmap_from_path(Path(directory) / str(name or "").strip(), tint=tint, size=size)
     if pixmap.isNull():
         return QIcon()
     return QIcon(pixmap)

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.ayugram_assets import load_ayugram_icon
+from ui.ayugram_menu import AyuPopupMenu
 from ui.components.avatar import AvatarWidget
 
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".mpg", ".mpeg", ".flv", ".ts", ".m4v"}
@@ -1755,11 +1756,5 @@ class MessageStatisticsDialog(QDialog):
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
 
-def build_header_menu(parent: QWidget) -> QMenu:
-    menu = QMenu(parent)
-    menu.setStyleSheet(
-        "QMenu{background-color:#181819;color:#f1f1f1;border:1px solid rgba(255,255,255,0.08);padding:6px;}"
-        "QMenu::item{padding:7px 24px 7px 12px;border-radius:8px;}"
-        "QMenu::item:selected{background-color:rgba(255,255,255,0.08);}"
-    )
-    return menu
+def build_header_menu(parent: QWidget) -> AyuPopupMenu:
+    return AyuPopupMenu(parent)

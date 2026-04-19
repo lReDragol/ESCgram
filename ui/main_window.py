@@ -308,6 +308,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._reply_bar: Optional[QFrame] = None
         self._reply_preview_widget: Optional[ReplyPreviewWidget] = None
         self._chat_header: Optional[ChatHeaderBar] = None
+        self._chat_header_menu_popup: Optional[QWidget] = None
         self._chat_header_info_cache: Dict[str, Dict[str, Any]] = {}
         self._media_preview_bar: Optional[InlineMediaPreviewBar] = None
         self._bot_keyboard_bar: Optional[MessageReplyMarkupWidget] = None
@@ -351,7 +352,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self._media_busy_last_toast_at: float = 0.0
         self._media_active_tmpdir: Optional[str] = None
         self._local_media_seq: int = 0
-        self._input_min_height = 34
+        self._input_min_height = 48
         self._input_max_height = 260
         self._pending_reply_updates: set[int] = set()
         self._pending_local_deletes: set[int] = set()
@@ -1693,17 +1694,18 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
 
     def _build_bottom_row(self) -> QHBoxLayout:
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(12, 8, 12, 12)
+        bottom_row.setContentsMargins(12, 8, 12, 10)
         bottom_row.setSpacing(8)
 
         compose_shell = QFrame()
         compose_shell.setObjectName("chatComposeShell")
+        compose_shell.setMinimumHeight(48)
         compose_shell.setStyleSheet(
-            "QFrame#chatComposeShell{background-color:#17212b;border:1px solid rgba(255,255,255,0.05);border-radius:22px;}"
+            "QFrame#chatComposeShell{background-color:#17212b;border:1px solid rgba(255,255,255,0.05);border-radius:24px;}"
         )
         compose_layout = QHBoxLayout(compose_shell)
-        compose_layout.setContentsMargins(10, 4, 10, 4)
-        compose_layout.setSpacing(2)
+        compose_layout.setContentsMargins(0, 0, 0, 0)
+        compose_layout.setSpacing(0)
 
         self.btn_media = QToolButton()
         self.btn_media.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1716,8 +1718,8 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input.setMinimumHeight(self._input_min_height)
         self.user_input.setMaximumHeight(self._input_max_height)
         self.user_input.setStyleSheet(
-            "QTextEdit{background:transparent;border:none;color:#edf5ff;padding:6px 2px;"
-            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;font-size:14px;}"
+            "QTextEdit{background:transparent;border:none;color:#edf5ff;padding:11px 0 12px 0;"
+            "font-family:'Segoe UI Emoji','Noto Color Emoji','Apple Color Emoji','Segoe UI',sans-serif;font-size:18px;}"
         )
         self._default_input_placeholder = "Сообщение..."
         self.user_input.setPlaceholderText(self._default_input_placeholder)
@@ -1726,7 +1728,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.user_input.customContextMenuRequested.connect(self._show_input_context_menu)
         self.user_input.textChanged.connect(self._adjust_input_height)
         try:
-            self.user_input.document().setDocumentMargin(4.0)
+            self.user_input.document().setDocumentMargin(0.0)
         except Exception:
             pass
         compose_layout.addWidget(self.user_input, 1)
@@ -1745,7 +1747,7 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
         self.auto_ai_checkbox.stateChanged.connect(self.on_auto_ai_changed)
         self.auto_ai_checkbox.setStyleSheet(
             "QCheckBox{color:#7fa8d4;background-color:#17212b;border:1px solid rgba(255,255,255,0.05);"
-            "border-radius:16px;padding:8px 10px 8px 10px;font-size:11px;font-weight:700;spacing:0;}"
+            "border-radius:24px;padding:0 14px 0 14px;min-height:48px;font-size:12px;font-weight:700;spacing:0;}"
             "QCheckBox::indicator{width:0;height:0;}"
             "QCheckBox:hover{background-color:#1d2b39;}"
             "QCheckBox:checked{color:#ffffff;background-color:#2b5278;border-color:rgba(110,201,255,0.45);}"
@@ -1788,11 +1790,11 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _style_compose_embedded_button(self, button: QToolButton, *, icon_name: str) -> None:
         button.setAutoRaise(True)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.setFixedSize(38, 38)
-        button.setIcon(load_ayugram_icon(icon_name, tint="#8ea5bf", size=20))
-        button.setIconSize(QSize(20, 20))
+        button.setFixedSize(48, 48)
+        button.setIcon(load_ayugram_icon(icon_name, tint="#8ea5bf", size=22))
+        button.setIconSize(QSize(22, 22))
         button.setStyleSheet(
-            "QToolButton{border:none;background:transparent;border-radius:19px;padding:0;}"
+            "QToolButton{border:none;background:transparent;border-radius:24px;padding:0;}"
             "QToolButton:hover{background-color:rgba(122,184,255,0.12);}"
             "QToolButton:pressed{background-color:rgba(122,184,255,0.2);}"
         )
@@ -1809,18 +1811,22 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     ) -> None:
         bg = background or ("#58a8f6" if accent else "#1d2b39")
         hover = "#69b2fa" if accent else "#223244"
+        pressed = "#4f9ee8" if accent else "#1b2a3a"
         button.setToolTip(tooltip)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.setAutoRaise(True)
-        button.setFixedSize(42, 42)
-        button.setIcon(load_ayugram_icon(icon_name, tint=icon_tint, size=18))
-        button.setIconSize(QSize(18, 18))
+        button.setFixedSize(48, 48)
+        button.setIcon(load_ayugram_icon(icon_name, tint=icon_tint, size=20))
+        button.setIconSize(QSize(20, 20))
         button.setStyleSheet(
-            "QToolButton{border:none;border-radius:21px;padding:0;background-color:"
+            "QToolButton{border:none;border-radius:24px;padding:0;background-color:"
             + bg
             + ";}"
             "QToolButton:hover{background-color:"
             + hover
+            + ";}"
+            "QToolButton:pressed{background-color:"
+            + pressed
             + ";}"
         )
 
@@ -3115,23 +3121,45 @@ class ChatWindow(QWidget, ChatSidebarMixin, MessageFeedMixin):
     def _show_chat_header_menu(self, global_pos: QPoint) -> None:
         if not self.current_chat_id:
             return
-        menu = build_header_menu(self)
-        menu.addAction("Открыть профиль").triggered.connect(self._show_current_chat_info)
-        menu.addAction("Статистика чата").triggered.connect(self._show_current_chat_statistics)
-        menu.addAction("Анти-накрутка").triggered.connect(lambda: self._show_current_chat_statistics(scan=True))
-        menu.addSeparator()
-        menu.addAction("Выгрузить чат").triggered.connect(self._export_current_chat_history)
-        menu.addSeparator()
-        menu.addAction("Обновить историю").triggered.connect(lambda: self.load_chat_history_async(reset=True))
-        menu.addAction("Пометить прочитанным").triggered.connect(lambda: self._mark_current_chat_read(local=False))
-        menu.addAction("Покинуть чат").triggered.connect(self._leave_current_chat_from_profile)
-        try:
-            menu.exec(global_pos)
-        finally:
+        existing = getattr(self, "_chat_header_menu_popup", None)
+        if existing is not None:
             try:
-                menu.deleteLater()
+                existing.close()
             except Exception:
                 pass
+        menu = build_header_menu(self)
+        self._chat_header_menu_popup = menu
+        try:
+            menu.closed.connect(lambda: setattr(self, "_chat_header_menu_popup", None))
+        except Exception:
+            pass
+        menu.add_action("Открыть профиль", self._show_current_chat_info, icon_name="profile.png")
+        menu.add_action("Статистика чата", self._show_current_chat_statistics, icon_name="stats.png")
+        menu.add_action(
+            "Анти-накрутка",
+            lambda: self._show_current_chat_statistics(scan=True),
+            icon_name="warning.png",
+        )
+        menu.add_separator()
+        menu.add_action("Выгрузить чат", self._export_current_chat_history, icon_name="export.png")
+        menu.add_separator()
+        menu.add_action(
+            "Обновить историю",
+            lambda: self.load_chat_history_async(reset=True),
+            icon_name="refresh.png",
+        )
+        menu.add_action(
+            "Пометить прочитанным",
+            lambda: self._mark_current_chat_read(local=False),
+            icon_name="read.png",
+        )
+        menu.add_action(
+            "Покинуть чат",
+            self._leave_current_chat_from_profile,
+            icon_name="leave.png",
+            destructive=True,
+        )
+        menu.show_at(global_pos, align_right=True)
 
     def update_ai_controls_state(self) -> None:
         if not self.current_chat_id:

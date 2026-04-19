@@ -313,21 +313,22 @@ class ChatListRowWidget(QWidget):
         unread: int,
         time_text: str = "",
         pinned: bool = False,
-        avatar_size: int = 40,
+        avatar_size: int = 54,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._avatar_size = max(44, int(avatar_size or 40))
+        self._avatar_size = max(54, int(avatar_size or 54))
         self._avatar_cache_key: Optional[tuple] = None
         self._avatar_pixmap_key: Optional[int] = None
         self._title_text = str(title or "").strip()
         self._avatar_is_placeholder = True
         self._pin_pixmap = load_ayugram_pixmap("pin.png", tint="#7f9fc5", size=14)
+        self.setMinimumHeight(72)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(12, 8, 12, 8)
+        root.setContentsMargins(10, 9, 14, 9)
         root.setSpacing(12)
 
         self._avatar = AvatarWidget(size=self._avatar_size, parent=self)
@@ -340,10 +341,10 @@ class ChatListRowWidget(QWidget):
 
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(6)
+        top_row.setSpacing(4)
 
         self._title = QLabel(self._title_text, self)
-        self._title.setStyleSheet("font-size:14px; font-weight:700; color:#eff6ff; background:transparent;")
+        self._title.setStyleSheet("font-size:15px; font-weight:600; color:#eff6ff; background:transparent;")
         self._title.setWordWrap(False)
         top_row.addWidget(self._title, 1)
 
@@ -355,30 +356,30 @@ class ChatListRowWidget(QWidget):
         top_row.addWidget(self._pin_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._time = QLabel(str(time_text or "").strip(), self)
-        self._time.setStyleSheet("font-size:11px; color:#7f95b0; background:transparent;")
+        self._time.setStyleSheet("font-size:12px; color:#7f95b0; background:transparent;")
         self._time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._time.setMinimumWidth(46)
+        self._time.setMinimumWidth(48)
         top_row.addWidget(self._time, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
 
         text_col.addLayout(top_row)
 
         bottom_row = QHBoxLayout()
         bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.setSpacing(8)
+        bottom_row.setSpacing(6)
 
         self._preview = QLabel(str(preview or "").strip(), self)
-        self._preview.setStyleSheet("font-size:12px; color:#8ea5bf; background:transparent;")
+        self._preview.setStyleSheet("font-size:13px; color:#8ea5bf; background:transparent;")
         self._preview.setWordWrap(False)
         bottom_row.addWidget(self._preview, 1)
 
         root.addLayout(text_col, 1)
 
         self._badge = QLabel("", self)
-        self._badge.setMinimumWidth(22)
-        self._badge.setFixedHeight(22)
+        self._badge.setMinimumWidth(20)
+        self._badge.setFixedHeight(20)
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._badge.setStyleSheet(
-            "background-color:#58a8f6; color:#ffffff; border-radius:11px; padding:1px 8px; font-size:11px; font-weight:700;"
+            "background-color:#58a8f6; color:#ffffff; border-radius:10px; padding:0 7px; font-size:11px; font-weight:700;"
         )
         bottom_row.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         text_col.addLayout(bottom_row)
@@ -495,6 +496,8 @@ class ChatSidebarMixin:
     avatar_cache: Any                # опционально: .chat(chat_id, info) -> QPixmap
     auto_ai_checkbox: Optional[Any]  # опционально: QCheckBox
     _avatar_size: int = 44           # дефолт на случай, если хост не задаёт
+    _sidebar_dialog_avatar_size: int = 54
+    _sidebar_dialog_row_height: int = 72
 
     # слоты, которые обычно реализует хост; заглушки убирают ворнинги инспектора
     def on_chat_list_clicked(self, item: QListWidgetItem) -> None:
@@ -651,10 +654,10 @@ class ChatSidebarMixin:
         self.chat_list.setUniformItemSizes(False)
         self.chat_list.setAlternatingRowColors(False)
         self.chat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.chat_list.setIconSize(QSize(self._avatar_size, self._avatar_size))
+        self.chat_list.setIconSize(QSize(self._sidebar_dialog_avatar_size, self._sidebar_dialog_avatar_size))
         self.chat_list.setSpacing(0)
         self.chat_list.setMinimumWidth(328)
-        row_h = max(72, self._avatar_size + 18)
+        row_h = int(getattr(self, "_sidebar_dialog_row_height", 72) or 72)
         self.chat_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.chat_list.setStyleSheet(
             "QListWidget{font-size:13px;background-color:#17212b;border:1px solid rgba(255,255,255,0.05);"
@@ -1175,7 +1178,7 @@ class ChatSidebarMixin:
                         break
 
             current_item: Optional[QListWidgetItem] = None
-            row_h = max(32, self._avatar_size + 8)  # высота строки ≈ аватар + небольшой отступ
+            row_h = int(getattr(self, "_sidebar_dialog_row_height", 72) or 72)
             if can_update_in_place:
                 for idx, row in enumerate(visible_rows):
                     cid = str(row["id"])
@@ -1219,14 +1222,14 @@ class ChatSidebarMixin:
                     item = QListWidgetItem("")
                     item.setData(Qt.ItemDataRole.UserRole, cid)
                     item.setData(Qt.ItemDataRole.UserRole + 1, info)
-                    item.setSizeHint(QSize(320, max(row_h, self._avatar_size + 22)))
+                    item.setSizeHint(QSize(320, row_h))
                     row_widget = ChatListRowWidget(
                         title=title,
                         preview=preview,
                         unread=unread,
                         time_text=time_text,
                         pinned=pinned,
-                        avatar_size=max(self._avatar_size, 52),
+                        avatar_size=self._sidebar_dialog_avatar_size,
                         parent=self.chat_list,
                     )
                     pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
@@ -1298,8 +1301,14 @@ class ChatSidebarMixin:
             return None, None
         try:
             photo_id = str(info.get("photo_small_id") or info.get("photo_small") or "")
-            avatar_key = ("chat", str(chat_id), photo_id, int(self._avatar_size))
-            pixmap = self.avatar_cache.chat(str(chat_id), info, allow_fetch=allow_fetch)  # type: ignore[attr-defined]
+            target_size = int(getattr(self, "_sidebar_dialog_avatar_size", 54) or 54)
+            avatar_key = ("chat", str(chat_id), photo_id, target_size)
+            pixmap = self.avatar_cache.chat(  # type: ignore[attr-defined]
+                str(chat_id),
+                info,
+                allow_fetch=allow_fetch,
+                size=target_size,
+            )
             return pixmap, avatar_key
         except Exception:
             return None, None
@@ -1383,7 +1392,7 @@ class ChatSidebarMixin:
     ) -> None:
         rows = list(getattr(self, "_chat_list_override_rows", []) or [])
         mode = str(getattr(self, "_chat_list_override_mode", "") or "")
-        row_h = max(32, self._avatar_size + 8)
+        row_h = int(getattr(self, "_sidebar_dialog_row_height", 72) or 72)
         visible_rows: List[Dict[str, object]] = []
         signature_rows: List[tuple] = []
         for row in rows:
@@ -1451,14 +1460,14 @@ class ChatSidebarMixin:
             item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, cid)
             item.setData(Qt.ItemDataRole.UserRole + 1, info)
-            item.setSizeHint(QSize(320, max(row_h, self._avatar_size + 22)))
+            item.setSizeHint(QSize(320, row_h))
             row_widget = ChatListRowWidget(
                 title=title,
                 preview=preview,
                 unread=unread,
                 time_text=time_text,
                 pinned=pinned,
-                avatar_size=max(self._avatar_size, 52),
+                avatar_size=self._sidebar_dialog_avatar_size,
                 parent=self.chat_list,
             )
             pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
