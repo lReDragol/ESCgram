@@ -245,7 +245,16 @@ def gen_message_id(chat_history: List[Dict[str, Any]]) -> int:
     """Generate a new sequential message_id given an existing chat history."""
     if not chat_history:
         return 1
-    return max(msg["message_id"] for msg in chat_history if "message_id" in msg) + 1
+    max_id = 0
+    for msg in chat_history:
+        raw_id = None
+        if isinstance(msg, dict):
+            raw_id = msg.get("message_id", msg.get("id"))
+        try:
+            max_id = max(max_id, int(raw_id))
+        except Exception:
+            continue
+    return max_id + 1 if max_id > 0 else 1
 
 # ---------------------------- Chat storage ----------------------------------
 
@@ -269,26 +278,50 @@ class AIChat:
         self.history_file = str(app_paths.chats_dir() / str(chat_id) / "history.json")
         self.load_history()
 
-    def load_history(self) -> None:
-        """Читает историю безопасно: пустые/битые файлы — в .bak и начинаем с пустого списка."""
-        self.history = []
-        if self._storage:
-            try:
-                self.history = self._storage.get_ai_history(self.chat_id, limit=self.MAX_HISTORY_LENGTH)
-                self.log.debug("Loaded history entries=%d", len(self.history))
-                return
-            except Exception:
-                self.log.exception("Failed to load AI history from storage")
-                self.history = []
-                return
+    @staticmethod
+    def _normalize_history_entry(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            message_id = int(raw.get("message_id", raw.get("id")))
+        except Exception:
+            return None
+        reply_to = raw.get("reply_to")
+        try:
+            reply_to = int(reply_to) if reply_to is not None else None
+        except Exception:
+            reply_to = None
+        return {
+            "message_id": message_id,
+            "timestamp": str(raw.get("timestamp") or ""),
+            "role": str(raw.get("role") or "user"),
+            "content": str(raw.get("content") or raw.get("message") or ""),
+            "reply_to": reply_to,
+            "is_edited": bool(raw.get("is_edited")),
+            "is_deleted": bool(raw.get("is_deleted")),
+        }
+
+    def _normalize_history_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in list(rows or []):
+            normalized = self._normalize_history_entry(row)
+            if normalized is not None:
+                out.append(normalized)
+        return out[-self.MAX_HISTORY_LENGTH:]
+
+    def _load_history_from_file(self) -> List[Dict[str, Any]]:
         if not os.path.isfile(self.history_file):
-            return
+            return []
         try:
             if os.path.getsize(self.history_file) == 0:
                 raise ValueError("empty history.json")
             with open(self.history_file, "r", encoding="utf-8") as fh:
-                self.history = json.load(fh)
-            self.log.debug("Loaded history entries=%d", len(self.history))
+                raw_history = json.load(fh)
+            if not isinstance(raw_history, list):
+                raise ValueError("history.json must contain a list")
+            history = self._normalize_history_rows(raw_history)
+            self.log.debug("Loaded legacy history entries=%d", len(history))
+            return history
         except Exception as e:
             try:
                 bak = self.history_file + ".bak"
@@ -296,7 +329,30 @@ class AIChat:
                 self.log.error("Failed to load history.json (%s). Moved to %s; starting fresh", e, bak)
             except Exception:
                 self.log.exception("Failed to load history.json and to backup it")
-            self.history = []
+        return []
+
+    def load_history(self) -> None:
+        """Читает историю безопасно: пустые/битые файлы — в .bak и начинаем с пустого списка."""
+        self.history = []
+        if self._storage:
+            try:
+                stored_history = self._storage.get_ai_history(self.chat_id, limit=self.MAX_HISTORY_LENGTH)
+                self.history = self._normalize_history_rows(stored_history)
+                self.log.debug("Loaded history entries=%d", len(self.history))
+                if self.history:
+                    return
+            except Exception:
+                self.log.exception("Failed to load AI history from storage")
+                self.history = []
+            legacy_history = self._load_history_from_file()
+            if legacy_history:
+                self.history = legacy_history
+                try:
+                    self._storage.append_ai_messages(self.chat_id, self.history, limit=self.MAX_HISTORY_LENGTH)
+                except Exception:
+                    self.log.exception("Failed to migrate legacy AI history into storage")
+            return
+        self.history = self._load_history_from_file()
 
     def save_history(self) -> None:
         """Атомарная запись: пишем во временный файл и заменяем."""
@@ -304,9 +360,9 @@ class AIChat:
         if self._storage:
             try:
                 self._storage.append_ai_messages(self.chat_id, data, limit=self.MAX_HISTORY_LENGTH)
+                return
             except Exception:
                 self.log.exception("Failed to persist history")
-            return
         dir_ = os.path.dirname(self.history_file)
         os.makedirs(dir_, exist_ok=True)
         tmp = None

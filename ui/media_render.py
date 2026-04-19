@@ -59,6 +59,16 @@ def _media_volume_ratio(default: float = 1.0) -> float:
         return max(0.0, min(1.0, float(default)))
 
 
+def _can_generate_local_video_preview(path: str) -> bool:
+    candidate = str(path or "").strip()
+    if not candidate or not os.path.isfile(candidate):
+        return False
+    suffix = os.path.splitext(candidate)[1].lower()
+    if suffix in {"", ".temp", ".part", ".partial"}:
+        return False
+    return True
+
+
 # FIX: ограничитель параллельных превью-игроков
 class _ThumbLimiter:
     active: int = 0
@@ -545,9 +555,10 @@ class MediaRenderingMixin:
 
         if self.file_path and os.path.isfile(self.file_path):
             self.preview.setText("Готово: нажмите, чтобы открыть" if not circular else "Готово: нажмите по центру")
-            # Планируем генерацию превью после отрисовки виджета, чтобы не блокировать UI на создании элемента.
-            delay_ms = 220 if bool(getattr(self, "_loading_history", False)) else 0
-            QTimer.singleShot(delay_ms, lambda c=circular: self._spawn_local_video_thumb(circular=c))
+            if _can_generate_local_video_preview(self.file_path):
+                # Планируем генерацию превью после отрисовки виджета, чтобы не блокировать UI на создании элемента.
+                delay_ms = 220 if bool(getattr(self, "_loading_history", False)) else 0
+                QTimer.singleShot(delay_ms, lambda c=circular: self._spawn_local_video_thumb(circular=c))
         else:
             self.preview.setText("Медиа не загружено")
 
@@ -812,6 +823,8 @@ class MediaRenderingMixin:
         if not path or not os.path.isfile(path) or not self.preview:
             return
         pix = QPixmap(path)
+        if pix.isNull():
+            return
         if circular:
             size = self.VIDEO_NOTE_SIZE
             pm = pix.scaled(size, size,
@@ -825,7 +838,7 @@ class MediaRenderingMixin:
 
     # FIX: лёгкий одноразовый генератор превью с ограничением конкурентности
     def _spawn_local_video_thumb(self, *, circular: bool) -> None:
-        if not (self.file_path and os.path.isfile(self.file_path) and HAVE_QTMULTIMEDIA):
+        if not (self.file_path and _can_generate_local_video_preview(self.file_path) and HAVE_QTMULTIMEDIA):
             return
         if self._thumb_finished:
             return
