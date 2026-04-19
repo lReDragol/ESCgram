@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Iterable
 from utils import app_paths
 
 from PySide6.QtCore import (
-    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl,
+    Qt, Slot, QThread, QTimer, QPoint, QRect, QEvent, QUrl, QSize,
     QEasingCurve, QPropertyAnimation, QSequentialAnimationGroup, Property, QStandardPaths
 )
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QMouseEvent, QWheelEvent, QPixmap, QRegion, QTextCursor, QKeySequence, QShortcut, QPainter, QLinearGradient
