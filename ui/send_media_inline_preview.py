@@ -358,7 +358,7 @@ class InlineMediaPreviewBar(QFrame):
             title_lbl = QLabel(name or "Голосовое сообщение", card)
             title_lbl.setStyleSheet("color:#eef7ff;font-size:13px;font-weight:700;")
             subtitle_lbl = QLabel("Проверьте звучание и длительность перед отправкой", card)
-            subtitle_lbl.setStyleSheet("color:#8da8c4;font-size:11px;")
+            subtitle_lbl.setStyleSheet("color:#868686;font-size:11px;")
             wave = _VoicePreviewWaveform(card)
             wave.set_seed(name or self.file_path)
             self._voice_wave = wave

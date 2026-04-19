@@ -1,12 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import concurrent.futures
 import math
 import os
+import shutil
+import subprocess
+import threading
 import time
 from typing import Any, Callable, Optional, cast
 
 from PySide6.QtCore import (
-    Qt, QSize, QUrl, QThread, QPointF, QRectF, Signal, QObject, QEvent, QTimer
+    Qt, QSize, QUrl, QThread, QPointF, QRectF, Signal, Slot, QObject, QEvent, QTimer
 )
 from PySide6.QtGui import (
     QMovie, QPixmap, QRegion, QPainter, QPen, QColor, QMouseEvent, QPaintEvent, QImage, QPainterPath
@@ -14,6 +18,19 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget, QHBoxLayout, QSlider
 
 from ui.common import HAVE_QTMULTIMEDIA, log, MediaPlaybackCoordinator
+from utils import app_paths
+
+
+def _resolve_ffmpeg_binary() -> Optional[str]:
+    """Locate the ffmpeg binary (bundled or system)."""
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    try:
+        local = app_paths.telegram_workdir() / "ffmpeg" / "bin" / exe
+        if local.is_file():
+            return str(local)
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
 
 if HAVE_QTMULTIMEDIA:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QVideoFrame
@@ -71,9 +88,68 @@ def _can_generate_local_video_preview(path: str) -> bool:
 
 # FIX: ограничитель параллельных превью-игроков
 class _ThumbLimiter:
+    _lock = threading.Lock()
     active: int = 0
     max_active: int = 2      # не более двух параллельно
     backoff_ms: int = 180    # повтор через 180 мс
+
+    @classmethod
+    def acquire(cls) -> bool:
+        """Try to acquire a slot.  Returns True on success, False if at capacity."""
+        with cls._lock:
+            if cls.active >= cls.max_active:
+                return False
+            cls.active += 1
+            return True
+
+    @classmethod
+    def release(cls) -> None:
+        """Release a previously acquired slot."""
+        with cls._lock:
+            cls.active = max(0, cls.active - 1)
+
+
+# ---------------------------------------------------------------------------
+# Video thumbnail extraction via ffmpeg — lighter than QMediaPlayer
+# ---------------------------------------------------------------------------
+class _VideoThumbBus(QObject):
+    """Signal bus for ffmpeg-based video thumbnail results."""
+    done = Signal(int, str, str)  # (widget_id, video_path, thumb_path or "")
+
+
+_video_thumb_bus = _VideoThumbBus()
+_video_thumb_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="video_thumb"
+)
+
+
+def _video_thumb_submit(widget_id: int, video_path: str, thumb_path: str) -> None:
+    """Extract a single frame from *video_path* via ffmpeg and save to *thumb_path*."""
+    ffmpeg = _resolve_ffmpeg_binary()
+    if not ffmpeg:
+        _video_thumb_bus.done.emit(widget_id, video_path, "")
+        return
+
+    def _run() -> None:
+        try:
+            cmd = [
+                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-y", "-i", video_path, "-vframes", "1",
+                "-f", "image2", thumb_path,
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True, timeout=8.0)
+            if not (os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0):
+                raise RuntimeError("No frame extracted")
+            _video_thumb_bus.done.emit(widget_id, video_path, thumb_path)
+        except Exception:
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
+            _video_thumb_bus.done.emit(widget_id, video_path, "")
+
+    _video_thumb_pool.submit(_run)
 
 
 class _ClickLabel(QLabel):
@@ -836,8 +912,49 @@ class MediaRenderingMixin:
             return
         self._apply_pix_to_label(self.preview, pix)
 
-    # FIX: лёгкий одноразовый генератор превью с ограничением конкурентности
+    # Video thumbnail via ffmpeg — much lighter than creating a QMediaPlayer per video
     def _spawn_local_video_thumb(self, *, circular: bool) -> None:
+        if not (self.file_path and _can_generate_local_video_preview(self.file_path)):
+            return
+        if self._thumb_finished:
+            return
+        if self.thumb_path and os.path.isfile(self.thumb_path):
+            self._thumb_finished = True
+            self._apply_preview_pix(self.thumb_path, circular=circular)
+            return
+        if self._thumb_started:
+            return
+        self._thumb_started = True
+        self._thumb_circular = circular
+
+        dst = self.file_path + ".thumb.jpg"
+        self.thumb_path = dst
+
+        # Connect the bus signal to our handler (once per widget)
+        if not getattr(self, "_video_thumb_bus_connected", False):
+            _video_thumb_bus.done.connect(self._on_ffmpeg_thumb_done)
+            self._video_thumb_bus_connected = True
+
+        _video_thumb_submit(id(self), self.file_path, dst)
+
+    @Slot(int, str, str)
+    def _on_ffmpeg_thumb_done(self, widget_id: int, video_path: str, thumb_path: str) -> None:
+        """Handle ffmpeg-based thumbnail result."""
+        if widget_id != id(self):
+            return  # not our result
+        if thumb_path and os.path.isfile(thumb_path):
+            self._thumb_finished = True
+            self._apply_preview_pix(thumb_path, circular=getattr(self, "_thumb_circular", False))
+        else:
+            # Fallback: try QMediaPlayer if available
+            if HAVE_QTMULTIMEDIA:
+                self._thumb_started = False  # allow retry
+                self._spawn_local_video_thumb_qmp(circular=getattr(self, "_thumb_circular", False))
+            else:
+                self._thumb_finished = True  # give up
+
+    # Legacy QMediaPlayer fallback (kept for codecs ffmpeg can't handle)
+    def _spawn_local_video_thumb_qmp(self, *, circular: bool) -> None:
         if not (self.file_path and _can_generate_local_video_preview(self.file_path) and HAVE_QTMULTIMEDIA):
             return
         if self._thumb_finished:
@@ -849,19 +966,16 @@ class MediaRenderingMixin:
         if self._thumb_started:
             return
         # глобальный лимит
-        if _ThumbLimiter.active >= _ThumbLimiter.max_active:
-            QTimer.singleShot(_ThumbLimiter.backoff_ms, lambda: self._spawn_local_video_thumb(circular=circular))
+        if not _ThumbLimiter.acquire():
+            QTimer.singleShot(_ThumbLimiter.backoff_ms, lambda: self._spawn_local_video_thumb_qmp(circular=circular))
             return
 
         # старт
         self._thumb_started = True
-        _ThumbLimiter.active += 1
 
         try:
-            # без аудио: только QVideoSink (получаем кадр)  :contentReference[oaicite:5]{index=5}
             self._thumb_player = QMediaPlayer(cast(QWidget, self))
             self._thumb_sink = QVideoSink(cast(QWidget, self))
-            # ВАЖНО: не подключаем QAudioOutput — декодер тише и легче
             self._thumb_player.setVideoOutput(self._thumb_sink)
             cast(Any, self._thumb_player.errorOccurred).connect(self._on_thumb_error)
             cast(Any, self._thumb_player.mediaStatusChanged).connect(self._on_thumb_status)
@@ -882,20 +996,16 @@ class MediaRenderingMixin:
                 except Exception:
                     pass
                 handled["done"] = True
-                # сохраняем рядом
                 dst = self.file_path + ".thumb.jpg"
                 img.save(dst, "JPG", 80)
                 self.thumb_path = dst
                 self._thumb_finished = True
                 self._apply_preview_pix(dst, circular=circular)
 
-                # мягкая остановка и очистка
                 try:
                     self._thumb_player.stop()
                 except Exception:
                     pass
-                # Не вызываем disconnect() — PySide может ругаться в лог,
-                # удаление объекта корректно отцепляет слоты  :contentReference[oaicite:6]{index=6}
                 for obj in (self._thumb_player, self._thumb_sink):
                     try:
                         obj.deleteLater()
@@ -903,14 +1013,12 @@ class MediaRenderingMixin:
                         pass
                 self._thumb_player = None
                 self._thumb_sink = None
-                _ThumbLimiter.active = max(0, _ThumbLimiter.active - 1)
+                _ThumbLimiter.release()
 
-            # подключаем обработчик кадра
             cast(Any, self._thumb_sink.videoFrameChanged).connect(_on_frame)
             self._thumb_player.setSource(QUrl.fromLocalFile(self.file_path))
             self._thumb_player.play()
 
-            # страховка: если за 2 секунды кадр так и не пришёл — отменяем
             def _abort_if_needed() -> None:
                 if not self._thumb_finished:
                     try:
@@ -925,12 +1033,11 @@ class MediaRenderingMixin:
                             pass
                     self._thumb_player = None
                     self._thumb_sink = None
-                    _ThumbLimiter.active = max(0, _ThumbLimiter.active - 1)
+                    _ThumbLimiter.release()
             QTimer.singleShot(2000, _abort_if_needed)
 
         except Exception:
-            # аварийная развязка лимитера
-            _ThumbLimiter.active = max(0, _ThumbLimiter.active - 1)
+            _ThumbLimiter.release()
 
     def _show_animation(self, path: str) -> None:
         if not self.lbl_anim:

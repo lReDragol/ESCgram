@@ -3,6 +3,7 @@
 import os
 import logging
 import re
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QGridLayout,
@@ -42,6 +44,7 @@ except Exception:  # pragma: no cover
         return obj is not None
 
 from ui.styles import StyleManager
+from ui.qt_threading import single_shot_in_gui
 
 log = logging.getLogger("settings_window")
 
@@ -493,6 +496,56 @@ class SettingsWindow(QDialog):
         )
         layout.addWidget(self.btn_scan_all, 0, Qt.AlignmentFlag.AlignLeft)
 
+        selective_box = QGroupBox("Выборочный сканер сообществ")
+        selective_layout = QVBoxLayout(selective_box)
+        selective_layout.setContentsMargins(12, 12, 12, 12)
+        selective_layout.setSpacing(8)
+
+        selective_hint = QLabel(
+            "Вставьте ссылку вида t.me/... или username. Сканер найдёт связанные чаты/каналы,"
+            " временно войдёт в доступные узлы, соберёт аналитику, затем выйдет из временных входов."
+        )
+        selective_hint.setWordWrap(True)
+        selective_layout.addWidget(selective_hint)
+
+        selective_form = QFormLayout()
+        self.tools_selective_query = QLineEdit()
+        self.tools_selective_query.setPlaceholderText("Например: t.me/strbypass или strbypass")
+        selective_form.addRow("Ссылка / username:", self.tools_selective_query)
+
+        export_row = QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.setSpacing(6)
+        self.tools_selective_export_dir = QLineEdit()
+        self.tools_selective_export_dir.setPlaceholderText("Папка для HTML/CSS/SQL")
+        self.tools_selective_export_dir.setText(str(Path.home() / "Downloads" / "test"))
+        export_row.addWidget(self.tools_selective_export_dir, 1)
+        self.btn_tools_export_browse = QPushButton("Обзор")
+        self.btn_tools_export_browse.clicked.connect(self._browse_tools_export_dir)
+        export_row.addWidget(self.btn_tools_export_browse, 0)
+        export_wrap = QWidget()
+        export_wrap.setLayout(export_row)
+        selective_form.addRow("Папка выгрузки:", export_wrap)
+        selective_layout.addLayout(selective_form)
+
+        selective_actions = QHBoxLayout()
+        selective_actions.setContentsMargins(0, 0, 0, 0)
+        selective_actions.setSpacing(6)
+        self.btn_scan_selected = QPushButton("Сканировать сообщество")
+        self.btn_scan_selected.clicked.connect(self._run_selected_scan)
+        selective_actions.addWidget(self.btn_scan_selected, 0)
+        self.btn_export_selected_scan = QPushButton("Выгрузить последний скан")
+        self.btn_export_selected_scan.clicked.connect(self._export_selected_scan)
+        selective_actions.addWidget(self.btn_export_selected_scan, 0)
+        selective_actions.addStretch(1)
+        selective_layout.addLayout(selective_actions)
+
+        self.tools_selective_state = QLabel("")
+        self.tools_selective_state.setWordWrap(True)
+        self.tools_selective_state.setStyleSheet("color:#868686;")
+        selective_layout.addWidget(self.tools_selective_state)
+        layout.addWidget(selective_box)
+
         self.tools_progress_label = QLabel("")
         self.tools_progress_label.setWordWrap(True)
         self.tools_progress_label.setStyleSheet("color:#b2c7de;")
@@ -507,17 +560,17 @@ class SettingsWindow(QDialog):
 
         self.tools_avatar_state = QLabel("")
         self.tools_avatar_state.setWordWrap(True)
-        self.tools_avatar_state.setStyleSheet("color:#8da8c4;")
+        self.tools_avatar_state.setStyleSheet("color:#868686;")
         layout.addWidget(self.tools_avatar_state)
 
         self.tools_scan_state = QLabel("")
         self.tools_scan_state.setWordWrap(True)
-        self.tools_scan_state.setStyleSheet("color:#8da8c4;")
+        self.tools_scan_state.setStyleSheet("color:#868686;")
         layout.addWidget(self.tools_scan_state)
 
         self.tools_status = QLabel("")
         self.tools_status.setWordWrap(True)
-        self.tools_status.setStyleSheet("color:#8da8c4;")
+        self.tools_status.setStyleSheet("color:#868686;")
         layout.addWidget(self.tools_status)
         self._refresh_tool_state_labels()
         layout.addStretch(1)
@@ -572,7 +625,13 @@ class SettingsWindow(QDialog):
 
     def set_tools_busy(self, busy: bool) -> None:
         enabled = not bool(busy)
-        for name in ("btn_refresh_avatars", "btn_scan_all"):
+        for name in (
+            "btn_refresh_avatars",
+            "btn_scan_all",
+            "btn_scan_selected",
+            "btn_export_selected_scan",
+            "btn_tools_export_browse",
+        ):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(enabled)
@@ -587,6 +646,7 @@ class SettingsWindow(QDialog):
         label_map = {
             "refresh_all_avatars": ("tools_avatar_state", "Подгрузка аватарок"),
             "scan_all_chats": ("tools_scan_state", "Скан чатов"),
+            "scan_selected_community": ("tools_selective_state", "Скан сообщества"),
         }
         for key, meta in label_map.items():
             attr_name, title = meta
@@ -594,6 +654,48 @@ class SettingsWindow(QDialog):
             if label is None:
                 continue
             label.setText(self._format_tool_state_text(title, self._tool_state.get(key)))
+
+    def _browse_tools_export_dir(self) -> None:
+        current = str(self.tools_selective_export_dir.text() or "").strip() if hasattr(self, "tools_selective_export_dir") else ""
+        path = QFileDialog.getExistingDirectory(self, "Выберите папку выгрузки", current or str(Path.home()))
+        if path and hasattr(self, "tools_selective_export_dir"):
+            self.tools_selective_export_dir.setText(str(path))
+
+    def _run_selected_scan(self) -> None:
+        callback = self._callbacks.get("scan_selected_community") if isinstance(self._callbacks, dict) else None
+        if not callable(callback):
+            self.set_tools_status("Выборочный сканер недоступен в этой сборке.")
+            return
+        query = str(self.tools_selective_query.text() or "").strip() if hasattr(self, "tools_selective_query") else ""
+        export_dir = str(self.tools_selective_export_dir.text() or "").strip() if hasattr(self, "tools_selective_export_dir") else ""
+        try:
+            result = callback(query, export_dir)
+        except Exception as exc:
+            log.exception("Selected community scan action failed")
+            self.set_tools_status(str(exc) or "Не удалось запустить скан сообщества.")
+            return
+        if isinstance(result, tuple) and len(result) >= 2:
+            self.set_tools_status(str(result[1] or ""))
+        elif isinstance(result, str):
+            self.set_tools_status(result)
+
+    def _export_selected_scan(self) -> None:
+        callback = self._callbacks.get("export_selected_community_scan") if isinstance(self._callbacks, dict) else None
+        if not callable(callback):
+            self.set_tools_status("Экспорт скана недоступен в этой сборке.")
+            return
+        query = str(self.tools_selective_query.text() or "").strip() if hasattr(self, "tools_selective_query") else ""
+        export_dir = str(self.tools_selective_export_dir.text() or "").strip() if hasattr(self, "tools_selective_export_dir") else ""
+        try:
+            result = callback(query, export_dir)
+        except Exception as exc:
+            log.exception("Selected community export action failed")
+            self.set_tools_status(str(exc) or "Не удалось выгрузить скан сообщества.")
+            return
+        if isinstance(result, tuple) and len(result) >= 2:
+            self.set_tools_status(str(result[1] or ""))
+        elif isinstance(result, str):
+            self.set_tools_status(result)
 
     @staticmethod
     def _format_tool_state_text(title: str, state: Optional[Dict[str, Any]]) -> str:
@@ -789,7 +891,7 @@ class SettingsWindow(QDialog):
 
         self._refresh_ai_models(state)
         self._set_ai_context_value(state.get("context"))
-        QTimer.singleShot(0, self._start_ai_tags_refresh)
+        single_shot_in_gui(0, self._start_ai_tags_refresh)
 
         return tab
     def _emit_ai_change(self, payload: Dict[str, Any]) -> None:

@@ -466,9 +466,6 @@ class AIChat:
         )
 
     def generate_response(self, user_input: str) -> str:
-        # ВАЖНО: объявляем global один раз в начале функции, до любых присваиваний
-        # Иначе получите: "SyntaxError: name 'X' is assigned to before global declaration"
-        # (Требование Python: global-директива не может идти после использования/присваивания). :contentReference[oaicite:1]{index=1}
         global _ollama_model
 
         context = self.format_history()
@@ -492,23 +489,26 @@ class AIChat:
         except Exception as exc:
             msg = str(exc).lower()
 
-            # Недостаток RAM → понижаем параметры и пробуем ещё раз
+            def _reset_model() -> None:
+                with _ollama_lock:
+                    global _ollama_model
+                    _ollama_model = None
+
             if "unable to allocate cpu buffer" in msg:
                 self.log.error("Ollama memory error: %s", msg)
-                os.environ.setdefault("DRAGO_AI_MODEL", "gemma2:2b")  # меньшая модель
+                os.environ.setdefault("DRAGO_AI_MODEL", "gemma2:2b")
                 os.environ.setdefault("DRAGO_NUM_CTX", "1024")
-                _ollama_model = None
+                _reset_model()
                 try:
                     llm = _get_llm()
                     return llm.invoke(input=prompt)
                 except Exception:
                     return "Мало памяти для модели. Понизил параметры, попробуйте ещё раз."
 
-            # Нет GPU / нет CUDA → перезапуск на CPU
             if any(x in msg for x in ("no cuda", "no device", "cuda error", "failed to load cuda")):
                 self.log.warning("CUDA not available or failed at runtime; falling back to CPU")
                 os.environ["DRAGO_NUM_GPU"] = "0"
-                _ollama_model = None
+                _reset_model()
                 try:
                     llm = _get_llm()
                     return llm.invoke(input=prompt)
@@ -520,7 +520,7 @@ class AIChat:
                 self.log.error("Ollama CUDA buffer allocation failed; switching to CPU/offloading")
                 os.environ["DRAGO_NUM_GPU"] = "0"
                 os.environ.setdefault("DRAGO_AI_MODEL", "gemma2:2b")
-                _ollama_model = None
+                _reset_model()
                 try:
                     llm = _get_llm()
                     return llm.invoke(input=prompt)

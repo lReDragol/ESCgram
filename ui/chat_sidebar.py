@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QTimer,
     QObject,
     QVariantAnimation,
+    Signal,
 )
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
 from PySide6.QtWidgets import (
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
 
 from ui.settings_panel import SettingsDrawer
 from ui.styles import StyleManager
+from ui.qt_threading import invoke_in_gui_thread
+from utils.telegram_links import build_search_aliases
 try:
     from PySide6.QtGui import QImage
 except ImportError:
@@ -55,6 +58,80 @@ class FolderSpec:
     folder_id: str
     label: str
     icon_name: str
+
+
+class FolderPillBar(QWidget):
+    """Horizontal pill-style folder tabs (Ayugram SharedMediaLayout style)."""
+
+    folderChanged = Signal(str)
+
+    def __init__(self, specs: List[FolderSpec], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._style_mgr = StyleManager.instance()
+        self._active = "all"
+        self._specs: List[FolderSpec] = list(specs)
+        self._buttons: Dict[str, QPushButton] = {}
+        self._counts: Dict[str, int] = {}
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        for spec in specs:
+            btn = QPushButton(spec.label, self)
+            btn.setProperty("folder_id", spec.folder_id)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCheckable(True)
+            btn.setStyleSheet(
+                "QPushButton{background:rgba(255,255,255,0.04);color:#868686;border:none;"
+                "border-radius:14px;padding:6px 14px;font-size:12px;font-weight:600;}"
+                "QPushButton:hover{background:rgba(255,255,255,0.08);}"
+                "QPushButton:checked{background:rgba(100,181,239,0.22);color:#ffffff;}"
+            )
+            btn.clicked.connect(lambda checked, fid=spec.folder_id: self._on_clicked(fid))
+            layout.addWidget(btn)
+            self._buttons[spec.folder_id] = btn
+            self._counts[spec.folder_id] = 0
+
+        self._buttons.get("all", None).setChecked(True)
+
+    def _on_clicked(self, folder_id: str) -> None:
+        if folder_id == self._active:
+            return
+        self._active = folder_id
+        for fid, btn in self._buttons.items():
+            btn.setChecked(fid == folder_id)
+        self.folderChanged.emit(folder_id)
+
+    def active_folder(self) -> str:
+        return self._active
+
+    def set_active(self, folder_id: str) -> None:
+        if folder_id == self._active:
+            return
+        self._active = folder_id
+        for fid, btn in self._buttons.items():
+            btn.setChecked(fid == folder_id)
+
+    def set_count(self, folder_id: str, count: int) -> None:
+        self._counts[folder_id] = max(0, int(count or 0))
+        btn = self._buttons.get(folder_id)
+        if btn is None:
+            return
+        c = self._counts[folder_id]
+        spec_label = ""
+        for spec in getattr(self, "_specs", []):
+            if spec.folder_id == folder_id:
+                spec_label = spec.label
+                break
+        if not spec_label:
+            spec_label = btn.text().split(" (")[0]
+        if c > 0:
+            btn.setText(f"{spec_label} ({c})")
+        else:
+            btn.setText(spec_label)
 
 
 class FolderButton(QPushButton):
@@ -121,20 +198,29 @@ class FolderButton(QPushButton):
                       getattr(QImage, 'Format_ARGB32', None))
         img = source.toImage().convertToFormat(fmt)
         w, h = img.width(), img.height()
-
-        # строим альфу из яркости: чем темнее (ближе к чёрному), тем прозрачнее
-        for y in range(h):
-            for x in range(w):
-                rgba = img.pixel(x, y)
-                r = (rgba >> 16) & 0xFF
-                g = (rgba >> 8) & 0xFF
-                b = rgba & 0xFF
-                # простая яркость (0..255)
-                y8 = (77 * r + 150 * g + 29 * b) >> 8
-                # 0..255: ниже порога — 0 (прозрачный), выше — плавный рост
-                a = 0 if y8 <= threshold else min(255, (y8 - threshold) * 255 // (255 - threshold))
-                img.setPixel(x, y, (a << 24) | (color.red() << 16) | (color.green() << 8) | color.blue())
-
+        ptr = img.bits()
+        if ptr is None:
+            return QPixmap.fromImage(img)
+        nbytes = w * h * 4
+        if hasattr(ptr, 'setsize'):
+            ptr.setsize(nbytes)
+        buf = bytearray(ptr[:nbytes])
+        cr, cg, cb = color.red(), color.green(), color.blue()
+        for i in range(0, nbytes, 4):
+            b = buf[i]
+            g = buf[i + 1]
+            r = buf[i + 2]
+            y8 = (77 * r + 150 * g + 29 * b) >> 8
+            a = 0 if y8 <= threshold else min(255, (y8 - threshold) * 255 // (255 - threshold))
+            buf[i] = cb
+            buf[i + 1] = cg
+            buf[i + 2] = cr
+            buf[i + 3] = a
+        ptr2 = img.bits()
+        if ptr2 is not None:
+            if hasattr(ptr2, 'setsize'):
+                ptr2.setsize(nbytes)
+            ptr2[:nbytes] = buf
         return QPixmap.fromImage(img)
 
     def set_count(self, count: int) -> None:
@@ -152,20 +238,38 @@ class FolderButton(QPushButton):
         if source.isNull():
             return source
 
-        # 1) Находим границы непрозрачных пикселей по альфе
+        # 1) Находим границы непрозрачных пикселей по альфе (fast buffer access)
         fmt = getattr(QImage.Format, 'Format_ARGB32',
                       getattr(QImage, 'Format_ARGB32', None))
         img = source.toImage().convertToFormat(fmt)
         w, h = img.width(), img.height()
 
-        left, top, right, bottom = w, h, -1, -1
-        for y in range(h):
-            for x in range(w):
-                if (img.pixel(x, y) >> 24) & 0xFF:  # alpha > 0
-                    if x < left:   left = x
-                    if y < top:    top = y
-                    if x > right:  right = x
-                    if y > bottom: bottom = y
+        ptr = img.bits()
+        if ptr is not None:
+            nbytes = w * h * 4
+            if hasattr(ptr, 'setsize'):
+                ptr.setsize(nbytes)
+            buf = bytes(ptr[:nbytes])
+            left, top, right, bottom = w, h, -1, -1
+            for y in range(h):
+                row_off = y * w * 4
+                for x in range(w):
+                    off = row_off + x * 4
+                    if buf[off + 3]:  # alpha > 0  (ARGB32 LE = B G R A)
+                        if x < left:   left = x
+                        if y < top:    top = y
+                        if x > right:  right = x
+                        if y > bottom: bottom = y
+        else:
+            # Fallback: scanLine-based approach
+            left, top, right, bottom = w, h, -1, -1
+            for y in range(h):
+                for x in range(w):
+                    if (img.pixel(x, y) >> 24) & 0xFF:  # alpha > 0
+                        if x < left:   left = x
+                        if y < top:    top = y
+                        if x > right:  right = x
+                        if y > bottom: bottom = y
 
         # Если альфа пустая — просто впишем как есть
         if right < left or bottom < top:
@@ -196,7 +300,7 @@ class FolderButton(QPushButton):
 
 
 class ChatListRowWidget(QWidget):
-    """Compact chat row with title, meta info and right unread badge."""
+    """Ayugram-style chat row matching DialogCell night theme."""
 
     def __init__(
         self,
@@ -215,26 +319,27 @@ class ChatListRowWidget(QWidget):
         self._avatar_pixmap_key: Optional[int] = None
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(6, 4, 6, 4)
-        root.setSpacing(8)
+        root.setContentsMargins(10, 9, 6, 9)
+        root.setSpacing(12)
 
         self._avatar = QLabel(self)
-        self._avatar.setFixedSize(self._avatar_size, self._avatar_size)
-        self._avatar.setStyleSheet("border-radius:18px; background:rgba(40,56,74,0.65);")
+        av = self._avatar_size
+        self._avatar.setFixedSize(av, av)
+        self._avatar.setStyleSheet(f"border-radius:{av // 2}px; background:rgba(30,30,30,0.85);")
         self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(1)
+        text_col.setSpacing(2)
 
         self._title = QLabel(str(title or "").strip(), self)
-        self._title.setStyleSheet("font-size:13px; font-weight:600; color:#dce9f8; background:transparent;")
+        self._title.setStyleSheet("font-size:13px; font-weight:600; color:#f1f1f1; background:transparent;")
         self._title.setWordWrap(False)
         text_col.addWidget(self._title, 0)
 
         self._meta = QLabel(str(meta or "").strip(), self)
-        self._meta.setStyleSheet("font-size:11px; color:#8ea3bb; background:transparent;")
+        self._meta.setStyleSheet("font-size:11px; color:#828da2; background:transparent;")
         self._meta.setWordWrap(False)
         self._meta.setVisible(bool(meta))
         text_col.addWidget(self._meta, 0)
@@ -242,10 +347,10 @@ class ChatListRowWidget(QWidget):
         root.addLayout(text_col, 1)
 
         self._badge = QLabel("", self)
-        self._badge.setMinimumWidth(22)
+        self._badge.setMinimumWidth(23)
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._badge.setStyleSheet(
-            "background-color:#2f94d5; color:white; border-radius:10px; padding:1px 7px; font-size:11px; font-weight:700;"
+            "background-color:#3bb07b; color:#ffffff; border-radius:11px; padding:2px 8px; font-size:12px; font-weight:700;"
         )
         root.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.set_unread(unread)
@@ -366,6 +471,7 @@ class ChatSidebarMixin:
         self.search = QLineEdit(placeholderText="Поиск (имя, @username, id)…")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_search_text_changed)
+        self.search.returnPressed.connect(self._on_search_submitted)
         search_row.addWidget(self.search, 1)
 
         search_container = QWidget()
@@ -416,6 +522,10 @@ class ChatSidebarMixin:
                 btn.setChecked(True)
         folder_column.addStretch(1)
         self.folder_group.buttonToggled.connect(self._on_folder_button_toggled)
+
+        self.folder_pill_bar = FolderPillBar(self.folder_specs, self)
+        self.folder_pill_bar.folderChanged.connect(self._on_pill_folder_changed)
+        left.addWidget(self.folder_pill_bar, 0)
 
         self.chat_list = QListWidget()
         # слот предоставляется хост-классом; заглушка выше убрала ворнинг инспектора
@@ -475,6 +585,13 @@ class ChatSidebarMixin:
         self.settings_panel.streamer_mode_toggled.connect(self._on_settings_streamer_toggled)
         self.settings_panel.menu_action_requested.connect(self._on_settings_menu_action)
         self.settings_panel.back_requested.connect(lambda: self.menu_button.setChecked(False))
+        self.settings_panel.ayu_save_deleted_toggled.connect(self._on_settings_ayu_save_deleted)
+        self.settings_panel.ayu_save_edits_toggled.connect(self._on_settings_ayu_save_edits)
+        self.settings_panel.ayu_save_media_private_toggled.connect(self._on_settings_ayu_media_private)
+        self.settings_panel.ayu_save_media_group_toggled.connect(self._on_settings_ayu_media_group)
+        self.settings_panel.ayu_save_media_channel_toggled.connect(self._on_settings_ayu_media_channel)
+        self.settings_panel.ayu_send_online_toggled.connect(self._on_settings_ayu_send_online)
+        self.settings_panel.ayu_send_typing_toggled.connect(self._on_settings_ayu_send_typing)
         QTimer.singleShot(0, self._reposition_settings_panel)
 
         self.sidebar_ui = SidebarUI(loading_label=loading_label, container=self._left_wrap)
@@ -547,9 +664,11 @@ class ChatSidebarMixin:
         timer = getattr(self, "_chat_avatar_refresh_timer", None)
         if timer is None:
             return
-        if timer.isActive():
-            timer.stop()
-        timer.start(80)
+        def _start() -> None:
+            if timer.isActive():
+                timer.stop()
+            timer.start(80)
+        invoke_in_gui_thread(_start)
 
     def _on_settings_auto_toggled(self, checked: bool) -> None:
         if not self.current_chat_id:
@@ -604,6 +723,41 @@ class ChatSidebarMixin:
         if callable(handler):
             handler(bool(checked))
 
+    def _on_settings_ayu_save_deleted(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_save_deleted_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_save_edits(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_save_edits_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_media_private(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_media_private_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_media_group(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_media_group_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_media_channel(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_media_channel_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_send_online(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_send_online_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
+    def _on_settings_ayu_send_typing(self, checked: bool) -> None:
+        handler = getattr(self, "on_ayu_send_typing_changed", None)
+        if callable(handler):
+            handler(bool(checked))
+
     def _on_search_text_changed(self, text: str) -> None:
         handler = getattr(self, "on_sidebar_search_changed", None)
         if callable(handler):
@@ -628,6 +782,20 @@ class ChatSidebarMixin:
             self._chat_list_override_rows = []
         folder_id = button.property("folder_id") or "all"
         self._active_folder = str(folder_id)
+        pill_bar = getattr(self, "folder_pill_bar", None)
+        if pill_bar is not None:
+            pill_bar.set_active(str(folder_id))
+        self.populate_chat_list()
+
+    def _on_pill_folder_changed(self, folder_id: str) -> None:
+        fid = str(folder_id or "all").strip()
+        self._active_folder = fid
+        btn = self.folder_buttons.get(fid)
+        if btn is not None:
+            btn.setChecked(True)
+        if getattr(self, "_chat_list_override_mode", ""):
+            self._chat_list_override_mode = ""
+            self._chat_list_override_rows = []
         self.populate_chat_list()
 
     def set_chat_list_override(self, *, mode: str, rows: List[Dict[str, Any]]) -> None:
@@ -684,10 +852,20 @@ class ChatSidebarMixin:
     def _build_chat_search_blob(self, chat_id: str, info: Dict[str, Any]) -> str:
         title = str(info.get("title_display") or info.get("title") or chat_id).strip().lower()
         username = str(info.get("username") or "").strip().lower()
+        search_hint = str(info.get("search_hint") or "").strip().lower()
         id_tokens = [tok.lower() for tok in self._chat_id_aliases(chat_id)]
         type_tokens = [tok.lower() for tok in self._chat_type_tokens(str(info.get("type") or ""))]
-        parts = [title, username, str(chat_id).lower(), *id_tokens, *type_tokens]
+        link_tokens = build_search_aliases(username or search_hint)
+        parts = [title, username, search_hint, str(chat_id).lower(), *id_tokens, *type_tokens, *link_tokens]
         return " ".join(p for p in parts if p)
+
+    def _on_search_submitted(self) -> None:
+        handler = getattr(self, "on_sidebar_search_submitted", None)
+        if callable(handler):
+            try:
+                handler(str(getattr(self, "search", None).text() if hasattr(self, "search") else ""))
+            except Exception:
+                pass
 
     def _apply_filter(self, text: str) -> None:
         query = (text or "").strip().lower()
@@ -772,6 +950,13 @@ class ChatSidebarMixin:
             items = [_build_item(cid) for cid in all_ids]
             items.sort(key=self._chat_sort_key)
             self._update_folder_counts(items)
+
+            avatar_cache = getattr(self, "avatar_cache", None)
+            if avatar_cache and hasattr(avatar_cache, "prefetch_chats"):
+                try:
+                    avatar_cache.prefetch_chats(items)
+                except Exception:
+                    pass
 
             active_filter = getattr(self, "_active_folder", "all")
             hidden_set = set(getattr(self, "_hidden_chats", set()))
@@ -877,7 +1062,7 @@ class ChatSidebarMixin:
                     row_widget = self.chat_list.itemWidget(item)
                     if isinstance(row_widget, ChatListRowWidget):
                         row_widget.update_row(title=title, meta=meta, unread=unread)
-                        pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+                        pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
                         if pixmap is not None:
                             row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
                         chat_rows_by_id[cid] = row_widget
@@ -903,7 +1088,7 @@ class ChatSidebarMixin:
                         avatar_size=self._avatar_size,
                         parent=self.chat_list,
                     )
-                    pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+                    pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
                     if pixmap is not None:
                         row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
                     self.chat_list.addItem(item)
@@ -946,7 +1131,7 @@ class ChatSidebarMixin:
             if isinstance(raw_item_info, dict):
                 info_dict.update(dict(raw_item_info))
             title = str(info_dict.get("title_display") or info_dict.get("title") or cid)
-            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info_dict, title)
+            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info_dict, title, allow_fetch=True)
             if pixmap is None:
                 continue
             row_widget = self.chat_list.itemWidget(item)
@@ -963,6 +1148,8 @@ class ChatSidebarMixin:
         chat_id: str,
         info: Dict[str, Any],
         title: str,
+        *,
+        allow_fetch: bool = True,
     ) -> tuple[Optional[QPixmap], Optional[tuple]]:
         if not hasattr(self, "avatar_cache"):
             return None, None
@@ -971,7 +1158,7 @@ class ChatSidebarMixin:
         try:
             photo_id = str(info.get("photo_small_id") or info.get("photo_small") or "")
             avatar_key = ("chat", str(chat_id), photo_id, int(self._avatar_size))
-            pixmap = self.avatar_cache.chat(str(chat_id), info)  # type: ignore[attr-defined]
+            pixmap = self.avatar_cache.chat(str(chat_id), info, allow_fetch=allow_fetch)  # type: ignore[attr-defined]
             return pixmap, avatar_key
         except Exception:
             return None, None
@@ -1039,7 +1226,7 @@ class ChatSidebarMixin:
                 avatar_size=self._avatar_size,
                 parent=self.chat_list,
             )
-            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title)
+            pixmap, avatar_key = self._chat_list_avatar_payload(cid, info, title, allow_fetch=False)
             if pixmap is not None:
                 row_widget.set_avatar_cached(pixmap, cache_key=avatar_key)
             self.chat_list.addItem(item)
@@ -1118,6 +1305,13 @@ class ChatSidebarMixin:
                 button.set_count(counts.get(fid, 0))
             except Exception:
                 continue
+        pill_bar = getattr(self, "folder_pill_bar", None)
+        if pill_bar is not None:
+            for fid, cnt in counts.items():
+                try:
+                    pill_bar.set_count(fid, cnt)
+                except Exception:
+                    pass
 
     def _importance_for_sort(self, chat_id: str, *, info: Optional[Dict[str, Any]] = None) -> int:
         indicator = str((info or {}).get("_ai_indicator") or self._compose_indicator(chat_id, info=info))

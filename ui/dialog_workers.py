@@ -392,6 +392,31 @@ class BulkChatStatisticsWorker(QObject):
         )
 
 
+class CommunityScanWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+
+    def __init__(self, server, *, query: str, max_related: int = 12, max_depth: int = 1):
+        super().__init__()
+        self.server = server
+        self.query = str(query or "").strip()
+        self.max_related = int(max_related or 12)
+        self.max_depth = int(max_depth or 1)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.server.scan_selected_community(
+                self.query,
+                max_related=self.max_related,
+                max_depth=self.max_depth,
+                progress_callback=lambda done, total, text: self.progress.emit(int(done), int(total), str(text or "")),
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        self.finished.emit(dict(result or {}))
+
+
 class ReleaseCheckWorker(QObject):
     finished = Signal(dict)
 

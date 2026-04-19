@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
@@ -79,6 +79,13 @@ class SettingsDrawer(QWidget):
     show_my_avatar_toggled = Signal(bool)
     menu_action_requested = Signal(str)
     update_requested = Signal()
+    ayu_save_deleted_toggled = Signal(bool)
+    ayu_save_edits_toggled = Signal(bool)
+    ayu_save_media_private_toggled = Signal(bool)
+    ayu_save_media_group_toggled = Signal(bool)
+    ayu_save_media_channel_toggled = Signal(bool)
+    ayu_send_online_toggled = Signal(bool)
+    ayu_send_typing_toggled = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -277,6 +284,40 @@ class SettingsDrawer(QWidget):
 
         self._container_layout.addLayout(section)
 
+        self._build_ayuconfig_section()
+
+    def _build_ayuconfig_section(self) -> None:
+        section = QVBoxLayout()
+        section.setSpacing(6)
+        caption = QLabel("AyuConfig")
+        self._style_mgr.bind_stylesheet(caption, "settings.section.caption")
+        section.addWidget(caption)
+
+        self.chk_ayu_save_deleted = self._create_toggle(section, "Сохранять удалённые", "ayu/ghost.png")
+        self.chk_ayu_save_deleted.toggled.connect(lambda v: self.ayu_save_deleted_toggled.emit(bool(v)))
+        self.chk_ayu_save_edits = self._create_toggle(section, "Сохранять правки", "ayu/ghost.png")
+        self.chk_ayu_save_edits.toggled.connect(lambda v: self.ayu_save_edits_toggled.emit(bool(v)))
+
+        media_caption = QLabel("Сохранять медиа")
+        self._style_mgr.bind_stylesheet(media_caption, "settings.section.caption")
+        section.addWidget(media_caption)
+        self.chk_ayu_media_private = self._create_toggle(section, "Личные чаты", "menu/contacts_alphabet.png")
+        self.chk_ayu_media_private.toggled.connect(lambda v: self.ayu_save_media_private_toggled.emit(bool(v)))
+        self.chk_ayu_media_group = self._create_toggle(section, "Группы", "menu/groups_create.png")
+        self.chk_ayu_media_group.toggled.connect(lambda v: self.ayu_save_media_group_toggled.emit(bool(v)))
+        self.chk_ayu_media_channel = self._create_toggle(section, "Каналы", "menu/channel.png")
+        self.chk_ayu_media_channel.toggled.connect(lambda v: self.ayu_save_media_channel_toggled.emit(bool(v)))
+
+        privacy_caption = QLabel("Приватность")
+        self._style_mgr.bind_stylesheet(privacy_caption, "settings.section.caption")
+        section.addWidget(privacy_caption)
+        self.chk_ayu_send_online = self._create_toggle(section, "Показывать онлайн", "ayu/ghost.png")
+        self.chk_ayu_send_online.toggled.connect(lambda v: self.ayu_send_online_toggled.emit(bool(v)))
+        self.chk_ayu_send_typing = self._create_toggle(section, "Показывать набор текста", "ayu/ghost.png")
+        self.chk_ayu_send_typing.toggled.connect(lambda v: self.ayu_send_typing_toggled.emit(bool(v)))
+
+        self._container_layout.addLayout(section)
+
     def _create_toggle(self, container: QVBoxLayout, label: str, icon_name: str) -> QCheckBox:
         row = MenuToggleRow(label, icon_name, self)
         container.addWidget(row)
@@ -333,6 +374,41 @@ class SettingsDrawer(QWidget):
         self.chk_streamer_mode.blockSignals(True)
         self.chk_streamer_mode.setChecked(bool(checked))
         self.chk_streamer_mode.blockSignals(False)
+
+    def set_ayu_save_deleted_checked(self, checked: bool) -> None:
+        self.chk_ayu_save_deleted.blockSignals(True)
+        self.chk_ayu_save_deleted.setChecked(bool(checked))
+        self.chk_ayu_save_deleted.blockSignals(False)
+
+    def set_ayu_save_edits_checked(self, checked: bool) -> None:
+        self.chk_ayu_save_edits.blockSignals(True)
+        self.chk_ayu_save_edits.setChecked(bool(checked))
+        self.chk_ayu_save_edits.blockSignals(False)
+
+    def set_ayu_media_private_checked(self, checked: bool) -> None:
+        self.chk_ayu_media_private.blockSignals(True)
+        self.chk_ayu_media_private.setChecked(bool(checked))
+        self.chk_ayu_media_private.blockSignals(False)
+
+    def set_ayu_media_group_checked(self, checked: bool) -> None:
+        self.chk_ayu_media_group.blockSignals(True)
+        self.chk_ayu_media_group.setChecked(bool(checked))
+        self.chk_ayu_media_group.blockSignals(False)
+
+    def set_ayu_media_channel_checked(self, checked: bool) -> None:
+        self.chk_ayu_media_channel.blockSignals(True)
+        self.chk_ayu_media_channel.setChecked(bool(checked))
+        self.chk_ayu_media_channel.blockSignals(False)
+
+    def set_ayu_send_online_checked(self, checked: bool) -> None:
+        self.chk_ayu_send_online.blockSignals(True)
+        self.chk_ayu_send_online.setChecked(bool(checked))
+        self.chk_ayu_send_online.blockSignals(False)
+
+    def set_ayu_send_typing_checked(self, checked: bool) -> None:
+        self.chk_ayu_send_typing.blockSignals(True)
+        self.chk_ayu_send_typing.setChecked(bool(checked))
+        self.chk_ayu_send_typing.blockSignals(False)
 
     def set_update_state(self, text: str, *, can_update: bool, in_progress: bool = False) -> None:
         if hasattr(self, "_update_label"):
