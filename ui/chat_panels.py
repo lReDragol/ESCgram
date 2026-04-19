@@ -9,7 +9,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QPoint, QSize, Qt, Signal, Slot, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QImage, QImageReader, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -30,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from ui.ayugram_assets import load_ayugram_icon
 from ui.ayugram_menu import AyuPopupMenu
-from ui.components.avatar import AvatarWidget
+from ui.components.avatar import AvatarWidget, make_avatar_pixmap
 
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".mpg", ".mpeg", ".flv", ".ts", ".m4v"}
 _FFMPEG_SEMAPHORE = threading.Semaphore(2)
@@ -165,15 +167,25 @@ class ChatHeaderBar(QFrame):
 class _StatsSection(QWidget):
     def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self.setObjectName("statsSection")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#statsSection{"
+            "background-color:#15202b;"
+            "border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:18px;"
+            "}"
+            "QLabel#statsSectionTitle{color:#f3fbff;font-size:14px;font-weight:700;}"
+        )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
         header = QLabel(title)
-        header.setStyleSheet("color:#ffffff;font-size:15px;font-weight:700;")
+        header.setObjectName("statsSectionTitle")
         layout.addWidget(header)
         self.body = QVBoxLayout()
         self.body.setContentsMargins(0, 0, 0, 0)
-        self.body.setSpacing(6)
+        self.body.setSpacing(8)
         layout.addLayout(self.body)
 
 
@@ -198,12 +210,21 @@ class ChatInfoDialog(QDialog):
         self._sections = dict(sections or {})
         self._callbacks = dict(callbacks or {})
         self._embedded = bool(embedded)
-        self._tabs: Optional[QTabWidget] = None
+        self._tabs: Optional[QTabBar] = None
+        self._tab_stack: Optional[QStackedWidget] = None
         self._tab_layouts: Dict[int, QVBoxLayout] = {}
         self._tab_builders: Dict[int, Any] = {}
         self._tab_loaded: set[int] = set()
         self._tab_titles: Dict[int, str] = {}
-        self._tab_sections: Dict[int, str] = {1: "media", 2: "files", 3: "links", 4: "members", 5: "voice", 6: "music", 7: "gifs"}
+        self._tab_sections: Dict[int, str] = {
+            0: "media",
+            1: "files",
+            2: "links",
+            3: "members",
+            4: "voice",
+            5: "music",
+            6: "gifs",
+        }
         self._section_loaded: set[str] = {
             key for key in ("media", "files", "links", "members", "voice", "music", "gifs") if key in self._sections
         }
@@ -221,66 +242,86 @@ class ChatInfoDialog(QDialog):
         self._media_preview_cache: Dict[str, QPixmap] = {}
         self._media_preview_cache_max_size: int = 256
         self._media_preview_batch_size: int = 5
+        self._header_counter_label: Optional[QLabel] = None
+        self._header_metric_values: Dict[str, QLabel] = {}
 
         self.setWindowTitle("Профиль чата")
         if not self._embedded:
-            self.resize(680, 680)
+            self.resize(760, 760)
         else:
             self.setMinimumSize(0, 0)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            "QDialog{background-color:#0f0f10;color:#f1f1f1;}"
-            "QLabel{color:#f1f1f1;background-color:transparent;border:none;}"
-            "QTabWidget::pane{border:1px solid rgba(255,255,255,0.08);border-radius:10px;top:-1px;background:#181819;}"
-            "QTabBar::tab{background:rgba(255,255,255,0.04);color:#868686;padding:8px 12px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;}"
-            "QTabBar::tab:selected{background:rgba(100,181,239,0.22);color:#ffffff;}"
-            "QLineEdit{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.10);border-radius:9px;padding:7px 10px;color:#f1f1f1;}"
-            "QLineEdit:focus{border:1px solid rgba(100,181,239,0.58);}"
-            "QPushButton{background:rgba(255,255,255,0.05);color:#f1f1f1;border:none;border-radius:8px;padding:7px 10px;}"
-            "QPushButton:hover{background:rgba(255,255,255,0.10);}"
+            "QDialog{background-color:#0f151d;color:#eff7ff;}"
+            "QLabel{color:#eff7ff;background-color:transparent;border:none;}"
+            "QFrame#chatProfileHero{"
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #1d2b3b, stop:1 #13202d);"
+            "border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:24px;"
+            "}"
+            "QFrame#chatProfileMetrics{background-color:#131c26;border:1px solid rgba(255,255,255,0.05);border-radius:20px;}"
+            "QFrame#chatProfileMetricItem{background-color:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.04);border-radius:16px;}"
+            "QLabel#chatProfileMetricValue{color:#f3fbff;font-size:22px;font-weight:700;}"
+            "QLabel#chatProfileMetricTitle{color:#7f9ab6;font-size:11px;font-weight:600;letter-spacing:0.08em;}"
+            "QLabel#chatProfileTitle{color:#f5fbff;font-size:24px;font-weight:700;}"
+            "QLabel#chatProfileSubtitle{color:#9ab3ca;font-size:13px;}"
+            "QLabel#chatProfileCounter{color:#74c9ff;font-size:13px;font-weight:600;}"
+            "QLabel#chatProfileAbout{color:#dbe9f5;font-size:13px;line-height:1.35em;}"
+            "QLabel#chatProfileChip{background-color:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.04);border-radius:12px;padding:6px 10px;color:#cfe1f0;font-size:11px;font-weight:600;}"
+            "QFrame#chatProfileTabsWrap{background-color:#111922;border-radius:18px;}"
+            "QTabBar{background:transparent;}"
+            "QTabBar::tab{background:transparent;color:#7b95b1;padding:0 8px;min-height:48px;margin:0 4px;border:none;border-bottom:3px solid transparent;font-size:13px;font-weight:600;}"
+            "QTabBar::tab:selected{color:#eff7ff;border-bottom-color:#6dc9ff;}"
+            "QTabBar::tab:hover{color:#d7e8f5;}"
+            "QLineEdit{background:#111b26;border:1px solid rgba(255,255,255,0.06);border-radius:21px;padding:0 16px;color:#eff7ff;min-height:42px;font-size:13px;}"
+            "QLineEdit:focus{border:1px solid rgba(109,201,255,0.65);}"
+            "QPushButton{background:rgba(255,255,255,0.06);color:#eff7ff;border:none;border-radius:14px;padding:9px 12px;min-height:38px;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.11);}"
             "QPushButton:focus{outline:none;border:none;}"
             "QToolButton:focus{outline:none;border:none;}"
         )
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16)
         root.setSpacing(12)
+        shell = QWidget(self)
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(14, 14, 14, 14)
+        shell_layout.setSpacing(12)
+        root.addWidget(shell, 1)
 
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        avatar_widget = AvatarWidget(size=64, parent=self)
-        if avatar is not None and not avatar.isNull():
-            avatar_widget.set_pixmap(avatar)
-        header.addWidget(avatar_widget, 0, Qt.AlignmentFlag.AlignTop)
+        shell_layout.addWidget(self._build_header_card(avatar), 0)
+        shell_layout.addWidget(self._build_metrics_card(), 0)
 
-        text_col = QVBoxLayout()
-        text_col.setSpacing(4)
-        title_label = QLabel(str(self._info.get("title") or self._info.get("id") or "Чат"))
-        title_label.setStyleSheet("font-size:20px;font-weight:700;color:#ffffff;")
-        text_col.addWidget(title_label)
-        subtitle = format_chat_subtitle(self._info)
-        if subtitle:
-            subtitle_label = QLabel(subtitle)
-            subtitle_label.setStyleSheet("color:#868686;font-size:12px;")
-            subtitle_label.setWordWrap(True)
-            text_col.addWidget(subtitle_label)
-        header.addLayout(text_col, 1)
-        root.addLayout(header)
+        tabs_wrap = QFrame(shell)
+        tabs_wrap.setObjectName("chatProfileTabsWrap")
+        tabs_layout = QVBoxLayout(tabs_wrap)
+        tabs_layout.setContentsMargins(10, 0, 10, 0)
+        tabs_layout.setSpacing(0)
 
-        tabs = QTabWidget(self)
+        tabs = QTabBar(tabs_wrap)
+        tabs.setDrawBase(False)
+        tabs.setExpanding(False)
+        tabs.setUsesScrollButtons(True)
+        tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        tabs.setDocumentMode(True)
         self._tabs = tabs
-        root.addWidget(tabs, 1)
+        tabs_layout.addWidget(tabs, 0)
+        shell_layout.addWidget(tabs_wrap, 0)
+
+        stack = QStackedWidget(shell)
+        self._tab_stack = stack
+        shell_layout.addWidget(stack, 1)
 
         self._tab_builders = {
-            0: lambda: self._wrap_scroll(self._build_overview_tab()),
-            1: self._build_media_tab,
-            2: self._build_files_tab,
-            3: self._build_links_tab,
-            4: lambda: self._wrap_scroll(self._build_members_tab()),
-            5: self._build_voice_tab,
-            6: self._build_music_tab,
-            7: self._build_gifs_tab,
-            8: lambda: self._wrap_scroll(self._build_actions_tab()),
+            0: self._build_media_tab,
+            1: self._build_files_tab,
+            2: self._build_links_tab,
+            3: lambda: self._wrap_scroll(self._build_members_tab()),
+            4: self._build_voice_tab,
+            5: self._build_music_tab,
+            6: self._build_gifs_tab,
         }
-        titles = ["Обзор", "Медиа", "Файлы", "Ссылки", "Участники", "Голосовые", "Музыка", "GIF", "Действия"]
+        titles = ["Медиа", "Файлы", "Ссылки", "Участ.", "Голос", "Музыка", "GIF"]
         for idx, title in enumerate(titles):
             self._tab_titles[idx] = title
             container = QWidget(self)
@@ -288,21 +329,19 @@ class ChatInfoDialog(QDialog):
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)
             self._tab_layouts[idx] = container_layout
-            tabs.addTab(container, title)
+            stack.addWidget(container)
+            tabs.addTab(title)
 
-        self._set_lazy_tab_widget(0, self._wrap_scroll(self._build_overview_tab()))
-        self._tab_loaded.add(0)
-        tabs.currentChanged.connect(self._ensure_lazy_tab_loaded)
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         if not self._embedded:
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
             buttons.rejected.connect(self.reject)
-            buttons.accepted.connect(self.accept)
             root.addWidget(buttons)
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         try:
-            QTimer.singleShot(0, lambda: self._ensure_lazy_tab_loaded(int(tabs.currentIndex())))
+            QTimer.singleShot(0, lambda: self._on_tab_changed(max(0, int(tabs.currentIndex()))))
         except Exception:
             pass
 
@@ -310,6 +349,11 @@ class ChatInfoDialog(QDialog):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollArea>QWidget>QWidget{background:transparent;}"
+        )
         scroll.setWidget(widget)
         return scroll
 
@@ -339,6 +383,248 @@ class ChatInfoDialog(QDialog):
         self._tab_loaded.add(idx)
         if section:
             self._request_section(section)
+
+    def _on_tab_changed(self, index: int) -> None:
+        idx = max(0, int(index or 0))
+        if self._tab_stack is not None and 0 <= idx < self._tab_stack.count():
+            self._tab_stack.setCurrentIndex(idx)
+        self._ensure_lazy_tab_loaded(idx)
+        self._update_header_counter()
+
+    def _build_header_card(self, avatar: Optional[QPixmap]) -> QWidget:
+        card = QFrame(self)
+        card.setObjectName("chatProfileHero")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(14)
+
+        avatar_widget = AvatarWidget(size=88, parent=card)
+        if avatar is not None and not avatar.isNull():
+            avatar_widget.set_pixmap(avatar)
+        head.addWidget(avatar_widget, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 2, 0, 0)
+        text_col.setSpacing(4)
+
+        title_label = QLabel(str(self._info.get("title") or self._info.get("id") or "Чат"))
+        title_label.setObjectName("chatProfileTitle")
+        title_label.setWordWrap(True)
+        text_col.addWidget(title_label)
+
+        subtitle_text = format_chat_subtitle(self._info) or str(self._info.get("status") or "").strip()
+        subtitle_label = QLabel(subtitle_text or "Данные профиля")
+        subtitle_label.setObjectName("chatProfileSubtitle")
+        subtitle_label.setWordWrap(True)
+        text_col.addWidget(subtitle_label)
+
+        counter_label = QLabel("")
+        counter_label.setObjectName("chatProfileCounter")
+        counter_label.setWordWrap(True)
+        self._header_counter_label = counter_label
+        text_col.addWidget(counter_label)
+        text_col.addStretch(1)
+        head.addLayout(text_col, 1)
+        layout.addLayout(head)
+
+        chips = self._build_identity_chips(card)
+        if chips is not None:
+            layout.addWidget(chips, 0)
+
+        about = str(self._info.get("about") or "").strip()
+        if about:
+            about_label = QLabel(about[:320])
+            about_label.setObjectName("chatProfileAbout")
+            about_label.setWordWrap(True)
+            layout.addWidget(about_label, 0)
+
+        actions = self._build_header_actions(card)
+        if actions is not None:
+            layout.addWidget(actions, 0)
+
+        return card
+
+    def _build_identity_chips(self, parent: QWidget) -> Optional[QWidget]:
+        entries: List[str] = []
+        ctype = str(self._info.get("type") or "").strip().lower()
+        type_map = {
+            "private": "Личный чат",
+            "bot": "Бот",
+            "user": "Пользователь",
+            "group": "Группа",
+            "supergroup": "Супергруппа",
+            "channel": "Канал",
+        }
+        if ctype:
+            entries.append(type_map.get(ctype, ctype.title()))
+        username = str(self._info.get("username") or "").strip()
+        if username:
+            entries.append(f"@{username}")
+        phone = str(self._info.get("phone") or "").strip()
+        if phone:
+            entries.append(phone)
+        if self._info.get("is_verified"):
+            entries.append("Проверен")
+        if self._info.get("is_premium"):
+            entries.append("Premium")
+        if not entries:
+            return None
+
+        wrap = QWidget(parent)
+        grid = QGridLayout(wrap)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        for idx, text in enumerate(entries[:6]):
+            chip = QLabel(str(text))
+            chip.setObjectName("chatProfileChip")
+            chip.setWordWrap(False)
+            grid.addWidget(chip, idx // 2, idx % 2)
+        return wrap
+
+    def _build_header_actions(self, parent: QWidget) -> Optional[QWidget]:
+        actions: List[tuple[str, str, str]] = []
+        if callable(self._callbacks.get("show_stats")):
+            actions.append(("Статистика", "show_stats", "secondary"))
+        if callable(self._callbacks.get("export")):
+            actions.append(("Экспорт", "export", "secondary"))
+        if callable(self._callbacks.get("mark_read")):
+            actions.append(("Прочитано", "mark_read", "secondary"))
+        if callable(self._callbacks.get("leave_chat")):
+            actions.append(("Покинуть", "leave_chat", "danger"))
+        if not actions:
+            return None
+
+        wrap = QWidget(parent)
+        grid = QGridLayout(wrap)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        for idx, (label, callback_key, tone) in enumerate(actions):
+            button = QPushButton(label, wrap)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if tone == "danger":
+                button.setStyleSheet(
+                    "QPushButton{background:rgba(255,98,98,0.18);color:#ffd9d9;border:none;border-radius:14px;padding:9px 12px;min-height:38px;}"
+                    "QPushButton:hover{background:rgba(255,98,98,0.28);}"
+                )
+            button.clicked.connect(partial(self._call, callback_key))
+            grid.addWidget(button, idx // 2, idx % 2)
+        return wrap
+
+    def _build_metrics_card(self) -> QWidget:
+        card = QFrame(self)
+        card.setObjectName("chatProfileMetrics")
+        layout = QGridLayout(card)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
+        labels = {
+            "media": "МЕДИА",
+            "files": "ФАЙЛЫ",
+            "links": "ССЫЛКИ",
+            "members": "ЛЮДИ",
+        }
+        order = ["media", "files", "links", "members"]
+        for idx, key in enumerate(order):
+            tile = QFrame(card)
+            tile.setObjectName("chatProfileMetricItem")
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(14, 12, 14, 12)
+            tile_layout.setSpacing(2)
+            value_label = QLabel("0")
+            value_label.setObjectName("chatProfileMetricValue")
+            title_label = QLabel(labels.get(key, key.upper()))
+            title_label.setObjectName("chatProfileMetricTitle")
+            tile_layout.addWidget(value_label, 0)
+            tile_layout.addWidget(title_label, 0)
+            tile_layout.addStretch(1)
+            self._header_metric_values[key] = value_label
+            layout.addWidget(tile, idx // 2, idx % 2)
+        self._refresh_header_metrics()
+        return card
+
+    @staticmethod
+    def _plural_word(value: int, one: str, few: str, many: str) -> str:
+        number = abs(int(value or 0))
+        mod10 = number % 10
+        mod100 = number % 100
+        if mod10 == 1 and mod100 != 11:
+            return one
+        if 2 <= mod10 <= 4 and not 12 <= mod100 <= 14:
+            return few
+        return many
+
+    def _section_count(self, section: str) -> int:
+        key = str(section or "").strip().lower()
+        if key == "members":
+            try:
+                info_members = int(self._info.get("members_count") or 0)
+            except Exception:
+                info_members = 0
+            loaded_members = len([row for row in list(self._sections.get("members") or []) if isinstance(row, dict)])
+            return max(info_members, loaded_members)
+        return len([row for row in list(self._sections.get(key) or []) if isinstance(row, dict)])
+
+    def _refresh_header_metrics(self) -> None:
+        metrics = {
+            "media": self._section_count("media"),
+            "files": self._section_count("files"),
+            "links": self._section_count("links"),
+            "members": self._section_count("members"),
+        }
+        for key, value in metrics.items():
+            label = self._header_metric_values.get(key)
+            if label is not None:
+                label.setText(str(int(value)))
+
+    def _section_counter_text(self, section: str) -> str:
+        key = str(section or "").strip().lower()
+        if key in self._section_loading and self._section_count(key) <= 0:
+            loading_map = {
+                "media": "Загружаю медиа…",
+                "files": "Загружаю файлы…",
+                "links": "Загружаю ссылки…",
+                "members": "Загружаю участников…",
+                "voice": "Загружаю голосовые…",
+                "music": "Загружаю музыку…",
+                "gifs": "Загружаю GIF…",
+            }
+            return loading_map.get(key, "Загружаю раздел…")
+
+        count = self._section_count(key)
+        if key == "media":
+            return f"{count} медиа"
+        if key == "files":
+            return f"{count} {self._plural_word(count, 'файл', 'файла', 'файлов')}"
+        if key == "links":
+            return f"{count} {self._plural_word(count, 'ссылка', 'ссылки', 'ссылок')}"
+        if key == "members":
+            return f"{count} {self._plural_word(count, 'участник', 'участника', 'участников')}"
+        if key == "voice":
+            return f"{count} {self._plural_word(count, 'голосовое', 'голосовых', 'голосовых')}"
+        if key == "music":
+            return f"{count} {self._plural_word(count, 'трек', 'трека', 'треков')}"
+        if key == "gifs":
+            return f"{count} GIF"
+        subtitle = format_chat_subtitle(self._info)
+        return subtitle or str(self._info.get("about") or "").strip() or "Профиль чата"
+
+    def _update_header_counter(self) -> None:
+        if self._header_counter_label is None:
+            return
+        index = 0
+        if self._tabs is not None:
+            try:
+                index = max(0, int(self._tabs.currentIndex()))
+            except Exception:
+                index = 0
+        section = self._tab_sections.get(index, "")
+        self._header_counter_label.setText(self._section_counter_text(section))
 
     @staticmethod
     def _format_ts(ts: Any) -> str:
@@ -382,44 +668,50 @@ class ChatInfoDialog(QDialog):
     def _make_empty_tab(self, text: str) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        card = _StatsSection("Раздел пуст", tab)
         lbl = QLabel(text)
         lbl.setWordWrap(True)
-        lbl.setStyleSheet("color:#868686;")
-        layout.addWidget(lbl)
+        lbl.setStyleSheet("color:#93abc1;")
+        card.body.addWidget(lbl)
+        layout.addWidget(card, 0)
         layout.addStretch(1)
         return tab
 
     def _make_loading_tab(self, text: str) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        card = _StatsSection("Синхронизация", tab)
         title = QLabel(text)
         title.setWordWrap(True)
-        title.setStyleSheet("color:#f1f1f1;font-weight:600;")
+        title.setStyleSheet("color:#f1f7ff;font-weight:600;")
         note = QLabel("Данные подгружаются в фоне. Интерфейс останется доступным.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#868686;")
-        layout.addWidget(title)
-        layout.addWidget(note)
+        note.setStyleSheet("color:#93abc1;")
+        card.body.addWidget(title)
+        card.body.addWidget(note)
+        layout.addWidget(card, 0)
         layout.addStretch(1)
         return tab
 
     def _make_error_tab(self, text: str, *, section: Optional[str] = None) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        card = _StatsSection("Ошибка загрузки", tab)
         title = QLabel(text)
         title.setWordWrap(True)
-        title.setStyleSheet("color:#ff6b6b;font-weight:600;")
-        layout.addWidget(title)
+        title.setStyleSheet("color:#ffb0b0;font-weight:600;")
+        card.body.addWidget(title)
         if section:
             retry_btn = QPushButton("Повторить", tab)
             retry_btn.clicked.connect(lambda: self._retry_section(section))
-            layout.addWidget(retry_btn, 0)
+            card.body.addWidget(retry_btn, 0)
+        layout.addWidget(card, 0)
         layout.addStretch(1)
         return tab
 
@@ -444,6 +736,7 @@ class ChatInfoDialog(QDialog):
         self._section_loading.add(key)
         self._section_errors.pop(key, None)
         self._refresh_section_tab(key)
+        self._update_header_counter()
 
         def _run() -> None:
             payload: List[Dict[str, Any]] = []
@@ -469,12 +762,15 @@ class ChatInfoDialog(QDialog):
         if error:
             self._section_errors[key] = str(error)
             self._refresh_section_tab(key)
+            self._update_header_counter()
             return
         rows = [dict(row) for row in list(payload or []) if isinstance(row, dict)]
         self._sections[key] = rows
         self._section_loaded.add(key)
         self._section_errors.pop(key, None)
         self._refresh_section_tab(key)
+        self._refresh_header_metrics()
+        self._update_header_counter()
 
     def _refresh_section_tab(self, section: str) -> None:
         key = str(section or "").strip().lower()
@@ -489,6 +785,7 @@ class ChatInfoDialog(QDialog):
         except Exception:
             widget = self._make_error_tab("Не удалось обновить вкладку.", section=key)
         self._set_lazy_tab_widget(int(tab_index), widget)
+        self._update_header_counter()
 
     def _build_overview_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -606,6 +903,27 @@ class ChatInfoDialog(QDialog):
                 child.setParent(None)
                 child.deleteLater()
 
+    @staticmethod
+    def _initials(value: str) -> str:
+        parts = [chunk for chunk in str(value or "").strip().replace("_", " ").split() if chunk]
+        if not parts:
+            return "?"
+        if len(parts) == 1:
+            return parts[0][:2].upper()
+        return (parts[0][:1] + parts[1][:1]).upper()
+
+    @staticmethod
+    def _seed_color(seed: str) -> QColor:
+        palette = [
+            QColor("#5677fc"),
+            QColor("#4cb5ae"),
+            QColor("#d97c53"),
+            QColor("#6d8cff"),
+            QColor("#8f6be8"),
+            QColor("#3aa0d8"),
+        ]
+        return palette[abs(hash(str(seed or ""))) % len(palette)]
+
     def _section_row_matches(self, row: Dict[str, Any], mode: str, query: str) -> bool:
         q = str(query or "").strip().lower()
         if not q:
@@ -628,13 +946,13 @@ class ChatInfoDialog(QDialog):
 
     def _build_section_preview(self, row: Dict[str, Any], *, mode: str, parent: QWidget) -> QLabel:
         preview = QLabel(parent)
-        preview.setFixedSize(56, 56)
+        preview.setFixedSize(64, 64)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview.setStyleSheet(
-            "background-color:rgba(255,255,255,0.06);"
-            "border:1px solid rgba(255,255,255,0.08);"
-            "border-radius:8px;"
-            "color:#868686;"
+            "background-color:#10202f;"
+            "border:1px solid rgba(255,255,255,0.05);"
+            "border-radius:14px;"
+            "color:#9ab6cf;"
             "font-size:12px;"
             "font-weight:700;"
         )
@@ -657,7 +975,7 @@ class ChatInfoDialog(QDialog):
                                 Qt.TransformationMode.SmoothTransformation,
                             )
                         )
-                        preview.setStyleSheet("border-radius:8px;")
+                        preview.setStyleSheet("border-radius:14px;")
                         return preview
             else:
                 pix = QPixmap(fpath)
@@ -667,9 +985,9 @@ class ChatInfoDialog(QDialog):
                             preview.size(),
                             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                             Qt.TransformationMode.SmoothTransformation,
+                            )
                         )
-                    )
-                    preview.setStyleSheet("border-radius:8px;")
+                    preview.setStyleSheet("border-radius:14px;")
                     return preview
         if mode == "files":
             ext = os.path.splitext(str(row.get("file_name") or "").strip())[1].lstrip(".").upper()
@@ -690,16 +1008,16 @@ class ChatInfoDialog(QDialog):
     def _add_section_item(self, layout: QVBoxLayout, row: Dict[str, Any], *, mode: str) -> None:
         card = QFrame(self)
         card.setStyleSheet(
-            "QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}"
-            "QPushButton{padding:5px 8px;border-radius:8px;}"
+            "QFrame{background-color:#15202b;border:1px solid rgba(255,255,255,0.05);border-radius:18px;}"
+            "QPushButton{padding:8px 10px;border-radius:12px;min-height:34px;}"
         )
         root = QVBoxLayout(card)
-        root.setContentsMargins(0, 6, 0, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
 
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(10)
+        head.setSpacing(12)
         head.addWidget(self._build_section_preview(row, mode=mode, parent=card), 0)
 
         content = QVBoxLayout()
@@ -716,18 +1034,18 @@ class ChatInfoDialog(QDialog):
             subtitle_text = str(row.get("text") or "").strip()
         title = QLabel(title_text)
         title.setWordWrap(True)
-        title.setStyleSheet("color:#ffffff;font-size:13px;font-weight:600;background:transparent;")
+        title.setStyleSheet("color:#f5fbff;font-size:14px;font-weight:600;background:transparent;")
         content.addWidget(title)
 
         if subtitle_text and mode != "links":
             subtitle = QLabel(subtitle_text[:180])
             subtitle.setWordWrap(True)
-            subtitle.setStyleSheet("color:#868686;font-size:12px;background:transparent;")
+            subtitle.setStyleSheet("color:#8faac2;font-size:12px;background:transparent;")
             content.addWidget(subtitle)
         elif subtitle_text and mode == "links":
             subtitle = QLabel(subtitle_text[:180])
             subtitle.setWordWrap(True)
-            subtitle.setStyleSheet("color:#868686;font-size:11px;background:transparent;")
+            subtitle.setStyleSheet("color:#8faac2;font-size:11px;background:transparent;")
             content.addWidget(subtitle)
 
         meta_parts = [self._format_ts(row.get("date")), f"#{int(row.get('id') or 0)}"]
@@ -739,14 +1057,14 @@ class ChatInfoDialog(QDialog):
             if size_text != "n/a":
                 meta_parts.append(size_text)
         meta = QLabel(" • ".join([part for part in meta_parts if part]))
-        meta.setStyleSheet("color:#868686;font-size:11px;background:transparent;")
+        meta.setStyleSheet("color:#6f8aa5;font-size:11px;background:transparent;")
         content.addWidget(meta)
         head.addLayout(content, 1)
         root.addLayout(head)
 
         actions = QHBoxLayout()
-        actions.setContentsMargins(66, 0, 0, 0)
-        actions.setSpacing(6)
+        actions.setContentsMargins(76, 0, 0, 0)
+        actions.setSpacing(8)
         if mode == "links":
             url = str(row.get("url") or "").strip()
             open_btn = QPushButton("Открыть ссылку", card)
@@ -790,17 +1108,17 @@ class ChatInfoDialog(QDialog):
     def _build_media_tile(self, row: Dict[str, Any], parent: QWidget) -> QWidget:
         tile = QFrame(parent)
         tile.setStyleSheet(
-            "QFrame{background-color:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;}"
-            "QPushButton{padding:4px 7px;border-radius:7px;font-size:11px;}"
+            "QFrame{background-color:#15202b;border:1px solid rgba(255,255,255,0.05);border-radius:18px;}"
+            "QPushButton{padding:6px 8px;border-radius:10px;font-size:11px;min-height:30px;}"
         )
         layout = QVBoxLayout(tile)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         preview = QLabel(tile)
-        preview.setFixedSize(96, 96)
+        preview.setFixedSize(118, 118)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setStyleSheet("background:#0f1f30;border-radius:8px;")
+        preview.setStyleSheet("background:#0f1f30;border-radius:14px;")
         fpath = str(row.get("file_path") or "").strip()
         kind = str(row.get("type") or "").strip().lower()
         if fpath and os.path.isfile(fpath):
@@ -821,7 +1139,7 @@ class ChatInfoDialog(QDialog):
         layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
 
         stamp = QLabel(self._format_ts(row.get("date")))
-        stamp.setStyleSheet("color:#868686;font-size:11px;")
+        stamp.setStyleSheet("color:#8da6bf;font-size:11px;")
         stamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(stamp, 0)
 
@@ -1000,8 +1318,8 @@ class ChatInfoDialog(QDialog):
 
         tab = QWidget(self)
         root = QVBoxLayout(tab)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(2, 4, 2, 4)
+        root.setSpacing(10)
 
         search = QLineEdit(tab)
         if mode == "media":
@@ -1019,8 +1337,8 @@ class ChatInfoDialog(QDialog):
 
         container = QWidget(scroll)
         items_layout = QVBoxLayout(container)
-        items_layout.setContentsMargins(0, 0, 0, 0)
-        items_layout.setSpacing(2)
+        items_layout.setContentsMargins(0, 2, 0, 12)
+        items_layout.setSpacing(10)
         scroll.setWidget(container)
 
         def _render(query: str = "") -> None:
@@ -1031,7 +1349,7 @@ class ChatInfoDialog(QDialog):
             filtered = [row for row in deduped if self._section_row_matches(row, mode, query)]
             if not filtered:
                 empty = QLabel("Ничего не найдено")
-                empty.setStyleSheet("color:#868686;padding:8px 4px;")
+                empty.setStyleSheet("color:#8da6bf;padding:8px 4px;")
                 items_layout.addWidget(empty, 0)
                 items_layout.addStretch(1)
                 return
@@ -1044,7 +1362,7 @@ class ChatInfoDialog(QDialog):
                     grouped.setdefault(self._month_group_label(row.get("date")), []).append(row)
                 for group_name, group_rows in grouped.items():
                     header = QLabel(group_name)
-                    header.setStyleSheet("color:#ffffff;font-weight:700;padding:8px 2px 2px 2px;")
+                    header.setStyleSheet("color:#f4fbff;font-size:12px;font-weight:700;padding:6px 2px 0 2px;letter-spacing:0.05em;")
                     items_layout.addWidget(header, 0)
                     grid_wrap = QWidget(container)
                     grid = QGridLayout(grid_wrap)
@@ -1071,7 +1389,7 @@ class ChatInfoDialog(QDialog):
                 if group != prev_group:
                     prev_group = group
                     header = QLabel(group)
-                    header.setStyleSheet("color:#ffffff;font-weight:700;padding:8px 2px 2px 2px;")
+                    header.setStyleSheet("color:#f4fbff;font-size:12px;font-weight:700;padding:6px 2px 0 2px;letter-spacing:0.05em;")
                     items_layout.addWidget(header, 0)
                 self._add_section_item(items_layout, row, mode=mode)
             if len(filtered) > len(visible_rows):
@@ -1143,16 +1461,19 @@ class ChatInfoDialog(QDialog):
             return self._make_empty_tab("Список участников появится после синхронизации чата.")
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(2, 4, 2, 10)
+        layout.setSpacing(10)
         for row in members:
             line = QFrame(tab)
-            line.setStyleSheet("QFrame{background:transparent;border:none;border-bottom:1px solid rgba(255,255,255,0.06);}")
+            line.setStyleSheet("QFrame{background-color:#15202b;border:1px solid rgba(255,255,255,0.05);border-radius:18px;}")
             line_layout = QHBoxLayout(line)
-            line_layout.setContentsMargins(0, 6, 0, 10)
-            line_layout.setSpacing(10)
-            left = QVBoxLayout()
+            line_layout.setContentsMargins(14, 14, 14, 14)
+            line_layout.setSpacing(12)
             name = str(row.get("name") or row.get("id") or "unknown")
+            avatar = AvatarWidget(size=44, parent=line)
+            avatar.set_pixmap(make_avatar_pixmap(44, None, self._initials(name), background=self._seed_color(name)))
+            line_layout.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+            left = QVBoxLayout()
             username = str(row.get("username") or "").strip()
             status = str(row.get("status") or "").strip()
             kind = str(row.get("type") or "").strip()
@@ -1165,13 +1486,13 @@ class ChatInfoDialog(QDialog):
                 head += f" [{kind}]"
             title = QLabel(head)
             title.setWordWrap(True)
-            title.setStyleSheet("color:#ffffff;font-weight:600;")
+            title.setStyleSheet("color:#f5fbff;font-size:14px;font-weight:600;")
             left.addWidget(title)
             msgs = int(row.get("messages") or 0)
             deleted = int(row.get("deleted_messages") or 0)
             last_date = self._format_ts(row.get("last_date"))
             details = QLabel(f"Сообщений: {msgs} • удалено: {deleted} • активен: {last_date}")
-            details.setStyleSheet("color:#868686;font-size:11px;")
+            details.setStyleSheet("color:#8faac2;font-size:11px;")
             left.addWidget(details)
             line_layout.addLayout(left, 1)
             layout.addWidget(line)
